@@ -36,6 +36,7 @@ Item {
   property bool watchlistRefreshPending: false
 
   readonly property bool signedIn: snapshot.authenticated === true
+  readonly property bool authLoading: root.signedIn && snapshot.loading === true
   readonly property bool needsSetup: snapshot.needsSetup === true
   readonly property color foreground: Color.popups.text
   readonly property color muted: Color.muted
@@ -623,7 +624,6 @@ Item {
         root.signingIn = false
         root.loginStatus = ""
         snapshotFile.reload()
-        root.refresh()
       } else if (status === "error") {
         root.signingIn = false
         root.loginStatus = String(data.message || "Sign-in did not finish.")
@@ -1297,7 +1297,9 @@ Item {
                   spacing: Style.space(2)
 
                   Text {
-                    text: Model.formatUsd(root.displayPrice, 2)
+                    text: root.authLoading && (!isFinite(root.displayPrice) || root.displayPrice <= 0)
+                      ? "Loading portfolio…"
+                      : Model.formatUsd(root.displayPrice, 2)
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.display
@@ -1307,6 +1309,7 @@ Item {
                   Row {
                     spacing: Style.space(8)
                     Text {
+                      visible: !root.authLoading
                       text: Model.formatSignedUsd(root.displayPnl, 2)
                       color: Model.pnlColor(root.displayPnl, Color.accent, Color.urgent, root.foreground)
                       font.family: root.fontFamily
@@ -1314,6 +1317,7 @@ Item {
                       font.bold: true
                     }
                     Text {
+                      visible: !root.authLoading
                       text: Model.formatPercent(root.displayPnlPercent)
                       color: Model.pnlColor(root.displayPnlPercent, Color.accent, Color.urgent, root.foreground)
                       font.family: root.fontFamily
@@ -1328,8 +1332,8 @@ Item {
                       anchors.verticalCenter: parent.verticalCenter
                     }
                     Text {
-                      visible: (root.refreshing || root.detailLoading) && !root.chartHover
-                      text: "Updating…"
+                      visible: (root.authLoading || root.refreshing || root.detailLoading) && !root.chartHover
+                      text: root.authLoading ? "Loading details…" : "Updating…"
                       color: root.muted
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -1627,8 +1631,16 @@ Item {
                   spacing: Style.space(8)
 
                   Text {
-                    visible: root.visibleAssets.length === 0
+                    visible: !root.authLoading && root.visibleAssets.length === 0
                     text: root.marketTab === "watchlist" ? "Nothing on your Coinbase watchlist." : "Nothing in this tab yet."
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Text {
+                    visible: root.authLoading && root.visibleAssets.length === 0
+                    text: "Loading your Coinbase portfolio…"
                     color: root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall

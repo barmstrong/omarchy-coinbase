@@ -1326,9 +1326,16 @@ def _finish_login(payload: dict[str, Any]) -> None:
     write_login_status("exchanging")
     print("STATUS exchanging", flush=True)
     save_tokens(payload)
+    period = str(load_prefs().get("period") or "day")
+    if period not in PERIODS:
+        period = "day"
+    # Switch the shell out of its signed-out state as soon as the token is
+    # safely stored. Account totals and enriched charts arrive in subsequent
+    # atomic snapshot updates.
+    write_snapshot(portfolio_loading_snapshot(period))
     write_login_status("snapshot")
     print("STATUS snapshot", flush=True)
-    build_snapshot("day")
+    build_snapshot(period)
     write_login_status("done")
     print("ok", flush=True)
 
@@ -2948,6 +2955,38 @@ def snapshot_bar(
     }
 
 
+def portfolio_loading_snapshot(
+    period: str,
+    *,
+    user: dict[str, Any] | None = None,
+    assets: list[dict[str, Any]] | None = None,
+    total: float = 0,
+) -> dict[str, Any]:
+    period = period if period in PERIODS else "day"
+    rows = [dict(row) for row in (assets or []) if isinstance(row, dict)]
+    amount = round(num(total), 2)
+    sparkline = [amount, amount] if amount > 0 else []
+    return empty_snapshot(
+        authenticated=True,
+        needsSetup=False,
+        loading=True,
+        user=dict(user or {}),
+        total=amount,
+        period=period,
+        mode="portfolio",
+        sparkline=sparkline,
+        assets=rows,
+        bar=snapshot_bar(
+            rows,
+            portfolio=True,
+            total=amount,
+            pnl=0,
+            pnl_percent=0,
+            period=period,
+        ),
+    )
+
+
 def enrich_yahoo_assets(assets: list[dict[str, Any]]) -> None:
     stocks = [
         a
@@ -3258,6 +3297,17 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
         except RuntimeError:
             assets = fetch_v2_accounts(token)
             total = sum(num(a.get("value")) for a in assets)
+        if not token_is_current(token):
+            return market_snapshot(period)
+        quick_assets = tidy_assets([dict(asset) for asset in assets])
+        write_snapshot(
+            portfolio_loading_snapshot(
+                period,
+                user=user,
+                assets=quick_assets,
+                total=total,
+            )
+        )
         assets = merge_watchlist(assets, token)
         enrich_with_products(assets)
         assets = tidy_assets(assets)

@@ -17,6 +17,13 @@ The panel includes:
 This project is not affiliated with or endorsed by Coinbase. Coinbase and its
 logo are trademarks of their respective owner.
 
+## Screenshots
+
+<p align="center">
+  <img src="preview.png" alt="Coinbase portfolio and watchlist dashboard in Omarchy" width="48%">
+  <img src="assets/asset-detail.png" alt="Ethereum asset detail view with chart and market statistics" width="48%">
+</p>
+
 ## Install
 
 Requires Omarchy with `omarchy-shell`, Python 3, and network access. It has no
@@ -140,6 +147,7 @@ Useful development commands:
 ```bash
 omarchy plugin validate .
 node broker/test.mjs
+python3 -m unittest discover -s tests -v
 bin/coinbase status
 bin/coinbase snapshot --period day
 bin/coinbase search eth

@@ -14,6 +14,7 @@ BarWidget {
 
   readonly property int refreshSeconds: Math.max(15, parseInt(setting("refreshSeconds", 60), 10) || 60)
   readonly property bool signedIn: snapshot.authenticated === true
+  readonly property bool authLoading: root.signedIn && snapshot.loading === true
   readonly property var barPnl: snapshot.bar || ({})
   readonly property string tickerText: String(barPnl.symbol || "BTC").toUpperCase()
   readonly property real quotePrice: Number(signedIn ? snapshot.total : barPnl.price)
@@ -30,9 +31,11 @@ BarWidget {
   }
   readonly property bool showTicker: !signedIn && barDisplay !== "price"
   readonly property bool showPrice: hasQuote && (!signedIn || barDisplay !== "price")
-  readonly property bool showPnl: hasQuote && barDisplay === "full" && isFinite(pnlPercent)
+  readonly property bool showPnl: !authLoading && hasQuote && barDisplay === "full" && isFinite(pnlPercent)
   readonly property string chipText: signedIn
-    ? (hasQuote ? (barDisplay === "full" ? (totalText + "  " + pnlText) : (barDisplay === "quote" ? totalText : "CB")) : "CB")
+    ? (authLoading
+        ? (hasQuote && barDisplay !== "price" ? totalText : "CB")
+        : (hasQuote ? (barDisplay === "full" ? (totalText + "  " + pnlText) : (barDisplay === "quote" ? totalText : "CB")) : "CB"))
     : (hasQuote ? (barDisplay === "price" ? totalText : (barDisplay === "quote" ? (tickerText + "  " + totalText) : (tickerText + "  " + totalText + "  " + pnlText))) : tickerText)
 
   implicitWidth: button.implicitWidth

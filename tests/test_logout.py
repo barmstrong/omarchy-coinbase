@@ -18,6 +18,46 @@ def load_helper():
 
 
 class LogoutTests(unittest.TestCase):
+    def test_login_publishes_authenticated_state_before_full_snapshot(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            helper.STATE_DIR = state
+            helper.TOKEN_FILE = state / "tokens.json"
+            helper.SNAPSHOT_FILE = state / "snapshot.json"
+            helper.LOGIN_STATUS_FILE = state / "login-status.json"
+            helper.PREFS_FILE = state / "prefs.json"
+            helper.BROKER_URL_FILE = state / "broker.url"
+            helper.BROKER_URL_FILE.write_text("https://broker.example\n", encoding="utf-8")
+            helper.load_prefs = lambda: {"period": "week"}
+
+            full_snapshot_started = False
+
+            def fake_build_snapshot(period):
+                nonlocal full_snapshot_started
+                full_snapshot_started = True
+                self.assertEqual(period, "week")
+                snapshot = json.loads(helper.SNAPSHOT_FILE.read_text(encoding="utf-8"))
+                self.assertTrue(snapshot["authenticated"])
+                self.assertTrue(snapshot["loading"])
+                self.assertEqual(snapshot["period"], "week")
+                status = json.loads(helper.LOGIN_STATUS_FILE.read_text(encoding="utf-8"))
+                self.assertEqual(status["status"], "snapshot")
+
+            helper.build_snapshot = fake_build_snapshot
+            with contextlib.redirect_stdout(io.StringIO()):
+                helper._finish_login(
+                    {
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_in": 3600,
+                    }
+                )
+
+            self.assertTrue(full_snapshot_started)
+            status = json.loads(helper.LOGIN_STATUS_FILE.read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "done")
+
     def test_logout_clears_private_snapshot_before_network_work(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:
