@@ -61,6 +61,7 @@ BarWidget {
 
   function logout() {
     if (!signedIn || logoutProc.running) return
+    if (snapshotProc.running) snapshotProc.running = false
     logoutProc.running = true
   }
 

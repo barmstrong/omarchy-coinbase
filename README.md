@@ -23,9 +23,18 @@ Requires Omarchy with `omarchy-shell`, Python 3, and network access. It has no
 third-party Python or JavaScript runtime dependencies and needs no elevated
 privileges.
 
+The Coinbase submission has passed the marketplace's automated compatibility
+and security-baseline checks and is awaiting maintainer listing approval. Once
+it is published on [Omarchy Plugin Marketplace](https://omarchyplugins.com/),
+its install button will copy this same command:
+
 ```bash
 omarchy plugin add https://github.com/barmstrong/omarchy-coinbase.git --enable
 ```
+
+The command clones the current public repository, validates it locally, and
+then installs and enables the widget. Until the listing is approved, run it
+directly in a terminal.
 
 Click the bar widget, then **Sign in with Coinbase**. The repository includes a
 hosted OAuth broker URL, so installers do not need a Coinbase client secret.
@@ -36,11 +45,15 @@ Use **Log out** in the panel first. This asks Coinbase to revoke the active
 access token and then removes the local token file. Remove the plugin with:
 
 ```bash
-omarchy plugin remove coinbase --yes
+omarchy plugin remove coinbase
 ```
 
 Omarchy may retain non-secret preferences and market-data caches under
-`~/.local/state/omarchy/coinbase/` after removal.
+`~/.local/state/omarchy/coinbase/` after removal. To erase those files too:
+
+```bash
+rm -r -- ~/.local/state/omarchy/coinbase
+```
 
 ## Security and privacy
 

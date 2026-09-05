@@ -225,6 +225,17 @@ def snapshot_lock():
 
 
 @contextmanager
+def auth_lock():
+    ensure_state()
+    with (STATE_DIR / "auth.lock").open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
 def candle_cache_lock():
     ensure_state()
     with _CANDLE_THREAD_LOCK:
@@ -1100,7 +1111,7 @@ def cmd_setup(client_id: str, client_secret: str, read_stdin: bool = False) -> N
     print("ok")
 
 
-def save_tokens(payload: dict[str, Any]) -> dict[str, Any]:
+def _save_tokens_unlocked(payload: dict[str, Any]) -> dict[str, Any]:
     access = payload.get("access_token")
     refresh = payload.get("refresh_token") or load_tokens().get("refresh_token")
     if not isinstance(access, str) or not access or len(access) > 8192:
@@ -1123,6 +1134,11 @@ def save_tokens(payload: dict[str, Any]) -> dict[str, Any]:
     return tokens
 
 
+def save_tokens(payload: dict[str, Any]) -> dict[str, Any]:
+    with auth_lock():
+        return _save_tokens_unlocked(payload)
+
+
 def refresh_tokens(app: dict[str, str], tokens: dict[str, Any]) -> dict[str, Any]:
     refresh = tokens.get("refresh_token")
     if not refresh:
@@ -1134,7 +1150,7 @@ def refresh_tokens(app: dict[str, str], tokens: dict[str, Any]) -> dict[str, Any
             headers={"Content-Type": "application/json"},
             body={"refresh_token": str(refresh)},
         )
-        return save_tokens(payload)
+        return _save_tokens_unlocked(payload)
     payload = http_json(
         "POST",
         TOKEN_URL,
@@ -1145,19 +1161,26 @@ def refresh_tokens(app: dict[str, str], tokens: dict[str, Any]) -> dict[str, Any
             "client_secret": app["clientSecret"],
         },
     )
-    return save_tokens(payload)
+    return _save_tokens_unlocked(payload)
 
 
 def valid_access_token() -> str:
-    app = load_app()
-    tokens = load_tokens()
-    if not using_broker() and (not app.get("clientId") or not app.get("clientSecret")):
-        raise RuntimeError("needsSetup")
-    if not tokens.get("access_token"):
-        raise RuntimeError("not signed in")
-    if int(tokens.get("expires_at") or 0) <= int(time.time()):
-        tokens = refresh_tokens(app, tokens)
-    return str(tokens["access_token"])
+    with auth_lock():
+        app = load_app()
+        tokens = load_tokens()
+        if not using_broker() and (not app.get("clientId") or not app.get("clientSecret")):
+            raise RuntimeError("needsSetup")
+        if not tokens.get("access_token"):
+            raise RuntimeError("not signed in")
+        if int(tokens.get("expires_at") or 0) <= int(time.time()):
+            tokens = refresh_tokens(app, tokens)
+        return str(tokens["access_token"])
+
+
+def token_is_current(token: str) -> bool:
+    with auth_lock():
+        current = str(load_tokens().get("access_token") or "")
+    return bool(current) and secrets.compare_digest(current, str(token or ""))
 
 
 def _desktop_exec(desktop: str) -> str:
@@ -1474,37 +1497,46 @@ def cmd_login() -> None:
 
 
 def cmd_logout() -> None:
-    app = load_app()
-    tokens = load_tokens()
-    access = str(tokens.get("access_token") or "")
-    if access:
-        try:
-            if using_broker():
-                http_json(
-                    "POST",
-                    broker_url() + "/oauth/revoke",
-                    body={"access_token": access},
-                    timeout=8,
-                )
-            elif app.get("clientId") and app.get("clientSecret"):
-                http_json(
-                    "POST",
-                    REVOKE_URL,
-                    headers={"Authorization": f"Bearer {access}"},
-                    form={
-                        "token": access,
-                        "client_id": app["clientId"],
-                        "client_secret": app["clientSecret"],
-                    },
-                    timeout=8,
-                )
-        except RuntimeError:
-            pass
-    try:
-        TOKEN_FILE.unlink()
-    except FileNotFoundError:
-        pass
     period = str(load_prefs().get("period") or "day")
+    if period not in PERIODS:
+        period = "day"
+    signed_out = empty_snapshot(period=period)
+    signed_out["bar"]["period"] = period
+    with auth_lock():
+        app = load_app()
+        tokens = load_tokens()
+        access = str(tokens.get("access_token") or "")
+        try:
+            TOKEN_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        # Clear portfolio data and stale OAuth/API errors before revocation or
+        # public-market network requests can delay the logout UI.
+        write_snapshot(signed_out)
+        write_login_status("logged-out")
+        if access:
+            try:
+                if using_broker():
+                    http_json(
+                        "POST",
+                        broker_url() + "/oauth/revoke",
+                        body={"access_token": access},
+                        timeout=8,
+                    )
+                elif app.get("clientId") and app.get("clientSecret"):
+                    http_json(
+                        "POST",
+                        REVOKE_URL,
+                        headers={"Authorization": f"Bearer {access}"},
+                        form={
+                            "token": access,
+                            "client_id": app["clientId"],
+                            "client_secret": app["clientSecret"],
+                        },
+                        timeout=8,
+                    )
+            except RuntimeError:
+                pass
     try:
         build_market_snapshot(period)
     except Exception:  # noqa: BLE001
@@ -3280,10 +3312,14 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
             "actions": ACTION_URLS,
             "fetchedAt": now_iso(),
         }
+        if not token_is_current(token):
+            return market_snapshot(period)
         write_snapshot(snap)
         refresh_products_cache()
         return snap
     except Exception as exc:  # noqa: BLE001
+        if not token_is_current(token):
+            return market_snapshot(period)
         snap = empty_snapshot(authenticated=True, error=str(exc), period=period)
         # Keep last-good numbers if we already had a snapshot.
         previous = read_json(SNAPSHOT_FILE, {})

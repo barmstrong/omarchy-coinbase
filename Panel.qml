@@ -565,6 +565,18 @@ Item {
   }
 
   function logout() {
+    if (snapshotProc.running) snapshotProc.running = false
+    if (rowProc.running) rowProc.running = false
+    if (watchlistProc.running) watchlistProc.running = false
+    root.signingIn = false
+    root.loginStatus = ""
+    var signedOut = Object.assign({}, root.snapshot)
+    signedOut.authenticated = false
+    signedOut.error = ""
+    signedOut.user = ({})
+    signedOut.assets = []
+    signedOut.total = 0
+    root.snapshot = signedOut
     logoutProc.running = true
   }
 
@@ -615,6 +627,9 @@ Item {
       } else if (status === "error") {
         root.signingIn = false
         root.loginStatus = String(data.message || "Sign-in did not finish.")
+      } else if (status === "logged-out") {
+        root.signingIn = false
+        root.loginStatus = ""
       }
     }
   }
@@ -674,7 +689,11 @@ Item {
   Process {
     id: logoutProc
     command: [root.pluginFile("bin/coinbase"), "logout"]
-    onExited: snapshotFile.reload()
+    onExited: {
+      root.signingIn = false
+      root.loginStatus = ""
+      snapshotFile.reload()
+    }
   }
 
   Process {
