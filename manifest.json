@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "coinbase",
+  "name": "Coinbase",
+  "version": "1.0.0",
+  "author": "Brian Armstrong",
+  "license": "MIT",
+  "description": "Coinbase portfolio overview for the Omarchy bar: balances, watchlist, and read-only OAuth.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Coinbase",
+    "description": "Portfolio value and daily P&L, with a Coinbase dashboard on click",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSeconds": 60
+    },
+    "schema": [
+      {
+        "key": "refreshSeconds",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60
+      }
+    ]
+  }
+}

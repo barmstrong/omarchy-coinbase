@@ -1,0 +1,1690 @@
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+import qs.Commons
+import qs.Ui
+import "Model.js" as Model
+
+Item {
+  id: root
+
+  property var shell: null
+  property var manifest: null
+  property bool opened: false
+  property var snapshot: ({})
+  property bool refreshing: false
+  property bool signingIn: false
+  property string loginStatus: ""
+  property string searchQuery: ""
+  property var searchResults: []
+  property string clientIdDraft: ""
+  property string clientSecretDraft: ""
+  property int listCursor: -1
+  property string marketTab: "crypto"
+  property bool hoverSelectEnabled: false
+  property bool tabSynced: false
+  property var detailAsset: null
+  property var detailChart: ({})
+  property bool detailLoading: false
+  property var lastPortfolio: ({})
+  property int chartSeq: 0
+  property int chartProcSeq: 0
+  property string chartWantId: ""
+  property bool rowsRefreshPending: false
+  property bool watchlistRefreshPending: false
+
+  readonly property bool signedIn: snapshot.authenticated === true
+  readonly property bool needsSetup: snapshot.needsSetup === true
+  readonly property color foreground: Color.popups.text
+  readonly property color muted: Color.muted
+  readonly property string fontFamily: Style.font.family
+  readonly property int pad: Style.space(16)
+  readonly property var periodOptions: [
+    { value: "hour", label: "1H" },
+    { value: "day", label: "1D" },
+    { value: "week", label: "1W" },
+    { value: "month", label: "1M" },
+    { value: "year", label: "1Y" },
+    { value: "all", label: "ALL" }
+  ]
+  readonly property var marketTabs: root.signedIn
+    ? [
+        { value: "watchlist", label: "Watchlist" },
+        { value: "crypto", label: "Crypto" },
+        { value: "stock", label: "Stocks" },
+        { value: "derivative", label: "Perps" }
+      ]
+    : [
+        { value: "crypto", label: "Crypto" },
+        { value: "stock", label: "Stocks" },
+        { value: "derivative", label: "Perps" }
+  ]
+  readonly property bool showingDetail: detailAsset !== null
+  readonly property string period: String(snapshot.period || "day")
+  readonly property var assets: snapshot.assets || []
+  readonly property bool searching: String(searchQuery).replace(/^\s+|\s+$/g, "").length > 0
+  readonly property var visibleAssets: filteredAssets(searchQuery, assets)
+  readonly property real pnl: Number(root.showingDetail ? snapshot.pnl : root.portfolioField("pnl", snapshot.pnl))
+  readonly property color pnlColor: Model.pnlColor(root.showingDetail ? Number((detailChart && detailChart.pnl) || (detailAsset && detailAsset.pnl) || 0) : pnl, Color.accent, Color.urgent, foreground)
+  readonly property var sparkline: {
+    if (root.showingDetail) {
+      if (detailChart && detailChart.sparkline && detailChart.sparkline.length)
+        return detailChart.sparkline
+      if (detailAsset && detailAsset.rowSpark && detailAsset.rowSpark.length)
+        return detailAsset.rowSpark
+    }
+    if (root.signedIn && root.portfolioLooksWrong(snapshot) && lastPortfolio && lastPortfolio.sparkline && lastPortfolio.sparkline.length)
+      return lastPortfolio.sparkline
+    return snapshot.sparkline || []
+  }
+  property bool chartHover: false
+  property real chartHoverPrice: NaN
+  property int chartHoverIndex: -1
+  readonly property string chartHoverTime: {
+    var n = sparkline.length
+    var i = chartHoverIndex
+    if (!root.chartHover || i < 0 || n < 2) return ""
+    var spans = { hour: 3600, day: 86400, week: 7 * 86400, month: 30 * 86400, year: 365 * 86400, all: 5 * 365 * 86400 }
+    var span = spans[period] || 86400
+    var t = new Date(Date.now() - (1 - i / (n - 1)) * span * 1000)
+    if (period === "hour" || period === "day") return Qt.formatDateTime(t, "h:mm AP")
+    if (period === "week") return Qt.formatDateTime(t, "ddd h:mm AP")
+    if (period === "month") return Qt.formatDateTime(t, "MMM d h:mm AP")
+    return Qt.formatDateTime(t, "MMM d yyyy")
+  }
+  readonly property real displayPrice: {
+    if (chartHover && isFinite(chartHoverPrice)) return chartHoverPrice
+    if (root.showingDetail) {
+      if (detailChart && isFinite(Number(detailChart.price)) && Number(detailChart.price) > 0)
+        return Number(detailChart.price)
+      return Number(detailAsset && detailAsset.price)
+    }
+    if (root.signedIn) return Number(root.portfolioField("total", snapshot.total))
+    return Number(snapshot.bar && snapshot.bar.price)
+  }
+  readonly property real displayPnl: {
+    if (!chartHover || !isFinite(chartHoverPrice) || !sparkline.length) {
+      if (root.showingDetail) return Number((detailChart && detailChart.pnl) || (detailAsset && detailAsset.pnl) || 0)
+      return Number(root.portfolioField("pnl", snapshot.pnl))
+    }
+    var start = Number(sparkline[0])
+    if (!isFinite(start)) return Number(root.portfolioField("pnl", snapshot.pnl))
+    return chartHoverPrice - start
+  }
+  readonly property real displayPnlPercent: {
+    if (!chartHover || !isFinite(chartHoverPrice) || !sparkline.length) {
+      if (root.showingDetail) return Number((detailChart && detailChart.pnlPercent) || (detailAsset && detailAsset.pnlPercent) || 0)
+      return Number(root.portfolioField("pnlPercent", snapshot.pnlPercent))
+    }
+    var start = Number(sparkline[0])
+    if (!isFinite(start) || start === 0) return Number(root.portfolioField("pnlPercent", snapshot.pnlPercent))
+    return (chartHoverPrice - start) / start * 100
+  }
+  readonly property var barPnl: snapshot.bar || ({})
+  readonly property string selectedAssetName: String(barPnl.name || "").trim()
+  readonly property string selectedAssetSymbol: String(barPnl.symbol || "BTC").trim()
+  readonly property string selectedAssetLabel: {
+    if (selectedAssetName !== "" && selectedAssetName.toUpperCase() !== selectedAssetSymbol.toUpperCase())
+      return selectedAssetName + " (" + selectedAssetSymbol + ")"
+    return selectedAssetName || selectedAssetSymbol
+  }
+  readonly property var actions: snapshot.actions || ({
+    send: "https://www.coinbase.com/send",
+    receive: "https://www.coinbase.com/receive",
+    deposit: "https://www.coinbase.com/deposit",
+    withdraw: "https://www.coinbase.com/withdraw"
+  })
+
+  function pluginFile(rel) {
+    var url = String(Qt.resolvedUrl(rel))
+    if (url.indexOf("file://") === 0) url = decodeURIComponent(url.substring(7))
+    return url
+  }
+
+  function applySnapshot(raw) {
+    var wasSigned = root.signedIn
+    snapshot = Model.parseSnapshot(raw)
+    root.capturePortfolio(snapshot)
+    if (root.signedIn && !wasSigned) {
+      root.marketTab = "watchlist"
+      root.tabSynced = true
+      return
+    }
+    if (root.opened && !root.tabSynced) {
+      root.syncTabToPin()
+      root.tabSynced = true
+    }
+  }
+
+  function capturePortfolio(snap) {
+    if (!snap || snap.authenticated !== true) return
+    if (root.portfolioLooksWrong(snap)) return
+    var s = snap.sparkline || []
+    var total = Number(snap.total)
+    if (!isFinite(total) || total <= 0 || s.length < 2) return
+    lastPortfolio = {
+      sparkline: s,
+      total: total,
+      pnl: Number(snap.pnl),
+      pnlPercent: Number(snap.pnlPercent)
+    }
+  }
+
+  function portfolioLooksWrong(snap) {
+    if (!snap || !lastPortfolio || !lastPortfolio.total) return false
+    var ref = Number(lastPortfolio.total)
+    var total = Number(snap.total)
+    var s = snap.sparkline || []
+    var last = Number(s.length ? s[s.length - 1] : 0)
+    if (isFinite(total) && total > 0 && total < ref * 0.05) return true
+    if (s.length >= 2 && isFinite(last) && last > 0 && last < ref * 0.05) return true
+    if (s.length >= 2 && isFinite(last) && isFinite(total) && total > 0 && Math.abs(last - total) / total > 0.35) return true
+    return false
+  }
+
+  function portfolioField(key, fallback) {
+    if (root.signedIn && root.portfolioLooksWrong(snapshot) && lastPortfolio && lastPortfolio[key] !== undefined)
+      return lastPortfolio[key]
+    return fallback
+  }
+
+  function syncTabToPin() {
+    if (root.signedIn) {
+      root.marketTab = "watchlist"
+      return
+    }
+    var kind = String(barPnl.kind || "")
+    var pid = String(barPnl.productId || "").toUpperCase()
+    if (kind === "derivative" || pid.indexOf("PERP") !== -1 || pid.indexOf("INTX") !== -1)
+      root.marketTab = "derivative"
+    else if (kind === "stock" || kind === "commodity")
+      root.marketTab = "stock"
+    else
+      root.marketTab = "crypto"
+  }
+
+  property real pointerX: -1
+  property real pointerY: -1
+
+  function notePointerMove(handler) {
+    var pos = handler && handler.point ? handler.point.position : null
+    if (!pos) {
+      root.hoverSelectEnabled = true
+      return
+    }
+    var x = pos.x
+    var y = pos.y
+    if (root.pointerX >= 0 && (Math.abs(x - root.pointerX) > 4 || Math.abs(y - root.pointerY) > 4))
+      root.hoverSelectEnabled = true
+    root.pointerX = x
+    root.pointerY = y
+  }
+
+  function resetHoverSelect() {
+    root.hoverSelectEnabled = false
+    root.pointerX = -1
+    root.pointerY = -1
+    root.listCursor = root.visibleAssets.length > 0 ? 0 : -1
+  }
+
+  function assetSearchScore(row, q) {
+    q = String(q || "").replace(/^\s+|\s+$/g, "").toLowerCase()
+    if (!q) return 0
+    var id = String(row.id || "").toLowerCase()
+    var name = String(row.name || "").toLowerCase()
+    var product = String(row.productId || "").toLowerCase()
+    var haystack = id + " " + name + " " + product
+    var terms = q.split(/\s+/)
+    for (var i = 0; i < terms.length; i++) {
+      if (terms[i] && haystack.indexOf(terms[i]) === -1) return 0
+    }
+    if (id === q) return 100
+    if (name === q) return 90
+    if (id.startsWith(q)) return 80
+    if (name.startsWith(q)) return 60
+    return 20 + terms.length * 5
+  }
+
+  function rowPeriodPercent(row) {
+    if (!row || String(row.rowSparkPeriod || "") !== root.period) return NaN
+    var values = row.rowSpark || []
+    if (values.length < 2) return NaN
+    var first = Number(values[0])
+    var last = Number(values[values.length - 1])
+    if (!isFinite(first) || !isFinite(last) || first === 0) return NaN
+    return (last - first) / first * 100
+  }
+
+  function rowPeriodColor(row) {
+    return Model.pnlColor(root.rowPeriodPercent(row), Color.accent, Color.urgent, root.muted)
+  }
+
+  function rowsNeedRefresh() {
+    var rows = root.visibleAssets || []
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      if (!row || !row.productId || String(row.kind || "") === "fiat") continue
+      if (String(row.rowSparkPeriod || "") !== root.period || (row.rowSpark || []).length < 2)
+        return true
+    }
+    return false
+  }
+
+  function refreshRows(force) {
+    if (!root.opened) return
+    if (snapshotProc.running || rowProc.running) {
+      root.rowsRefreshPending = true
+      return
+    }
+    if (!force && !root.rowsNeedRefresh()) return
+    root.rowsRefreshPending = false
+    rowProc.command = [pluginFile("bin/coinbase"), "rows", "--period", root.period, "--tab", root.marketTab]
+    rowProc.running = true
+  }
+
+  function filteredAssets(query, rows) {
+    var q = String(query || "").replace(/^\s+|\s+$/g, "").toLowerCase()
+    rows = rows || []
+    var out = []
+    var tab = String(root.marketTab || "crypto")
+    var seen = {}
+    var searching = q.length > 0
+    for (var i = 0; i < rows.length; i++) {
+      var a = rows[i]
+      var aid = String(a.id || "")
+      var aname = String(a.name || "")
+      if (!aid.replace(/^\s+|\s+$/g, "") && !aname.replace(/^\s+|\s+$/g, "")) continue
+      var junk = aid.indexOf("v1:equity") === 0 || (aid.length >= 16 && /^[01]+$/.test(aid))
+      if (junk && (aname === aid || aname === "Stock")) continue
+      if (!searching) {
+        if (tab === "watchlist") {
+          if (!a.watchlist) continue
+        } else if (String(a.kind || "crypto") !== tab) continue
+      }
+      if (q && root.assetSearchScore(a, q) <= 0) continue
+      out.push(a)
+      seen[String(a.kind || "") + ":" + String(a.id || "").toUpperCase()] = true
+    }
+    if (q.length >= 2) {
+      var extra = root.searchResults || []
+      for (var j = 0; j < extra.length; j++) {
+        var hit = extra[j]
+        var hid = String(hit.kind || "crypto") + ":" + String(hit.id || "").toUpperCase()
+        if (seen[hid]) continue
+        if (root.assetSearchScore(hit, q) <= 0) continue
+        out.push(hit)
+        seen[hid] = true
+      }
+    }
+    if (q) {
+      out.sort(function(a, b) {
+        var d = root.assetSearchScore(b, q) - root.assetSearchScore(a, q)
+        if (d !== 0) return d
+        var cap = Number(b.marketCap || 0) - Number(a.marketCap || 0)
+        if (cap !== 0) return cap
+        return String(a.id || "").localeCompare(String(b.id || ""))
+      })
+    } else if (tab === "watchlist") {
+      out.sort(function(a, b) {
+        var ao = Number(a.watchlistOrder)
+        var bo = Number(b.watchlistOrder)
+        if (!isFinite(ao)) ao = 1e9
+        if (!isFinite(bo)) bo = 1e9
+        if (ao !== bo) return ao - bo
+        return String(a.id || "").localeCompare(String(b.id || ""))
+      })
+    } else if (tab === "stock") {
+      out.sort(function(a, b) {
+        var cap = Number(b.marketCap || 0) - Number(a.marketCap || 0)
+        if (cap !== 0) return cap
+        return String(a.id || "").localeCompare(String(b.id || ""))
+      })
+    }
+    return out
+  }
+
+  function open(payloadJson) {
+    opened = true
+    watchlistRefreshPending = true
+    listCursor = 0
+    hoverSelectEnabled = false
+    tabSynced = false
+    if (flick) flick.contentY = 0
+    snapshotFile.reload()
+    syncTabToPin()
+    refresh()
+    Qt.callLater(function() {
+      if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
+    })
+  }
+
+  function focusSearch() {
+    searchField.forceActiveFocus()
+    searchField.selectAll()
+    if (listCursor < 0 && visibleAssets.length > 0) listCursor = 0
+  }
+
+  function moveListCursor(delta) {
+    if (visibleAssets.length === 0) {
+      listCursor = -1
+      return
+    }
+    var next = listCursor + delta
+    if (listCursor < 0) next = delta > 0 ? 0 : visibleAssets.length - 1
+    if (next < 0) next = 0
+    if (next > visibleAssets.length - 1) next = visibleAssets.length - 1
+    listCursor = next
+    root.ensureCursorVisible()
+  }
+
+  function moveListEdge(toEnd) {
+    if (visibleAssets.length === 0) {
+      listCursor = -1
+      return
+    }
+    listCursor = toEnd ? visibleAssets.length - 1 : 0
+    root.ensureCursorVisible()
+  }
+
+  function ensureCursorVisible() {
+    Qt.callLater(function() {
+      if (root.listCursor < 0) return
+      var view = root.searching ? overlayFlick : flick
+      var repeater = root.searching ? searchAssetRepeater : marketAssetRepeater
+      var item = repeater.itemAt(root.listCursor)
+      if (!view || !item) return
+      var mapped = item.mapToItem(view.contentItem, 0, 0)
+      var top = mapped.y
+      var bottom = top + item.height
+      if (top < view.contentY)
+        view.contentY = Math.max(0, top)
+      else if (bottom > view.contentY + view.height)
+        view.contentY = Math.min(Math.max(0, view.contentHeight - view.height), bottom - view.height)
+    })
+  }
+
+  function moveTab(delta) {
+    if (root.showingDetail || root.searching || !root.marketTabs.length) return
+    var current = 0
+    for (var i = 0; i < root.marketTabs.length; i++) {
+      if (root.marketTabs[i].value === root.marketTab) {
+        current = i
+        break
+      }
+    }
+    var next = (current + delta + root.marketTabs.length) % root.marketTabs.length
+    root.marketTab = root.marketTabs[next].value
+    root.resetHoverSelect()
+    if (flick) flick.contentY = 0
+    Qt.callLater(function() { root.refreshRows(false) })
+  }
+
+  function isBarAsset(row) {
+    if (!row) return false
+    var pid = String(barPnl.productId || "").toUpperCase()
+    var rowPid = String(row.productId || "").toUpperCase()
+    if (pid && rowPid) return rowPid === pid
+    var sym = String(barPnl.symbol || "").toUpperCase()
+    return !!(sym && String(row.id || "").toUpperCase() === sym && String(row.kind || "") === String(barPnl.kind || "crypto"))
+  }
+
+  function tickerId(row) {
+    if (!row) return ""
+    return String(row.productId || row.id || "")
+  }
+
+  function setBarTicker(productId, symbol) {
+    if (!productId || root.signedIn) return
+    if (tickerProc.running) tickerProc.running = false
+    var cmd = [pluginFile("bin/coinbase"), "ticker", productId]
+    if (symbol) cmd.push("--symbol", String(symbol))
+    tickerProc.command = cmd
+    tickerProc.running = true
+    if (!root.signedIn) refreshing = true
+  }
+
+  function pinToBar(row) {
+    if (!row || root.signedIn) return
+    root.setBarTicker(root.tickerId(row), String(row.id || ""))
+  }
+
+  function chooseAsset(row) {
+    if (!row) return
+    root.openDetail(row)
+  }
+
+  function openDetail(row) {
+    if (!row) return
+    root.detailAsset = row
+    root.searchQuery = ""
+    if (searchField) searchField.text = ""
+    root.loadDetailChart(row)
+  }
+
+  function loadDetailChart(row, periodOverride) {
+    if (!row) return
+    root.chartSeq += 1
+    root.chartProcSeq = root.chartSeq
+    root.chartWantId = String(root.tickerId(row) || "").toUpperCase()
+    if (chartProc.running) chartProc.running = false
+    root.detailLoading = true
+    root.detailChart = ({})
+    var p = periodOverride || period
+    chartProc.command = [pluginFile("bin/coinbase"), "chart", root.tickerId(row), "--period", p, "--symbol", String(row.id || ""), "--kind", String(row.kind || "crypto")]
+    chartProc.running = true
+  }
+
+  function closeDetail() {
+    root.chartSeq += 1
+    if (chartProc.running) chartProc.running = false
+    root.detailAsset = null
+    root.detailChart = ({})
+    root.detailLoading = false
+    root.chartHover = false
+    root.chartHoverPrice = NaN
+    root.chartHoverIndex = -1
+  }
+
+  function activateCursor() {
+    if (visibleAssets.length === 0) return
+    var idx = listCursor
+    if (idx < 0 || idx >= visibleAssets.length) idx = 0
+    listCursor = idx
+    root.chooseAsset(visibleAssets[idx])
+  }
+
+  function close() {
+    opened = false
+    watchlistRefreshPending = false
+    signingIn = false
+    closeDetail()
+  }
+
+  function dismiss() {
+    if (root.shell && typeof root.shell.hide === "function")
+      root.shell.hide((root.manifest && root.manifest.id) || "coinbase")
+    else close()
+  }
+
+  function refresh() {
+    if (snapshotProc.running) return
+    refreshing = true
+    snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", period]
+    snapshotProc.running = true
+  }
+
+  function refreshWatchlist() {
+    if (!root.opened || !root.signedIn) return
+    if (snapshotProc.running || watchlistProc.running) {
+      root.watchlistRefreshPending = true
+      return
+    }
+    root.watchlistRefreshPending = false
+    watchlistProc.command = [pluginFile("bin/coinbase"), "watchlist-refresh"]
+    watchlistProc.running = true
+  }
+
+  function setPeriod(next) {
+    if (!next || next === period) return
+    if (snapshotProc.running) snapshotProc.running = false
+    var nextSnapshot = Object.assign({}, root.snapshot)
+    nextSnapshot.period = next
+    root.snapshot = nextSnapshot
+    root.chartHover = false
+    root.chartHoverPrice = NaN
+    root.chartHoverIndex = -1
+    root.rowsRefreshPending = true
+    refreshing = true
+    snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", next, "--fast"]
+    snapshotProc.running = true
+    if (root.showingDetail && root.detailAsset)
+      root.loadDetailChart(root.detailAsset, next)
+  }
+
+  function signIn() {
+    if (root.signingIn) return
+    signingIn = true
+    loginStatus = "Opening Coinbase…"
+    Quickshell.execDetached([pluginFile("bin/coinbase"), "login"])
+  }
+
+  function saveAndSignIn() {
+    if (setupProc.running || !clientIdDraft || !clientSecretDraft) return
+    signingIn = true
+    loginStatus = "Saving OAuth app…"
+    setupProc.command = [pluginFile("bin/coinbase"), "setup", "--stdin"]
+    setupProc.running = true
+  }
+
+  function activateAuth() {
+    if (root.signedIn) root.logout()
+    else if (root.needsSetup && root.clientIdDraft && root.clientSecretDraft) root.saveAndSignIn()
+    else if (!root.needsSetup) root.signIn()
+  }
+
+  function logout() {
+    logoutProc.running = true
+  }
+
+  function openUrl(url) {
+    if (!url) return
+    Quickshell.execDetached([pluginFile("bin/coinbase"), "open", url])
+    root.dismiss()
+  }
+
+  FileView {
+    id: snapshotFile
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/coinbase/snapshot.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.applySnapshot(text())
+  }
+
+  FileView {
+    id: loginStatusFile
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/coinbase/login-status.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var data = {}
+      try { data = JSON.parse(text() || "{}") } catch (e) { data = {} }
+      var status = String(data.status || "")
+      if (status === "opening") {
+        root.signingIn = true
+        root.loginStatus = "Opening Coinbase…"
+      } else if (status === "waiting") {
+        root.signingIn = true
+        root.loginStatus = "Waiting for Coinbase in your browser…"
+        root.dismiss()
+      } else if (status === "exchanging") {
+        root.signingIn = true
+        root.loginStatus = "Finishing sign-in…"
+      } else if (status === "snapshot") {
+        root.signingIn = true
+        root.loginStatus = "Loading portfolio…"
+        snapshotFile.reload()
+      } else if (status === "done") {
+        root.signingIn = false
+        root.loginStatus = ""
+        snapshotFile.reload()
+        root.refresh()
+      } else if (status === "error") {
+        root.signingIn = false
+        root.loginStatus = String(data.message || "Sign-in did not finish.")
+      }
+    }
+  }
+
+  Process {
+    id: snapshotProc
+    command: [root.pluginFile("bin/coinbase"), "snapshot"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "")
+        if (raw.indexOf("{") !== -1) root.applySnapshot(raw)
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      root.refreshing = false
+      snapshotFile.reload()
+      Qt.callLater(function() { root.refreshRows(root.rowsRefreshPending) })
+      if (root.watchlistRefreshPending)
+        Qt.callLater(function() { root.refreshWatchlist() })
+    }
+  }
+
+  Process {
+    id: rowProc
+    stdout: StdioCollector {
+      waitForEnd: true
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      snapshotFile.reload()
+      if (root.rowsRefreshPending)
+        Qt.callLater(function() { root.refreshRows(true) })
+    }
+  }
+
+  Process {
+    id: setupProc
+    stdinEnabled: true
+    onStarted: {
+      setupProc.write(JSON.stringify({
+        client_id: root.clientIdDraft,
+        client_secret: root.clientSecretDraft
+      }) + "\n")
+      root.clientSecretDraft = ""
+    }
+    onExited: function(code) {
+      if (code === 0) root.signIn()
+      else {
+        root.signingIn = false
+        root.loginStatus = "Could not save OAuth app."
+      }
+    }
+  }
+
+  Process {
+    id: logoutProc
+    command: [root.pluginFile("bin/coinbase"), "logout"]
+    onExited: snapshotFile.reload()
+  }
+
+  Process {
+    id: watchlistProc
+    stdout: StdioCollector {
+      waitForEnd: true
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      snapshotFile.reload()
+      if (root.watchlistRefreshPending)
+        Qt.callLater(function() { root.refreshWatchlist() })
+      else if (root.marketTab === "watchlist")
+        Qt.callLater(function() { root.refreshRows(false) })
+    }
+  }
+
+  Process {
+    id: chartProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (!root.showingDetail || root.chartProcSeq !== root.chartSeq) return
+        var raw = String(text || "")
+        if (raw.indexOf("{") === -1) return
+        try {
+          var data = JSON.parse(raw)
+          var got = String(data.productId || data.id || "").toUpperCase()
+          var want = String(root.chartWantId || root.tickerId(root.detailAsset) || "").toUpperCase()
+          if (want && got && got !== want && got.split("-")[0] !== want.split("-")[0]) return
+          root.detailChart = data
+        } catch (e) {
+          root.detailChart = ({})
+        }
+        root.detailLoading = false
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      if (root.chartProcSeq === root.chartSeq) root.detailLoading = false
+    }
+  }
+
+  Process {
+    id: tickerProc
+    onExited: function(code) {
+      root.refreshing = false
+      snapshotFile.reload()
+      if (code === 0) {
+        root.searchQuery = ""
+        root.searchResults = []
+        root.listCursor = 0
+        if (searchField) searchField.text = ""
+      }
+    }
+  }
+
+  Process {
+    id: searchProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var rows = Model.parseSearch(text)
+        var seen = {}
+        var vis = root.visibleAssets || []
+        for (var i = 0; i < vis.length; i++)
+          seen[String(vis[i].id || "").toUpperCase()] = true
+        var out = []
+        for (var j = 0; j < rows.length; j++) {
+          var id = String(rows[j].id || "").toUpperCase()
+          if (seen[id]) continue
+          out.push(rows[j])
+        }
+        root.searchResults = out
+      }
+    }
+  }
+
+  Timer {
+    id: searchDebounce
+    interval: 280
+    onTriggered: {
+      var q = String(root.searchQuery || "").replace(/^\s+|\s+$/g, "")
+      if (q.length < 2) {
+        root.searchResults = []
+        return
+      }
+      searchProc.command = [root.pluginFile("bin/coinbase"), "search", q]
+      searchProc.running = true
+    }
+  }
+
+  Timer {
+    interval: 60000
+    running: root.opened && root.signedIn
+    repeat: true
+    onTriggered: root.refreshWatchlist()
+  }
+
+  component AuthButton: Rectangle {
+    id: authBtn
+    property string label: "Sign in"
+    property bool primary: true
+    property bool enabled: true
+    property bool compact: false
+
+    implicitWidth: Math.max(compact ? Style.space(56) : Style.space(88), authLabel.implicitWidth + Style.space(compact ? 14 : 24))
+    implicitHeight: compact ? Style.space(24) : Style.space(32)
+    radius: Style.cornerRadius
+    color: authMouse.pressed
+      ? Style.pressedFillFor(root.foreground, Color.accent)
+      : (authMouse.containsMouse
+        ? Style.hoverFillFor(root.foreground, Color.accent)
+        : (primary ? Style.selectedFillFor(root.foreground, Color.accent) : "transparent"))
+    border.width: Math.max(1, Style.normalBorderWidth)
+    border.color: primary ? root.foreground : root.muted
+    opacity: enabled ? 1 : 0.55
+
+    Text {
+      id: authLabel
+      anchors.centerIn: parent
+      text: authBtn.label
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: compact ? Style.font.bodySmall : Style.font.body
+      font.bold: primary
+    }
+
+    MouseArea {
+      id: authMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      enabled: authBtn.enabled
+      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: authBtn.clicked()
+    }
+
+    signal clicked()
+  }
+
+  component AssetRow: Rectangle {
+    id: assetRow
+    required property var modelData
+    required property int index
+    width: parent ? parent.width : 0
+    height: Style.space(48)
+    radius: Style.cornerRadius
+    color: (index === root.listCursor)
+      ? Style.hoverFillFor(root.foreground, Color.accent)
+      : "transparent"
+
+    Column {
+      id: assetCol
+      z: 1
+      width: parent.width - Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(4)
+      spacing: Style.space(2)
+
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+
+        Column {
+          width: parent.width - Style.space(220)
+          spacing: Style.space(1)
+          Row {
+            spacing: Style.space(6)
+            Text {
+              text: String(modelData.name || modelData.id)
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: !root.signedIn && root.isBarAsset(modelData)
+              elide: Text.ElideRight
+            }
+            Text {
+              visible: !root.signedIn && root.isBarAsset(modelData)
+              text: "󰐃"
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
+          Text {
+            text: [modelData.id, modelData.kind].filter(function(s) { return !!s }).join(" · ")
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Sparkline {
+          width: Style.space(72)
+          height: Style.space(28)
+          compact: true
+          interactive: false
+          values: modelData.rowSpark || []
+          stroke: root.rowPeriodColor(modelData)
+          fill: Util.alpha(root.rowPeriodColor(modelData), 0.18)
+          foreground: root.foreground
+          muted: root.muted
+          fontFamily: root.fontFamily
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        Column {
+          width: Style.space(80)
+          Text {
+            anchors.right: parent.right
+            text: Number(modelData.price) > 0 ? Model.formatUsd(modelData.price, Number(modelData.price) >= 100 ? 2 : 4) : "—"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+          Text {
+            anchors.right: parent.right
+            text: isFinite(root.rowPeriodPercent(modelData)) ? Model.formatPercent(root.rowPeriodPercent(modelData)) : "—"
+            color: root.rowPeriodColor(modelData)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+      }
+    }
+
+    HoverHandler {
+      id: rowHover
+      cursorShape: Qt.PointingHandCursor
+      onPointChanged: {
+        root.notePointerMove(rowHover)
+        if (root.hoverSelectEnabled && hovered) root.listCursor = index
+      }
+      onHoveredChanged: {
+        if (hovered && root.hoverSelectEnabled) root.listCursor = index
+      }
+    }
+
+    TapHandler {
+      acceptedButtons: Qt.LeftButton
+      gesturePolicy: TapHandler.ReleaseWithinBounds
+      onTapped: root.chooseAsset(modelData)
+    }
+  }
+
+  PanelWindow {
+    id: window
+    visible: root.opened
+    anchors { top: true; bottom: true; left: true; right: true }
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.namespace: "coinbase"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+
+    onVisibleChanged: if (visible && keyCatcher) keyCatcher.forceActiveFocus()
+
+    Rectangle {
+      anchors.fill: parent
+      color: Util.alpha(Color.background, 0.55)
+      MouseArea { anchors.fill: parent; onClicked: root.dismiss() }
+    }
+
+    Item {
+      id: keyCatcher
+      anchors.fill: parent
+      focus: true
+      Shortcut {
+        enabled: root.opened && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "/"
+        context: Qt.WindowShortcut
+        onActivated: root.focusSearch()
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Down"
+        context: Qt.WindowShortcut
+        onActivated: root.moveListCursor(1)
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Up"
+        context: Qt.WindowShortcut
+        onActivated: root.moveListCursor(-1)
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Return"
+        context: Qt.WindowShortcut
+        onActivated: root.activateCursor()
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Enter"
+        context: Qt.WindowShortcut
+        onActivated: root.activateCursor()
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !root.searching && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Left"
+        context: Qt.WindowShortcut
+        onActivated: root.moveTab(-1)
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !root.searching && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Right"
+        context: Qt.WindowShortcut
+        onActivated: root.moveTab(1)
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "Home"
+        context: Qt.WindowShortcut
+        onActivated: root.moveListEdge(false)
+      }
+      Shortcut {
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "End"
+        context: Qt.WindowShortcut
+        onActivated: root.moveListEdge(true)
+      }
+
+      Keys.onEscapePressed: {
+        if (root.showingDetail) {
+          root.closeDetail()
+          event.accepted = true
+        } else root.dismiss()
+      }
+      Keys.onPressed: function(event) {
+        var typing = searchField.activeFocus || clientIdField.activeFocus || clientSecretField.activeFocus
+        if (event.key === Qt.Key_Escape) {
+          if (root.showingDetail) {
+            root.closeDetail()
+            event.accepted = true
+            return
+          }
+        }
+        if ((event.key === Qt.Key_Slash || event.text === "/") && !typing) {
+          root.focusSearch()
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_R && !typing) {
+          root.refresh()
+          event.accepted = true
+          return
+        }
+        if (!typing && !root.showingDetail && (event.key === Qt.Key_J || event.key === Qt.Key_K)) {
+          root.moveListCursor(event.key === Qt.Key_J ? 1 : -1)
+          event.accepted = true
+          return
+        }
+        if (!typing && !root.showingDetail && !root.searching && (event.key === Qt.Key_H || event.key === Qt.Key_L)) {
+          root.moveTab(event.key === Qt.Key_L ? 1 : -1)
+          event.accepted = true
+        }
+      }
+
+      BorderSurface {
+        id: card
+        anchors.centerIn: parent
+        width: Math.min(Style.space(480), parent.width - Style.space(40))
+        height: Math.min(Style.space(580), parent.height - Style.space(36))
+        color: Color.popups.background
+        radius: Style.cornerRadius
+        borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+
+        MouseArea {
+          anchors.fill: parent
+          z: 0
+          onClicked: function(m) { m.accepted = true }
+        }
+
+        Item {
+          id: chrome
+          z: 1
+          anchors.fill: parent
+          anchors.topMargin: card.borderTop + root.pad
+          anchors.bottomMargin: card.borderBottom + root.pad
+          anchors.leftMargin: card.borderLeft + root.pad
+          anchors.rightMargin: card.borderRight + root.pad
+
+          Column {
+            id: topChrome
+            anchors.top: parent.top
+            width: parent.width
+            spacing: Style.space(10)
+
+          Item {
+            width: parent.width
+            height: Math.max(Style.space(32), detailActions.implicitHeight, headerAuth.implicitHeight, accountActions.implicitHeight)
+
+            Row {
+              id: titleRow
+              anchors.left: parent.left
+              anchors.right: detailActions.visible ? detailActions.left : (accountActions.visible ? accountActions.left : headerAuth.left)
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(8)
+
+              CoinbaseIcon {
+                id: headerIcon
+                visible: !root.showingDetail
+                iconSize: Style.font.title
+                color: root.foreground
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: backLabel
+                visible: root.showingDetail
+                text: "‹"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(8)
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.closeDetail()
+                }
+              }
+
+              Text {
+                id: headerCopy
+                width: Math.max(0, titleRow.width - (headerIcon.visible ? headerIcon.width + titleRow.spacing : 0) - (backLabel.visible ? backLabel.width + titleRow.spacing : 0))
+                text: root.showingDetail
+                  ? String((detailAsset && (detailAsset.name || detailAsset.id)) || "Asset")
+                  : (root.signedIn && snapshot.user && snapshot.user.name ? snapshot.user.name : "Coinbase")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                elide: Text.ElideRight
+                verticalAlignment: Text.AlignVCenter
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Row {
+              id: detailActions
+              visible: root.showingDetail
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              Button {
+                visible: !root.signedIn
+                text: root.isBarAsset(root.detailAsset) ? "Pinned" : "Pin"
+                bordered: true
+                selected: root.isBarAsset(root.detailAsset)
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                onClicked: root.pinToBar(root.detailAsset)
+              }
+              Button {
+                text: "Buy"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                onClicked: root.openUrl((root.detailAsset && (root.detailAsset.buyUrl || root.detailAsset.url)) || "")
+              }
+              Button {
+                text: "Sell"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                onClicked: root.openUrl((root.detailAsset && (root.detailAsset.sellUrl || root.detailAsset.url)) || "")
+              }
+            }
+
+            Row {
+              id: accountActions
+              visible: root.signedIn && !root.showingDetail
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              AuthButton {
+                compact: true
+                label: "My account"
+                primary: false
+                onClicked: root.openUrl("https://www.coinbase.com/")
+              }
+              AuthButton {
+                compact: true
+                label: "Sign out"
+                primary: false
+                onClicked: root.logout()
+              }
+            }
+
+            AuthButton {
+              id: headerAuth
+              visible: !root.signedIn && !root.needsSetup && !root.showingDetail
+              width: visible ? implicitWidth : 0
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              compact: true
+              label: root.signingIn ? "Signing in…" : "Sign in"
+              primary: true
+              enabled: !root.signingIn
+              onClicked: root.signIn()
+            }
+          }
+
+          Column {
+            visible: !root.signedIn && root.needsSetup
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "This copy has no OAuth broker yet. Deploy broker/ or paste a Coinbase OAuth client ID and secret."
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            TextField {
+              id: clientIdField
+              width: parent.width
+              placeholderText: "OAuth client ID"
+              foreground: root.foreground
+              font.family: root.fontFamily
+              text: root.clientIdDraft
+              onTextChanged: root.clientIdDraft = text
+              Keys.onEscapePressed: root.dismiss()
+            }
+
+            TextField {
+              id: clientSecretField
+              width: parent.width
+              placeholderText: "OAuth client secret (stored locally, never in git)"
+              password: true
+              foreground: root.foreground
+              font.family: root.fontFamily
+              text: root.clientSecretDraft
+              onTextChanged: root.clientSecretDraft = text
+              Keys.onEscapePressed: root.dismiss()
+            }
+
+            AuthButton {
+              width: parent.width
+              height: Style.space(40)
+              label: root.signingIn ? (root.loginStatus || "Signing in…") : "Save and sign in"
+              primary: true
+              enabled: !root.signingIn && root.clientIdDraft !== "" && root.clientSecretDraft !== ""
+              onClicked: root.saveAndSignIn()
+            }
+          }
+
+          Text {
+            visible: !root.signedIn && root.loginStatus !== ""
+            width: parent.width
+            horizontalAlignment: Text.AlignRight
+            wrapMode: Text.WordWrap
+            text: root.loginStatus
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          }
+
+          Column {
+            id: chartColumn
+            anchors.top: topChrome.bottom
+            anchors.topMargin: Style.space(10)
+            width: parent.width
+            spacing: Style.space(6)
+
+                Text {
+                  visible: !root.showingDetail && !root.signedIn
+                  width: parent.width
+                  text: root.selectedAssetLabel
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.heading
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Column {
+                  width: parent.width
+                  spacing: Style.space(2)
+
+                  Text {
+                    text: Model.formatUsd(root.displayPrice, 2)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.display
+                    font.bold: true
+                  }
+
+                  Row {
+                    spacing: Style.space(8)
+                    Text {
+                      text: Model.formatSignedUsd(root.displayPnl, 2)
+                      color: Model.pnlColor(root.displayPnl, Color.accent, Color.urgent, root.foreground)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.title
+                      font.bold: true
+                    }
+                    Text {
+                      text: Model.formatPercent(root.displayPnlPercent)
+                      color: Model.pnlColor(root.displayPnlPercent, Color.accent, Color.urgent, root.foreground)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.title
+                    }
+                    Text {
+                      visible: root.chartHover && root.chartHoverTime !== ""
+                      text: root.chartHoverTime
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      visible: (root.refreshing || root.detailLoading) && !root.chartHover
+                      text: "Updating…"
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.letterSpacing: 1
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+
+                Row {
+                  spacing: Style.space(4)
+
+                  Repeater {
+                    model: root.periodOptions
+                    Rectangle {
+                      required property var modelData
+                      readonly property bool current: modelData.value === root.period
+                      radius: Style.space(6)
+                      color: current ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                      implicitWidth: pillLabel.implicitWidth + Style.space(14)
+                      implicitHeight: pillLabel.implicitHeight + Style.space(8)
+
+                      Text {
+                        id: pillLabel
+                        anchors.centerIn: parent
+                        text: modelData.label
+                        color: current ? root.foreground : root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: current
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.setPeriod(modelData.value)
+                      }
+                    }
+                  }
+                }
+
+                Sparkline {
+                  width: parent.width
+                  height: Style.space(120)
+                  values: root.sparkline
+                  stroke: root.pnlColor
+                  fill: Util.alpha(root.pnlColor, 0.16)
+                  foreground: root.foreground
+                  muted: root.muted
+                  fontFamily: root.fontFamily
+                  onHovered: function(active, price, index) {
+                    root.chartHover = active
+                    root.chartHoverPrice = price
+                    root.chartHoverIndex = index
+                  }
+                }
+
+                Item {
+                  visible: !root.showingDetail
+                  width: parent.width
+                  height: searchField.implicitHeight
+
+                  TextField {
+                    id: searchField
+                    width: parent.width
+                    placeholderText: "Search"
+                    foreground: root.foreground
+                    font.family: root.fontFamily
+                    rightPadding: Style.space(88)
+                    text: root.searchQuery
+                    onTextChanged: {
+                      root.searchQuery = text
+                      root.resetHoverSelect()
+                      searchDebounce.restart()
+                    }
+                    Keys.onEscapePressed: {
+                      text = ""
+                      root.searchQuery = ""
+                      keyCatcher.forceActiveFocus()
+                      event.accepted = true
+                    }
+                    Keys.onDownPressed: root.moveListCursor(1)
+                    Keys.onUpPressed: root.moveListCursor(-1)
+                    Keys.onReturnPressed: root.activateCursor()
+                    Keys.onEnterPressed: root.activateCursor()
+                  }
+
+                  Row {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: String(searchField.text) === "" && !searchField.activeFocus
+                    spacing: Style.space(6)
+
+                    Text {
+                      text: "press"
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Rectangle {
+                      width: slashHint.implicitWidth + Style.space(10)
+                      height: slashHint.implicitHeight + Style.space(4)
+                      radius: 4
+                      color: "transparent"
+                      border.width: 1
+                      border.color: root.muted
+                      anchors.verticalCenter: parent.verticalCenter
+
+                      Text {
+                        id: slashHint
+                        anchors.centerIn: parent
+                        text: "/"
+                        color: root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                    }
+                  }
+                }
+          }
+
+          Item {
+            id: body
+            anchors.top: chartColumn.bottom
+            anchors.topMargin: Style.space(8)
+            anchors.bottom: parent.bottom
+            width: parent.width
+            clip: true
+
+            Column {
+              id: marketHeader
+              visible: !root.searching && !root.showingDetail
+              anchors.top: parent.top
+              width: parent.width
+              spacing: Style.space(8)
+
+              Row {
+                spacing: Style.space(4)
+                Repeater {
+                  model: root.marketTabs
+                  Button {
+                    required property var modelData
+                    text: modelData.label
+                    selected: modelData.value === root.marketTab
+                    bordered: true
+                    foreground: root.foreground
+                    accent: Color.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    focusable: false
+                    onClicked: {
+                      root.marketTab = modelData.value
+                      root.resetHoverSelect()
+                      if (flick) flick.contentY = 0
+                      Qt.callLater(function() { root.refreshRows(false) })
+                    }
+                  }
+                }
+              }
+
+              PanelSectionHeader {
+                text: root.marketTab === "watchlist" ? "WATCHLIST" : (root.marketTab === "derivative" ? "PERPS" : (root.marketTab === "stock" ? "STOCKS" : "CRYPTO"))
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                text: "↑↓ select · ←→ tabs · Enter open · / search · Esc back"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Flickable {
+              id: detailFlick
+              anchors.fill: parent
+              visible: root.showingDetail && !root.searching
+              contentWidth: width
+              contentHeight: detailBlock.implicitHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
+              flickableDirection: Flickable.VerticalFlick
+
+              Column {
+                id: detailBlock
+                width: detailFlick.width
+                spacing: Style.space(14)
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(16)
+                  visible: Number(detailChart.open) > 0 || Number(detailChart.high) > 0 || Number(detailChart.low) > 0 || Number(detailChart.volume) > 0
+
+                  Repeater {
+                    model: [
+                      { label: "OPEN", value: Number(detailChart.open) > 0 ? Model.formatUsd(detailChart.open, Number(detailChart.open) >= 100 ? 2 : 4) : "—" },
+                      { label: "HIGH", value: Number(detailChart.high) > 0 ? Model.formatUsd(detailChart.high, Number(detailChart.high) >= 100 ? 2 : 4) : "—" },
+                      { label: "LOW", value: Number(detailChart.low) > 0 ? Model.formatUsd(detailChart.low, Number(detailChart.low) >= 100 ? 2 : 4) : "—" },
+                      { label: "VOL", value: Number(detailChart.volume) > 0 ? Model.formatCompactNumber(detailChart.volume) : "—" }
+                    ]
+                    Column {
+                      required property var modelData
+                      width: (detailBlock.width - Style.space(48)) / 4
+                      spacing: Style.space(4)
+                      Text {
+                        text: modelData.label
+                        color: root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.letterSpacing: 1
+                      }
+                      Text {
+                        text: modelData.value
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.title
+                      }
+                    }
+                  }
+                }
+
+                Grid {
+                  width: parent.width
+                  columns: 3
+                  columnSpacing: Style.space(16)
+                  rowSpacing: Style.space(12)
+                  visible: detailChart.stats && detailChart.stats.length > 0
+
+                  Repeater {
+                    model: detailChart.stats || []
+                    Column {
+                      required property var modelData
+                      width: (detailBlock.width - Style.space(32)) / 3
+                      spacing: Style.space(4)
+                      Text {
+                        text: String(modelData.label || "")
+                        color: root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.letterSpacing: 1
+                      }
+                      Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: String(modelData.value || "—")
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.title
+                      }
+                    }
+                  }
+                }
+
+                Text {
+                  visible: !(detailChart.stats && detailChart.stats.length) && !root.detailLoading
+                  text: "No extra market stats for this asset yet."
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+
+            Flickable {
+              id: flick
+              anchors.top: marketHeader.bottom
+              anchors.topMargin: Style.space(8)
+              anchors.bottom: parent.bottom
+              anchors.left: parent.left
+              anchors.right: parent.right
+              visible: !root.searching && !root.showingDetail
+              contentWidth: width
+              contentHeight: marketsBlock.implicitHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
+              flickableDirection: Flickable.VerticalFlick
+
+              HoverHandler {
+                id: listHover
+                onPointChanged: root.notePointerMove(listHover)
+              }
+
+                Column {
+                  id: marketsBlock
+                  width: flick.width
+                  spacing: Style.space(8)
+
+                  Text {
+                    visible: root.visibleAssets.length === 0
+                    text: root.marketTab === "watchlist" ? "Nothing on your Coinbase watchlist." : "Nothing in this tab yet."
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Repeater {
+                    id: marketAssetRepeater
+                    model: root.visibleAssets
+                    AssetRow {}
+                  }
+
+                  Text {
+                    visible: String(snapshot.error || "") !== ""
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: String(snapshot.error || "")
+                    color: Color.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                }
+            }
+
+            Rectangle {
+              id: searchOverlay
+              visible: root.searching && !root.showingDetail
+              anchors.fill: parent
+              z: 30
+              color: Util.alpha(Color.popups.background, 0.88)
+              radius: Style.cornerRadius
+              clip: true
+              border.width: 1
+              border.color: Util.alpha(root.foreground, 0.08)
+
+              HoverHandler {
+                id: overlayHover
+                onPointChanged: root.notePointerMove(overlayHover)
+              }
+
+              Flickable {
+                id: overlayFlick
+                anchors.fill: parent
+                anchors.margins: Style.space(4)
+                contentWidth: width
+                contentHeight: overlayCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+                flickableDirection: Flickable.VerticalFlick
+
+                Column {
+                  id: overlayCol
+                  width: overlayFlick.width
+                  spacing: Style.space(2)
+
+                  Text {
+                    visible: root.visibleAssets.length === 0
+                    width: parent.width
+                    text: "No matching assets"
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Repeater {
+                    id: searchAssetRepeater
+                    model: root.visibleAssets
+                    AssetRow {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

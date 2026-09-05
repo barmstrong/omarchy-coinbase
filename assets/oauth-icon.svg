@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#0052FF"/>
+  <!-- Official C ratios from the 128px Coinbase favicon: outer 53, inner 27, slot 14. -->
+  <circle cx="512" cy="512" r="424" fill="#FFFFFF"/>
+  <circle cx="512" cy="512" r="216" fill="#0052FF"/>
+  <rect x="728" y="456" width="296" height="112" fill="#0052FF"/>
+</svg>

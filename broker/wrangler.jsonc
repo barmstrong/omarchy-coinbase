@@ -1,0 +1,11 @@
+{
+  "name": "omarchy-oauth",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-29",
+  "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS"
+    }
+  ]
+}

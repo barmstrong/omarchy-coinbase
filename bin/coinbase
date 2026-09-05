@@ -1,0 +1,3799 @@
+#!/usr/bin/env python3
+"""Coinbase helper for the Omarchy coinbase plugin.
+
+Talks to Coinbase over OAuth (read-only scopes) and writes a snapshot the
+QML watches. Tokens and client secrets stay in ~/.local/state and never
+enter QML or git.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import secrets
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from contextlib import contextmanager
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy" / "coinbase"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+APP_FILE = STATE_DIR / "oauth-app.json"
+TOKEN_FILE = STATE_DIR / "tokens.json"
+SNAPSHOT_FILE = STATE_DIR / "snapshot.json"
+WATCHLIST_FILE = STATE_DIR / "watchlist.json"
+PREFS_FILE = STATE_DIR / "prefs.json"
+PRODUCTS_CACHE = STATE_DIR / "products-cache.json"
+CANDLES_CACHE = STATE_DIR / "candles-cache.json"
+STOCK_CAPS_FILE = STATE_DIR / "stock-caps.json"
+LOGIN_STATUS_FILE = STATE_DIR / "login-status.json"
+BROKER_URL_FILE = PLUGIN_ROOT / "broker.url"
+
+AUTH_URL = "https://login.coinbase.com/oauth2/auth"
+TOKEN_URL = "https://login.coinbase.com/oauth2/token"
+REVOKE_URL = "https://login.coinbase.com/oauth2/revoke"
+API = "https://api.coinbase.com"
+REDIRECT_URI = "http://127.0.0.1:8765/callback"
+LISTEN_PORT = 8765
+UA = "omarchy-coinbase/1.0"
+CB_VERSION = "2024-08-29"
+SCOPES = ",".join(
+    [
+        "wallet:user:read",
+        "wallet:accounts:read",
+        "offline_access",
+    ]
+)
+PERIODS = {
+    "hour": {"granularity": "FIVE_MINUTE", "seconds": 3600},
+    "day": {"granularity": "FIVE_MINUTE", "seconds": 86400},
+    "week": {"granularity": "ONE_HOUR", "seconds": 7 * 86400},
+    "month": {"granularity": "SIX_HOUR", "seconds": 30 * 86400},
+    "year": {"granularity": "ONE_DAY", "seconds": 365 * 86400},
+    "all": {"granularity": "ONE_DAY", "seconds": 5 * 365 * 86400},
+}
+GRANULARITY_SECS = {
+    "ONE_MINUTE": 60,
+    "FIVE_MINUTE": 300,
+    "FIFTEEN_MINUTE": 900,
+    "THIRTY_MINUTE": 1800,
+    "ONE_HOUR": 3600,
+    "TWO_HOUR": 7200,
+    "SIX_HOUR": 21600,
+    "ONE_DAY": 86400,
+}
+MAX_CANDLES = 300
+SPARKLINE_POINTS = 120
+CATALOG_TTL = 300
+WATCHLIST_TTL = 180
+STOCK_CAP_TTL = 6 * 3600
+ROW_SPARK_POINTS = 24
+CANDLE_CACHE_LIMIT = 600
+CANDLE_STALE_SECONDS = 7 * 86400
+BAR_DISPLAY_MODES = ("full", "quote", "price")
+YAHOO_UA = "Mozilla/5.0"
+YAHOO_RANGES = {
+    "hour": ("1d", "5m"),
+    "day": ("1d", "5m"),
+    "week": ("5d", "15m"),
+    "month": ("1mo", "1d"),
+    "year": ("1y", "1d"),
+    "all": ("5y", "1wk"),
+}
+ACTION_URLS = {
+    "send": "https://www.coinbase.com/send",
+    "receive": "https://www.coinbase.com/receive",
+    "deposit": "https://www.coinbase.com/deposit",
+    "withdraw": "https://www.coinbase.com/withdraw",
+}
+STABLES = {"USDT", "USDC", "DAI", "FDUSD", "USDE", "BUSD", "USD1", "PYUSD", "USDS", "TUSD", "RLUSD", "GUSD", "USDP", "EURC", "USDG"}
+WRAPPED = {"STETH", "WSTETH", "WBTC", "WETH", "WEETH", "CBBTC", "WBT", "CBETH"}
+FALLBACK_MAJORS = [
+    ("BTC", "Bitcoin"),
+    ("ETH", "Ethereum"),
+    ("SOL", "Solana"),
+    ("XRP", "XRP"),
+    ("DOGE", "Dogecoin"),
+    ("ADA", "Cardano"),
+    ("BCH", "Bitcoin Cash"),
+    ("LINK", "Chainlink"),
+]
+MEGA_STOCKS = [
+    ("AAPL", "Apple"),
+    ("MSFT", "Microsoft"),
+    ("NVDA", "NVIDIA"),
+    ("GOOGL", "Alphabet"),
+    ("AMZN", "Amazon"),
+    ("META", "Meta"),
+    ("TSLA", "Tesla"),
+    ("AVGO", "Broadcom"),
+    ("NFLX", "Netflix"),
+    ("COST", "Costco"),
+    ("AMD", "AMD"),
+    ("JPM", "JPMorgan"),
+    ("COIN", "Coinbase"),
+    ("SPY", "SPDR S&P 500"),
+    ("QQQ", "Invesco QQQ"),
+]
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "DOGE": "dogecoin",
+    "ADA": "cardano",
+    "LINK": "chainlink",
+    "BCH": "bitcoin-cash",
+    "AVAX": "avalanche-2",
+    "DOT": "polkadot",
+    "LTC": "litecoin",
+    "UNI": "uniswap",
+    "ATOM": "cosmos",
+    "NEAR": "near",
+    "APT": "aptos",
+    "SUI": "sui",
+    "HYPE": "hyperliquid",
+    "ZEC": "zcash",
+    "WAMPL": "wrapped-ampleforth",
+}
+COMMODITY_ETFS = [
+    ("GLD", "Gold"),
+    ("SLV", "Silver"),
+    ("USO", "Oil"),
+    ("UNG", "Natural Gas"),
+    ("CPER", "Copper"),
+]
+STOCK_CIKS = {
+    "AAPL": "0000320193",
+    "MSFT": "0000789019",
+    "NVDA": "0001045810",
+    "GOOGL": "0001652044",
+    "AMZN": "0001018724",
+    "META": "0001326801",
+    "TSLA": "0001318605",
+    "AVGO": "0001730168",
+    "NFLX": "0001065280",
+    "COST": "0000909832",
+    "AMD": "0000002488",
+    "JPM": "0000019617",
+    "COIN": "0001679788",
+    "SPY": "0000884394",
+    "QQQ": "0001067839",
+    "GLD": "0001224133",
+    "SLV": "0001330568",
+    "USO": "0001327068",
+    "UNG": "0001477264",
+    "CPER": "0001471824",
+}
+
+_CANDLE_THREAD_LOCK = threading.Lock()
+_PRODUCT_THREAD_LOCK = threading.Lock()
+_PREFS_THREAD_LOCK = threading.Lock()
+MAX_HTTP_BYTES = 16 * 1024 * 1024
+
+
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only when credentials cannot cross an origin boundary."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        old_origin = (old.scheme.lower(), (old.hostname or "").lower(), old.port)
+        new_origin = (new.scheme.lower(), (new.hostname or "").lower(), new.port)
+        if old_origin != new_origin:
+            raise urllib.error.HTTPError(req.full_url, code, "cross-origin redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+HTTP_OPENER = urllib.request.build_opener(SameOriginRedirectHandler())
+
+
+def die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_state() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+@contextmanager
+def snapshot_lock():
+    ensure_state()
+    with (STATE_DIR / "snapshot.lock").open("w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def candle_cache_lock():
+    ensure_state()
+    with _CANDLE_THREAD_LOCK:
+        with (STATE_DIR / "candles-cache.lock").open("w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def product_cache_lock():
+    ensure_state()
+    with _PRODUCT_THREAD_LOCK:
+        with (STATE_DIR / "products-cache.lock").open("w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def prefs_lock():
+    ensure_state()
+    with _PREFS_THREAD_LOCK:
+        with (STATE_DIR / "prefs.lock").open("w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path: Path, data: Any, private: bool = False) -> None:
+    ensure_state()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    if private:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    tmp.replace(path)
+
+
+def write_snapshot(data: dict[str, Any]) -> None:
+    write_json(SNAPSHOT_FILE, data, private=False)
+
+
+def write_login_status(status: str, message: str = "") -> None:
+    write_json(
+        LOGIN_STATUS_FILE,
+        {"status": status, "message": message, "at": now_iso()},
+    )
+
+
+def broker_url() -> str:
+    env = (os.environ.get("COINBASE_OAUTH_BROKER") or "").strip().rstrip("/")
+    if env:
+        value = env
+    else:
+        try:
+            value = BROKER_URL_FILE.read_text(encoding="utf-8").strip().rstrip("/")
+        except OSError:
+            return ""
+    parsed = urllib.parse.urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return ""
+    return value
+
+
+def using_broker() -> bool:
+    return bool(broker_url())
+
+
+def empty_snapshot(**extra: Any) -> dict[str, Any]:
+    snap = {
+        "authenticated": False,
+        "usesBroker": using_broker(),
+        "needsSetup": not using_broker() and not bool(load_app().get("clientId")),
+        "error": "",
+        "user": {},
+        "total": 0,
+        "nativeCurrency": "USD",
+        "period": "day",
+        "pnl": 0,
+        "pnlPercent": 0,
+        "sparkline": [],
+        "assets": [],
+        "mode": "market",
+        "bar": {
+            "pnl": 0,
+            "pnlPercent": 0,
+            "period": "day",
+            "symbol": "BTC",
+            "productId": "BTC-USD",
+            "name": "Bitcoin",
+            "kind": "crypto",
+            "price": 0,
+        },
+        "catalogAt": 0,
+        "barDisplay": bar_display(),
+        "actions": ACTION_URLS,
+        "fetchedAt": now_iso(),
+    }
+    snap.update(extra)
+    return snap
+
+
+def load_app() -> dict[str, str]:
+    data = read_json(APP_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "clientId": str(data.get("clientId") or data.get("client_id") or "").strip(),
+        "clientSecret": str(data.get("clientSecret") or data.get("client_secret") or "").strip(),
+    }
+
+
+def load_tokens() -> dict[str, Any]:
+    data = read_json(TOKEN_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def load_watchlist_state() -> dict[str, Any]:
+    data = read_json(WATCHLIST_FILE, {})
+    if isinstance(data, list):
+        return {"products": [str(item).strip().upper() for item in data if str(item).strip()]}
+    return data if isinstance(data, dict) else {}
+
+
+def save_watchlist_state(**updates: Any) -> None:
+    data = load_watchlist_state()
+    data.pop("products", None)
+    data.pop("hiddenProducts", None)
+    data.update(updates)
+    write_json(WATCHLIST_FILE, data)
+
+
+def load_prefs() -> dict[str, Any]:
+    data = read_json(PREFS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def update_prefs(**updates: Any) -> dict[str, Any]:
+    with prefs_lock():
+        data = load_prefs()
+        data.update(updates)
+        write_json(PREFS_FILE, data)
+    return data
+
+
+def bar_display() -> str:
+    mode = str(load_prefs().get("barDisplay") or "full")
+    return mode if mode in BAR_DISPLAY_MODES else "full"
+
+
+def _is_hex_id(value: str) -> bool:
+    raw = str(value or "")
+    if raw.upper().endswith("-USD"):
+        raw = raw[:-4]
+    return len(raw) >= 32 and all(ch in "0123456789abcdefABCDEF" for ch in raw)
+
+
+def bar_preference() -> dict[str, str]:
+    prefs = load_prefs()
+    product = str(prefs.get("barProduct") or "").strip()
+    symbol = str(prefs.get("barSymbol") or "").strip().upper()
+    if _is_hex_id(product) or _is_hex_id(symbol):
+        update_prefs(barProduct="BTC-USD", barSymbol="BTC")
+        return {"symbol": "BTC", "product": "BTC-USD"}
+    product = product.upper()
+    if not product and not symbol:
+        return {"symbol": "BTC", "product": "BTC-USD"}
+    if not product and symbol:
+        product = product_id_for(symbol)
+    if not symbol and product:
+        symbol = product.split("-")[0]
+    return {"symbol": symbol or "BTC", "product": product or "BTC-USD"}
+
+
+def save_bar_preference(product_id: str, symbol: str = "") -> dict[str, str]:
+    raw = str(product_id or "").strip()
+    if not raw:
+        die("product id required")
+    given = str(symbol or "").strip().upper()
+    hex_id = len(raw) >= 32 and all(ch in "0123456789abcdefABCDEF" for ch in raw)
+    if hex_id:
+        product = raw
+        symbol_out = given
+        if not symbol_out:
+            previous = read_json(SNAPSHOT_FILE, {})
+            for asset in previous.get("assets") or []:
+                if str(asset.get("productId") or "") == raw:
+                    symbol_out = str(asset.get("id") or "").upper()
+                    break
+        if not symbol_out:
+            symbol_out = "BTC"
+    elif "-" in raw:
+        product = raw.upper()
+        symbol_out = given or raw.split("-")[0].upper()
+    else:
+        symbol_out = raw.upper()
+        product = product_id_for(symbol_out)
+    update_prefs(barProduct=product, barSymbol=symbol_out)
+    return {"symbol": symbol_out, "product": product}
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def num(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    if isinstance(value, dict):
+        return num(value.get("value") or value.get("amount"), default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def pkce_pair() -> tuple[str, str]:
+    verifier = b64url(secrets.token_bytes(32))
+    challenge = b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+def http_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    form: dict[str, str] | None = None,
+    body: Any = None,
+    timeout: int = 15,
+    allow_statuses: tuple[int, ...] = (),
+) -> Any:
+    data = None
+    req_headers = {"User-Agent": UA, "Accept": "application/json", "CB-VERSION": CB_VERSION}
+    if headers:
+        req_headers.update(headers)
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        req_headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with HTTP_OPENER.open(req, timeout=timeout) as resp:
+            raw_bytes = resp.read(MAX_HTTP_BYTES + 1)
+            if len(raw_bytes) > MAX_HTTP_BYTES:
+                raise RuntimeError(f"response too large from {urllib.parse.urlsplit(url).hostname or 'remote host'}")
+            raw = raw_bytes.decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict):
+                parsed["_http_status"] = resp.status
+            return parsed
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(65536).decode("utf-8", errors="replace")
+        if exc.code in allow_statuses:
+            try:
+                parsed = json.loads(detail) if detail else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict):
+                parsed["_http_status"] = exc.code
+            return parsed
+        raise RuntimeError(f"HTTP {exc.code} {url}: {detail[:400]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"request failed {url}: {exc}") from exc
+
+
+def api_get(path: str, token: str, params: dict[str, Any] | None = None) -> Any:
+    if path.startswith("http"):
+        parsed = urllib.parse.urlparse(path)
+        if parsed.scheme != "https" or parsed.hostname != "api.coinbase.com" or parsed.username or parsed.password:
+            raise RuntimeError("refusing authenticated request outside api.coinbase.com")
+        url = path
+    else:
+        if not path.startswith("/"):
+            raise RuntimeError("Coinbase API path must be absolute")
+        url = API + path
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    return http_json("GET", url, headers={"Authorization": f"Bearer {token}"})
+
+
+def public_get(path: str, params: dict[str, Any] | None = None, timeout: int = 15) -> Any:
+    if path.startswith("http"):
+        parsed = urllib.parse.urlparse(path)
+        if parsed.scheme != "https" or parsed.hostname != "api.coinbase.com" or parsed.username or parsed.password:
+            raise RuntimeError("refusing public request outside api.coinbase.com")
+        url = path
+    else:
+        if not path.startswith("/"):
+            raise RuntimeError("Coinbase API path must be absolute")
+        url = API + path
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    return http_json("GET", url, timeout=timeout)
+
+
+def yahoo_get(url: str, timeout: int = 12) -> Any:
+    return http_json("GET", url, headers={"User-Agent": YAHOO_UA}, timeout=timeout)
+
+
+def yahoo_symbol_for(asset: dict[str, Any]) -> str:
+    raw = str(asset.get("yahoo") or asset.get("id") or "").strip().upper()
+    if not raw:
+        return ""
+    if asset.get("kind") in {"stock", "commodity"}:
+        return raw.split("-")[0]
+    if asset.get("kind") == "crypto":
+        return f"{raw.split('-')[0]}-USD"
+    return raw
+
+
+def _yahoo_closes(indicators: Any) -> list[float]:
+    quote = (indicators or {}).get("quote") if isinstance(indicators, dict) else None
+    row = quote[0] if isinstance(quote, list) and quote else {}
+    closes = row.get("close") if isinstance(row, dict) else []
+    out: list[float] = []
+    if not isinstance(closes, list):
+        return out
+    for item in closes:
+        px = num(item)
+        if px:
+            out.append(px)
+    return out
+
+
+def _quote_from_yahoo_meta(meta: dict[str, Any], closes: list[float], symbol: str) -> dict[str, Any]:
+    price = num(meta.get("regularMarketPrice") or meta.get("fulldayPrice") or (closes[-1] if closes else 0))
+    prev = num(meta.get("chartPreviousClose") or meta.get("previousClose"))
+    pct = num(meta.get("regularMarketChangePercent"))
+    if not pct and price and prev:
+        pct = (price - prev) / prev * 100
+    change = num(meta.get("regularMarketChange"))
+    if not change and price and prev:
+        change = price - prev
+    return {
+        "symbol": str(meta.get("symbol") or symbol).upper(),
+        "name": str(meta.get("shortName") or meta.get("longName") or symbol),
+        "price": price,
+        "previousClose": prev,
+        "change": change,
+        "changePercent": pct,
+        "marketCap": num(meta.get("marketCap")),
+        "closes": downsample(closes, ROW_SPARK_POINTS) if len(closes) > ROW_SPARK_POINTS else closes,
+        "series": [(0, px) for px in closes],
+    }
+
+
+def fetch_yahoo_spark(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for sym in symbols:
+        key = str(sym or "").strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        uniq.append(key)
+    if not uniq:
+        return {}
+    url = (
+        "https://query1.finance.yahoo.com/v7/finance/spark?symbols="
+        + urllib.parse.quote(",".join(uniq))
+        + "&range=1d&interval=5m&includePrePost=true"
+    )
+    try:
+        payload = yahoo_get(url)
+    except RuntimeError:
+        return {}
+    rows = ((payload.get("spark") or {}).get("result")) if isinstance(payload, dict) else []
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(rows, list):
+        return out
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        resp = (item.get("response") or [None])[0] or {}
+        meta = resp.get("meta") or {}
+        closes = _yahoo_closes(resp.get("indicators"))
+        symbol = str(item.get("symbol") or meta.get("symbol") or "").upper()
+        quote = _quote_from_yahoo_meta(meta, closes, symbol)
+        if quote["symbol"] and quote["price"]:
+            out[quote["symbol"]] = quote
+    return out
+
+
+def _latest_timeseries_value(rows: Any) -> float:
+    latest = 0.0
+    if not isinstance(rows, list):
+        return latest
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        reported = row.get("reportedValue")
+        val = num(reported.get("raw") if isinstance(reported, dict) else reported)
+        if val:
+            latest = val
+    return latest
+
+
+def fetch_yahoo_market_cap(symbol: str) -> float:
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return 0.0
+    now = int(time.time())
+    url = (
+        "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/"
+        + urllib.parse.quote(symbol)
+        + "?"
+        + urllib.parse.urlencode(
+            {
+                "symbol": symbol,
+                "type": "trailingMarketCap",
+                "period1": now - 120 * 86400,
+                "period2": now,
+            }
+        )
+    )
+    try:
+        payload = yahoo_get(url, timeout=10)
+    except RuntimeError:
+        return 0.0
+    result = ((payload.get("timeseries") or {}).get("result") or [None])[0] or {}
+    return _latest_timeseries_value(result.get("trailingMarketCap"))
+
+
+def fetch_sec_shares(cik: str) -> float:
+    raw = "".join(ch for ch in str(cik or "") if ch.isdigit())
+    if not raw:
+        return 0.0
+    url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{raw.zfill(10)}/dei/EntityCommonStockSharesOutstanding.json"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": UA, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError):
+        return 0.0
+    units = ((payload.get("units") or {}).get("shares") or [])
+    if not isinstance(units, list) or not units:
+        return 0.0
+    latest = max(units, key=lambda row: str((row or {}).get("end") or (row or {}).get("filed") or "") if isinstance(row, dict) else "")
+    return num(latest.get("val") if isinstance(latest, dict) else 0)
+
+
+def stock_market_caps(symbols: list[str]) -> dict[str, dict[str, float]]:
+    wanted = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        key = str(symbol or "").strip().upper().split("-")[0]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        wanted.append(key)
+    if not wanted:
+        return {}
+    data = read_json(STOCK_CAPS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    caps = {str(k).upper(): num(v) for k, v in (data.get("caps") or {}).items()} if isinstance(data.get("caps"), dict) else {}
+    shares = {str(k).upper(): num(v) for k, v in (data.get("shares") or {}).items()} if isinstance(data.get("shares"), dict) else {}
+    caps_at = num(data.get("capsAt"))
+    shares_at = num(data.get("sharesAt"))
+    caps_fresh = caps_at > time.time() - STOCK_CAP_TTL
+    shares_fresh = shares_at > time.time() - 24 * 3600
+    cap_fetch = [s for s in wanted if not (caps_fresh and caps.get(s))]
+    if cap_fetch:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {pool.submit(fetch_yahoo_market_cap, symbol): symbol for symbol in cap_fetch}
+            for fut in as_completed(futs):
+                try:
+                    value = fut.result() or 0.0
+                except Exception:  # noqa: BLE001
+                    value = 0.0
+                if value:
+                    caps[futs[fut]] = value
+        data["caps"] = caps
+        data["capsAt"] = int(time.time())
+    share_fetch = [
+        s
+        for s in wanted
+        if not caps.get(s) and STOCK_CIKS.get(s) and not (shares_fresh and shares.get(s))
+    ]
+    if share_fetch:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = {pool.submit(fetch_sec_shares, STOCK_CIKS[symbol]): symbol for symbol in share_fetch}
+            for fut in as_completed(futs):
+                try:
+                    value = fut.result() or 0.0
+                except Exception:  # noqa: BLE001
+                    value = 0.0
+                if value:
+                    shares[futs[fut]] = value
+        data["shares"] = shares
+        data["sharesAt"] = int(time.time())
+        write_json(STOCK_CAPS_FILE, data)
+    elif cap_fetch:
+        data["shares"] = shares
+        write_json(STOCK_CAPS_FILE, data)
+    return {"caps": caps, "shares": shares}
+
+
+def fetch_yahoo_candles(symbol: str, period: str) -> list[tuple[int, float]]:
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return []
+    spec = YAHOO_RANGES.get(period) or YAHOO_RANGES["day"]
+    key = f"yahoo|{symbol}|{period}"
+    cached, cached_at = _cached_candles(key)
+    ttl = _candle_ttl((PERIODS.get(period) or PERIODS["day"])["seconds"])
+    if cached and cached_at > time.time() - ttl:
+        return cached
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        + urllib.parse.quote(symbol)
+        + f"?range={spec[0]}&interval={spec[1]}&includePrePost=true"
+    )
+    try:
+        payload = yahoo_get(url)
+    except RuntimeError:
+        return cached if cached_at > time.time() - CANDLE_STALE_SECONDS else []
+    result = ((payload.get("chart") or {}).get("result") or [None])[0] or {}
+    timestamps = result.get("timestamp") or []
+    closes = _yahoo_closes(result.get("indicators"))
+    out: list[tuple[int, float]] = []
+    if isinstance(timestamps, list) and timestamps and len(timestamps) == len(closes):
+        for ts, px in zip(timestamps, closes):
+            if int(num(ts)) and px:
+                out.append((int(num(ts)), px))
+        if out:
+            _store_cached_candles(key, out)
+            return out
+        return cached if cached_at > time.time() - CANDLE_STALE_SECONDS else []
+    now = int(time.time())
+    step = max(1, (PERIODS.get(period) or PERIODS["day"])["seconds"] // max(1, len(closes)))
+    start = now - step * max(0, len(closes) - 1)
+    for i, px in enumerate(closes):
+        out.append((start + i * step, px))
+    if out:
+        _store_cached_candles(key, out)
+        return out
+    return cached if cached_at > time.time() - CANDLE_STALE_SECONDS else []
+
+
+def format_stat_usd(value: Any) -> str:
+    n = num(value)
+    if not n:
+        return ""
+    sign = "-" if n < 0 else ""
+    absn = abs(n)
+    if absn >= 1e12:
+        return f"{sign}${absn / 1e12:.2f}T"
+    if absn >= 1e9:
+        return f"{sign}${absn / 1e9:.2f}B"
+    if absn >= 1e6:
+        return f"{sign}${absn / 1e6:.2f}M"
+    if absn >= 1e3:
+        return f"{sign}${absn / 1e3:.2f}K"
+    return f"{sign}${absn:,.2f}"
+
+
+def format_stat_qty(value: Any) -> str:
+    n = num(value)
+    if not n:
+        return ""
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.2f}K"
+    return f"{n:,.0f}"
+
+
+def _add_stat(stats: list[dict[str, str]], label: str, value: str) -> None:
+    text = str(value or "").strip()
+    if not text or text in {"-", "0", "$0.00"}:
+        return
+    stats.append({"label": label, "value": text})
+
+
+def yahoo_chart_bundle(symbol: str, period: str) -> dict[str, Any]:
+    symbol = str(symbol or "").strip().upper()
+    spec = YAHOO_RANGES.get(period) or YAHOO_RANGES["day"]
+    empty: dict[str, Any] = {"candles": [], "meta": {}, "price": 0, "name": symbol, "changePercent": 0}
+    if not symbol:
+        return empty
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        + urllib.parse.quote(symbol)
+        + f"?range={spec[0]}&interval={spec[1]}&includePrePost=true"
+    )
+    try:
+        payload = yahoo_get(url)
+    except RuntimeError:
+        return empty
+    result = ((payload.get("chart") or {}).get("result") or [None])[0] or {}
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    timestamps = result.get("timestamp") or []
+    closes = _yahoo_closes(result.get("indicators"))
+    parsed: list[tuple[int, float]] = []
+    if isinstance(timestamps, list) and timestamps and len(timestamps) == len(closes):
+        for ts, px in zip(timestamps, closes):
+            if int(num(ts)) and px:
+                parsed.append((int(num(ts)), px))
+    elif closes:
+        parsed = fetch_yahoo_candles(symbol, period)
+    quote = _quote_from_yahoo_meta(meta, closes, symbol)
+    return {
+        "candles": parsed,
+        "meta": meta,
+        "price": quote["price"],
+        "name": quote["name"],
+        "changePercent": quote["changePercent"],
+        "open": num(meta.get("regularMarketOpen") or meta.get("chartPreviousClose")),
+        "high": num(meta.get("regularMarketDayHigh")),
+        "low": num(meta.get("regularMarketDayLow")),
+        "volume": num(meta.get("regularMarketVolume")),
+        "fiftyTwoWeekHigh": num(meta.get("fiftyTwoWeekHigh")),
+        "fiftyTwoWeekLow": num(meta.get("fiftyTwoWeekLow")),
+        "marketCap": num(meta.get("marketCap")) or num(((read_json(STOCK_CAPS_FILE, {}) or {}).get("caps") or {}).get(symbol)),
+        "symbol": symbol,
+    }
+
+
+def fetch_coingecko_detail(symbol: str) -> dict[str, Any]:
+    cid = COINGECKO_IDS.get(str(symbol or "").upper())
+    if not cid:
+        return {}
+    url = (
+        "https://api.coingecko.com/api/v3/coins/"
+        + urllib.parse.quote(cid)
+        + "?localization=false&tickers=false&community_data=false&developer_data=false&sparkline=false"
+    )
+    try:
+        payload = http_json("GET", url, timeout=12)
+    except RuntimeError:
+        return {}
+    md = payload.get("market_data") if isinstance(payload, dict) else {}
+    if not isinstance(md, dict):
+        md = {}
+
+    def usd(key: str) -> float:
+        row = md.get(key)
+        if isinstance(row, dict):
+            return num(row.get("usd"))
+        return num(row)
+
+    ath_date = ""
+    ath_dates = md.get("ath_date")
+    if isinstance(ath_dates, dict):
+        ath_date = str(ath_dates.get("usd") or "")[:10]
+    return {
+        "name": str(payload.get("name") or ""),
+        "marketCap": usd("market_cap"),
+        "volume": usd("total_volume"),
+        "ath": usd("ath"),
+        "athDate": ath_date,
+        "high24": usd("high_24h"),
+        "low24": usd("low_24h"),
+        "circulating": num(md.get("circulating_supply")),
+        "maxSupply": num(md.get("max_supply")),
+        "rank": int(num(payload.get("market_cap_rank"))),
+    }
+
+
+def fetch_coingecko_candles(symbol: str, period: str) -> list[tuple[int, float]]:
+    symbol = str(symbol or "").strip().upper()
+    coin_id = COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        return []
+    chosen = period if period in PERIODS else "day"
+    key = f"coingecko|{coin_id}|{chosen}"
+    cached, cached_at = _cached_candles(key)
+    ttl = _candle_ttl(PERIODS[chosen]["seconds"])
+    if cached and cached_at > time.time() - ttl:
+        return cached
+    days = {
+        "hour": "1",
+        "day": "1",
+        "week": "7",
+        "month": "30",
+        "year": "365",
+        "all": "1825",
+    }[chosen]
+    url = (
+        "https://api.coingecko.com/api/v3/coins/"
+        + urllib.parse.quote(coin_id)
+        + "/market_chart?vs_currency=usd&days="
+        + days
+    )
+    try:
+        payload = http_json("GET", url, timeout=12)
+    except RuntimeError:
+        return cached if cached_at > time.time() - CANDLE_STALE_SECONDS else []
+    out: list[tuple[int, float]] = []
+    for row in payload.get("prices") or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        ts = int(num(row[0]) / 1000)
+        price = num(row[1])
+        if ts and price:
+            out.append((ts, price))
+    if out:
+        _store_cached_candles(key, out)
+        return out
+    return cached if cached_at > time.time() - CANDLE_STALE_SECONDS else []
+
+
+def fetch_crypto_candles(
+    product_id: str, symbol: str, granularity: str, seconds: int, period: str
+) -> list[tuple[int, float]]:
+    candles = fetch_candles(product_id, granularity, seconds)
+    if candles:
+        return candles
+    return fetch_coingecko_candles(symbol, period)
+
+
+def asset_stats(
+    *,
+    kind: str,
+    product: dict[str, Any] | None = None,
+    yahoo: dict[str, Any] | None = None,
+    gecko: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    product = product or {}
+    yahoo = yahoo or {}
+    gecko = gecko or {}
+    stats: list[dict[str, str]] = []
+    open_px = num(yahoo.get("open") or product.get("open_24h"))
+    high = num(yahoo.get("high") or gecko.get("high24") or product.get("high_24h"))
+    low = num(yahoo.get("low") or gecko.get("low24") or product.get("low_24h"))
+    volume = num(yahoo.get("volume") or gecko.get("volume") or product.get("approximate_quote_24h_volume"))
+    base = {
+        "open": open_px,
+        "high": high,
+        "low": low,
+        "volume": volume,
+    }
+    _add_stat(stats, "MARKET CAP", format_stat_usd(gecko.get("marketCap") or yahoo.get("marketCap") or product.get("market_cap")))
+    if gecko.get("rank"):
+        _add_stat(stats, "RANK", f"#{int(gecko['rank'])}")
+    _add_stat(stats, "24H HIGH", format_stat_usd(high))
+    _add_stat(stats, "24H LOW", format_stat_usd(low))
+    _add_stat(stats, "24H VOLUME", format_stat_usd(volume if volume > 1000 else 0) or format_stat_qty(product.get("volume_24h")))
+    _add_stat(stats, "CIRCULATING", format_stat_qty(gecko.get("circulating")))
+    _add_stat(stats, "MAX SUPPLY", format_stat_qty(gecko.get("maxSupply")))
+    _add_stat(stats, "ATH", format_stat_usd(gecko.get("ath")))
+    if gecko.get("athDate"):
+        _add_stat(stats, "ATH DATE", str(gecko.get("athDate")))
+    _add_stat(stats, "52W HIGH", format_stat_usd(yahoo.get("fiftyTwoWeekHigh")))
+    _add_stat(stats, "52W LOW", format_stat_usd(yahoo.get("fiftyTwoWeekLow")))
+    _add_stat(stats, "OPEN", format_stat_usd(open_px))
+    if kind in {"stock", "commodity"}:
+        # Keep stock-focused fields first by rebuilding if we have 52w data.
+        pass
+    return stats, base
+
+
+def fetch_yahoo_search(query: str) -> list[dict[str, Any]]:
+    query = str(query or "").strip()
+    if len(query) < 1:
+        return []
+    url = (
+        "https://query2.finance.yahoo.com/v1/finance/search?q="
+        + urllib.parse.quote(query)
+        + "&quotesCount=8&newsCount=0"
+    )
+    try:
+        payload = yahoo_get(url)
+    except RuntimeError:
+        return []
+    rows = payload.get("quotes") if isinstance(payload, dict) else []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        qtype = str(row.get("quoteType") or "")
+        if qtype in {"OPTION", "FUTURE", "INDEX"}:
+            continue
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol or symbol in seen or "-" in symbol and qtype != "CRYPTOCURRENCY":
+            if qtype != "EQUITY" and qtype != "ETF":
+                continue
+        if qtype not in {"EQUITY", "ETF"}:
+            continue
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        name = str(row.get("shortname") or row.get("longname") or symbol)
+        kind = "commodity" if symbol in {t for t, _ in COMMODITY_ETFS} else "stock"
+        out.append(
+            market_row(
+                symbol,
+                name,
+                kind,
+                f"{symbol}-USD",
+                url=asset_url(kind, symbol, f"{symbol}-USD", name),
+            )
+        )
+        out[-1]["yahoo"] = symbol
+        if len(out) >= 6:
+            break
+    return out
+
+
+def trade_urls(symbol: str, name: str = "", kind: str = "crypto") -> dict[str, str]:
+    ticker = str(symbol or "").split("-")[0]
+    code = urllib.parse.quote(ticker.upper(), safe="")
+    slug = price_slug(name, ticker)
+    if kind in {"stock", "commodity"}:
+        return {
+            "buy": f"https://www.coinbase.com/buy/{code}",
+            "sell": f"https://www.coinbase.com/sell/{code}",
+            "url": f"https://www.coinbase.com/price/{urllib.parse.quote(ticker.lower(), safe='')}",
+        }
+    return {
+        "buy": f"https://www.coinbase.com/buy/{code}",
+        "sell": f"https://www.coinbase.com/sell/{code}",
+        "url": asset_url(kind, ticker, "", name) if slug else f"https://www.coinbase.com/price/{urllib.parse.quote(slug, safe='')}",
+    }
+
+
+def cmd_setup(client_id: str, client_secret: str, read_stdin: bool = False) -> None:
+    if read_stdin:
+        try:
+            payload = json.loads(sys.stdin.readline())
+        except (json.JSONDecodeError, OSError) as exc:
+            die(f"invalid OAuth app input: {exc}")
+        if not isinstance(payload, dict):
+            die("invalid OAuth app input")
+        client_id = str(payload.get("client_id") or "")
+        client_secret = str(payload.get("client_secret") or "")
+    client_id = (client_id or os.environ.get("COINBASE_CLIENT_ID") or "").strip()
+    client_secret = (client_secret or os.environ.get("COINBASE_CLIENT_SECRET") or "").strip()
+    if not client_id or not client_secret:
+        die("setup needs a client id and secret (from a Coinbase OAuth app)")
+    write_json(APP_FILE, {"clientId": client_id, "clientSecret": client_secret}, private=True)
+    write_snapshot(empty_snapshot(needsSetup=False, error=""))
+    print("ok")
+
+
+def save_tokens(payload: dict[str, Any]) -> dict[str, Any]:
+    access = payload.get("access_token")
+    refresh = payload.get("refresh_token") or load_tokens().get("refresh_token")
+    if not isinstance(access, str) or not access or len(access) > 8192:
+        raise RuntimeError("token response missing a valid access token")
+    if refresh and (not isinstance(refresh, str) or len(refresh) > 8192):
+        raise RuntimeError("token response contained an invalid refresh token")
+    try:
+        expires_in = int(payload.get("expires_in") or 3600)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("token response contained an invalid expiry") from exc
+    expires_in = min(86400, max(60, expires_in))
+    tokens = {
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": str(payload.get("token_type") or "bearer"),
+        "scope": str(payload.get("scope") or ""),
+        "expires_at": int(time.time()) + expires_in - 60,
+    }
+    write_json(TOKEN_FILE, tokens, private=True)
+    return tokens
+
+
+def refresh_tokens(app: dict[str, str], tokens: dict[str, Any]) -> dict[str, Any]:
+    refresh = tokens.get("refresh_token")
+    if not refresh:
+        raise RuntimeError("not signed in")
+    if using_broker():
+        payload = http_json(
+            "POST",
+            broker_url() + "/oauth/refresh",
+            headers={"Content-Type": "application/json"},
+            body={"refresh_token": str(refresh)},
+        )
+        return save_tokens(payload)
+    payload = http_json(
+        "POST",
+        TOKEN_URL,
+        form={
+            "grant_type": "refresh_token",
+            "refresh_token": str(refresh),
+            "client_id": app["clientId"],
+            "client_secret": app["clientSecret"],
+        },
+    )
+    return save_tokens(payload)
+
+
+def valid_access_token() -> str:
+    app = load_app()
+    tokens = load_tokens()
+    if not using_broker() and (not app.get("clientId") or not app.get("clientSecret")):
+        raise RuntimeError("needsSetup")
+    if not tokens.get("access_token"):
+        raise RuntimeError("not signed in")
+    if int(tokens.get("expires_at") or 0) <= int(time.time()):
+        tokens = refresh_tokens(app, tokens)
+    return str(tokens["access_token"])
+
+
+def _desktop_exec(desktop: str) -> str:
+    if not desktop or Path(desktop).name != desktop or not desktop.endswith(".desktop"):
+        return ""
+    for prefix in (
+        Path.home() / ".local/share/applications",
+        Path.home() / ".nix-profile/share/applications",
+        Path("/usr/share/applications"),
+    ):
+        path = prefix / desktop
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if line.startswith("Exec="):
+                try:
+                    fields = shlex.split(line[5:].strip())
+                except ValueError:
+                    continue
+                if fields:
+                    return fields[0]
+    return ""
+
+
+def default_browser_exec() -> str:
+    env = os.environ.copy()
+    env.pop("BROWSER", None)
+    desktop = ""
+    try:
+        desktop = subprocess.check_output(
+            ["xdg-settings", "get", "default-web-browser"],
+            env=env,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        desktop = ""
+    if not desktop:
+        try:
+            desktop = subprocess.check_output(
+                ["xdg-mime", "query", "default", "x-scheme-handler/https"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            desktop = ""
+    return _desktop_exec(desktop) or "chromium"
+
+
+def _lua_string(value: str) -> str:
+    if "]]" not in value:
+        return f"[[{value}]]"
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _hypr_json(args: list[str]) -> Any:
+    try:
+        raw = subprocess.check_output(["hyprctl", "-j", *args], text=True, stderr=subprocess.DEVNULL)
+        return json.loads(raw)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+
+def _browser_addresses() -> set[str]:
+    clients = _hypr_json(["clients"]) or []
+    out: set[str] = set()
+    if not isinstance(clients, list):
+        return out
+    for client in clients:
+        cls = str(client.get("class") or "").lower()
+        if "chrom" in cls or "brave" in cls or "firefox" in cls or "edge" in cls:
+            addr = str(client.get("address") or "")
+            if addr.startswith("0x") and len(addr) > 2 and all(ch in "0123456789abcdefABCDEF" for ch in addr[2:]):
+                out.add(addr)
+    return out
+
+
+def _active_workspace() -> str:
+    data = _hypr_json(["activeworkspace"]) or {}
+    if isinstance(data, dict) and isinstance(data.get("id"), int):
+        return str(data["id"])
+    return ""
+
+
+def _hypr_dispatch(expr: str) -> None:
+    subprocess.run(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def _move_new_browser_here(before: set[str]) -> None:
+    workspace = _active_workspace()
+    if not workspace:
+        return
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        new = [addr for addr in _browser_addresses() if addr not in before]
+        if new:
+            addr = new[-1]
+            _hypr_dispatch(f"movetoworkspace {workspace},address:{addr}")
+            _hypr_dispatch(f"focuswindow address:{addr}")
+            _hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
+            return
+        time.sleep(0.12)
+
+
+def open_browser(url: str) -> None:
+    url = str(url or "").strip()
+    if not url:
+        return
+    parsed = urllib.parse.urlparse(url)
+    allowed_hosts = {"coinbase.com", "www.coinbase.com", "login.coinbase.com"}
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in allowed_hosts
+        or parsed.username
+        or parsed.password
+    ):
+        raise RuntimeError("refusing to open a non-Coinbase or malformed URL")
+    browser = default_browser_exec()
+    argv = [browser, "--new-window", url]
+    before = _browser_addresses() if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") else set()
+    try:
+        subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+    except OSError:
+        import webbrowser
+
+        webbrowser.open(url)
+        return
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        _move_new_browser_here(before)
+
+
+def _finish_login(payload: dict[str, Any]) -> None:
+    write_login_status("exchanging")
+    print("STATUS exchanging", flush=True)
+    save_tokens(payload)
+    write_login_status("snapshot")
+    print("STATUS snapshot", flush=True)
+    build_snapshot("day")
+    write_login_status("done")
+    print("ok", flush=True)
+
+
+def login_via_broker() -> None:
+    base = broker_url()
+    write_login_status("opening")
+    print("STATUS opening", flush=True)
+    started = http_json("POST", base + "/oauth/start")
+    authorize = started.get("authorize_url")
+    session_id = started.get("session_id")
+    if not authorize or not session_id:
+        write_login_status("error", "broker did not return an authorize URL")
+        die("broker did not return an authorize URL")
+    open_browser(str(authorize))
+    write_login_status("waiting")
+    print("STATUS waiting", flush=True)
+    deadline = time.time() + 180
+    payload = None
+    while time.time() < deadline:
+        time.sleep(1)
+        row = http_json(
+            "GET",
+            f"{base}/oauth/session/{urllib.parse.quote(str(session_id), safe='')}",
+            allow_statuses=(202, 400, 404),
+        )
+        status = int(row.get("_http_status") or 200)
+        if status == 202 or row.get("status") == "pending":
+            continue
+        if status == 404 or row.get("status") == "missing":
+            write_login_status("error", "sign-in session expired")
+            die("sign-in session expired")
+        if status >= 400 or row.get("status") == "error":
+            write_login_status("error", str(row.get("error") or "sign-in failed"))
+            die(str(row.get("error") or "sign-in failed"))
+        if row.get("access_token"):
+            payload = row
+            break
+    if not payload:
+        write_login_status("error", "Sign-in timed out.")
+        write_snapshot(empty_snapshot(error="Sign-in timed out."))
+        die("sign-in timed out")
+    _finish_login(payload)
+
+
+def cmd_login() -> None:
+    write_login_status("opening")
+    if using_broker():
+        login_via_broker()
+        return
+    app = load_app()
+    if not app.get("clientId") or not app.get("clientSecret"):
+        write_login_status("error", "Add your Coinbase OAuth app to sign in.")
+        write_snapshot(empty_snapshot(needsSetup=True, error="Add your Coinbase OAuth app to sign in."))
+        die("needsSetup")
+
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(16)
+    params = {
+        "response_type": "code",
+        "client_id": app["clientId"],
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    url = AUTH_URL + "?" + urllib.parse.urlencode(params)
+    result: dict[str, str] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != "/callback":
+                self.send_response(404)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            returned_state = (query.get("state") or [""])[0]
+            if not secrets.compare_digest(returned_state, state):
+                self.send_response(400)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.end_headers()
+                return
+            result["state"] = returned_state
+            code = (query.get("code") or [""])[0]
+            result["code"] = code if len(code) <= 4096 else ""
+            result["error"] = (query.get("error") or [""])[0][:200]
+            body = (
+                b"<!doctype html><meta charset=utf-8><title>Coinbase</title>"
+                b"<body style='font-family:sans-serif;background:#111;color:#eee;padding:48px'>"
+                b"<h1>Signed in</h1><p>You can close this tab and return to Omarchy.</p>"
+            )
+            if result.get("error") or not result.get("code"):
+                body = (
+                    b"<!doctype html><meta charset=utf-8><title>Coinbase</title>"
+                    b"<body style='font-family:sans-serif;background:#111;color:#eee;padding:48px'>"
+                    b"<h1>Sign-in did not finish</h1><p>Return to Omarchy and try again.</p>"
+                )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+            return
+
+    try:
+        server = HTTPServer(("127.0.0.1", LISTEN_PORT), Handler)
+    except OSError as exc:
+        die(f"cannot listen on {REDIRECT_URI}: {exc}")
+
+    server.timeout = 1
+    print("STATUS opening", flush=True)
+    open_browser(url)
+    write_login_status("waiting")
+    print("STATUS waiting", flush=True)
+    deadline = time.time() + 180
+    try:
+        while time.time() < deadline and not result:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    if result.get("error"):
+        write_snapshot(empty_snapshot(needsSetup=False, error=result["error"]))
+        die(result["error"])
+    if not result.get("code"):
+        write_snapshot(empty_snapshot(needsSetup=False, error="Sign-in timed out."))
+        die("sign-in timed out")
+    if result.get("state") != state:
+        die("state mismatch")
+
+    print("STATUS exchanging", flush=True)
+    payload = http_json(
+        "POST",
+        TOKEN_URL,
+        form={
+            "grant_type": "authorization_code",
+            "code": result["code"],
+            "client_id": app["clientId"],
+            "client_secret": app["clientSecret"],
+            "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        },
+    )
+    _finish_login(payload)
+
+
+def cmd_logout() -> None:
+    app = load_app()
+    tokens = load_tokens()
+    access = str(tokens.get("access_token") or "")
+    if access:
+        try:
+            if using_broker():
+                http_json(
+                    "POST",
+                    broker_url() + "/oauth/revoke",
+                    body={"access_token": access},
+                    timeout=8,
+                )
+            elif app.get("clientId") and app.get("clientSecret"):
+                http_json(
+                    "POST",
+                    REVOKE_URL,
+                    headers={"Authorization": f"Bearer {access}"},
+                    form={
+                        "token": access,
+                        "client_id": app["clientId"],
+                        "client_secret": app["clientSecret"],
+                    },
+                    timeout=8,
+                )
+        except RuntimeError:
+            pass
+    try:
+        TOKEN_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    period = str(load_prefs().get("period") or "day")
+    try:
+        build_market_snapshot(period)
+    except Exception:  # noqa: BLE001
+        write_snapshot(empty_snapshot())
+    print("ok")
+
+
+def product_id_for(symbol: str, quote: str = "USD") -> str:
+    symbol = str(symbol or "").upper()
+    if not symbol:
+        return ""
+    if "-" in symbol:
+        return symbol
+    if symbol in {"USD", "USDC", "USDT", "DAI", "EUR", "GBP"}:
+        return ""
+    return f"{symbol}-{quote}"
+
+
+def amount_value(value: Any) -> float:
+    if isinstance(value, dict):
+        return num(value.get("value") or value.get("amount"))
+    return num(value)
+
+
+def price_slug(name: str, symbol: str) -> str:
+    raw = str(name or symbol or "").strip().lower()
+    chars = []
+    dash = False
+    for ch in raw:
+        if ch.isalnum():
+            chars.append(ch)
+            dash = False
+        elif not dash:
+            chars.append("-")
+            dash = True
+    slug = "".join(chars).strip("-")
+    return slug or str(symbol or "btc").lower()
+
+
+def asset_url(kind: str, symbol: str, product_id: str = "", name: str = "") -> str:
+    slug = price_slug(name, symbol)
+    return f"https://www.coinbase.com/price/{urllib.parse.quote(slug, safe='')}"
+
+
+def fetch_user(token: str) -> dict[str, Any]:
+    try:
+        data = api_get("/v2/user", token)
+        user = data.get("data") or {} if isinstance(data, dict) else {}
+        if not isinstance(user, dict):
+            return {}
+        return {
+            "id": user.get("id") or "",
+            "name": user.get("name") or user.get("username") or "",
+        }
+    except RuntimeError:
+        return {}
+
+
+def fetch_v2_accounts(token: str) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+    path: str | None = "/v2/accounts"
+    params: dict[str, Any] | None = {"limit": 100}
+    seen_pages: set[str] = set()
+    for _ in range(20):
+        if not path or path in seen_pages:
+            break
+        seen_pages.add(path)
+        payload = api_get(path, token, params)
+        if not isinstance(payload, dict):
+            break
+        params = None
+        rows = payload.get("data") or []
+        if not isinstance(rows, list):
+            break
+        for acc in rows:
+            if not isinstance(acc, dict):
+                continue
+            currency = acc.get("currency")
+            code = currency.get("code") if isinstance(currency, dict) else str(currency or "")
+            native = amount_value((acc.get("native_balance") or {}).get("amount") if isinstance(acc.get("native_balance"), dict) else acc.get("native_balance"))
+            qty = amount_value(acc.get("balance"))
+            acc_type = str(acc.get("type") or "wallet")
+            kind = "fiat" if acc_type == "fiat" or code in {"USD", "EUR", "GBP"} else "crypto"
+            assets.append(
+                {
+                    "id": code,
+                    "name": (currency.get("name") if isinstance(currency, dict) else "") or code,
+                    "kind": kind,
+                    "productId": product_id_for(code),
+                    "price": (native / qty) if qty else 0,
+                    "quantity": qty,
+                    "value": native,
+                    "held": native >= 0.5 or qty > 0,
+                    "watchlist": False,
+                    "costBasis": 0,
+                    "unrealizedPnl": 0,
+                }
+            )
+        pagination = payload.get("pagination") or {}
+        nxt = pagination.get("next_uri") if isinstance(pagination, dict) else None
+        path = nxt if isinstance(nxt, str) and nxt else None
+    return assets
+
+
+def fetch_breakdown(token: str) -> tuple[list[dict[str, Any]], float]:
+    portfolios = api_get("/api/v3/brokerage/portfolios", token)
+    if not isinstance(portfolios, dict):
+        return [], 0.0
+    rows = portfolios.get("portfolios") or []
+    if not isinstance(rows, list):
+        return [], 0.0
+    rows = [row for row in rows if isinstance(row, dict)]
+    chosen = None
+    for row in rows:
+        if str(row.get("type") or "") in {"DEFAULT", "CONSUMER"} and not row.get("deleted"):
+            chosen = row
+            break
+    if chosen is None:
+        for row in rows:
+            if not row.get("deleted"):
+                chosen = row
+                break
+    if not chosen:
+        return [], 0.0
+    uuid = chosen.get("uuid")
+    payload = api_get(
+        f"/api/v3/brokerage/portfolios/{urllib.parse.quote(str(uuid), safe='')}",
+        token,
+        {"currency": "USD"},
+    )
+    if not isinstance(payload, dict):
+        return [], 0.0
+    breakdown = payload.get("breakdown") or payload
+    if not isinstance(breakdown, dict):
+        return [], 0.0
+    balances = breakdown.get("portfolio_balances") or {}
+    if not isinstance(balances, dict):
+        balances = {}
+    total = amount_value(balances.get("total_balance"))
+    assets: list[dict[str, Any]] = []
+
+    for pos in breakdown.get("spot_positions") or []:
+        if not isinstance(pos, dict):
+            continue
+        symbol = str(pos.get("asset") or "")
+        if "EQUITY" in str(pos.get("account_type") or "").upper():
+            continue
+        if not symbol:
+            continue
+        value = num(pos.get("total_balance_fiat"))
+        qty = num(pos.get("total_balance_crypto"))
+        kind = "fiat" if pos.get("is_cash") or symbol in {"USD", "USDC", "USDT", "EUR", "GBP"} else "crypto"
+        assets.append(
+            {
+                "id": symbol,
+                "name": symbol,
+                "kind": kind,
+                "productId": "" if kind == "fiat" else product_id_for(symbol),
+                "price": (value / qty) if qty else 0,
+                "quantity": qty,
+                "value": value,
+                "held": True,
+                "watchlist": False,
+                "costBasis": amount_value(pos.get("cost_basis")),
+                "unrealizedPnl": num(pos.get("unrealized_pnl")),
+                "averageEntry": amount_value(pos.get("average_entry_price")),
+            }
+        )
+
+    for pos in breakdown.get("equity_positions") or []:
+        if not isinstance(pos, dict):
+            continue
+        symbol = str(pos.get("cbrn") or pos.get("account_uuid") or "EQ")
+        value = amount_value(pos.get("total_balance_fiat"))
+        qty = amount_value(pos.get("total_balance_equity"))
+        assets.append(
+            {
+                "id": symbol,
+                "name": symbol,
+                "kind": "stock",
+                "productId": product_id_for(symbol),
+                "price": (value / qty) if qty else amount_value(pos.get("average_entry_price")),
+                "quantity": qty,
+                "value": value,
+                "held": True,
+                "watchlist": False,
+                "costBasis": amount_value(pos.get("cost_basis")),
+                "unrealizedPnl": amount_value(pos.get("unrealized_pnl")),
+                "averageEntry": amount_value(pos.get("average_entry_price")),
+            }
+        )
+
+    for pos in breakdown.get("perp_positions") or []:
+        if not isinstance(pos, dict):
+            continue
+        product = str(pos.get("product_id") or pos.get("symbol") or "")
+        pnl = amount_value((pos.get("unrealized_pnl") or {}).get("userNativeCurrency") if isinstance(pos.get("unrealized_pnl"), dict) else pos.get("unrealized_pnl"))
+        notional = amount_value((pos.get("position_notional") or {}).get("userNativeCurrency") if isinstance(pos.get("position_notional"), dict) else pos.get("position_notional"))
+        mark = amount_value((pos.get("mark_price") or {}).get("userNativeCurrency") if isinstance(pos.get("mark_price"), dict) else pos.get("mark_price"))
+        assets.append(
+            {
+                "id": product,
+                "name": product,
+                "kind": "derivative",
+                "productId": product,
+                "price": mark,
+                "quantity": num(pos.get("net_size")),
+                "value": notional,
+                "held": True,
+                "watchlist": False,
+                "costBasis": 0,
+                "unrealizedPnl": pnl,
+            }
+        )
+
+    for pos in breakdown.get("futures_positions") or []:
+        if not isinstance(pos, dict):
+            continue
+        product = str(pos.get("product_id") or pos.get("product_name") or "")
+        assets.append(
+            {
+                "id": product,
+                "name": pos.get("product_name") or product,
+                "kind": "derivative",
+                "productId": product,
+                "price": num(pos.get("current_price")),
+                "quantity": num(pos.get("amount")),
+                "value": num(pos.get("notional_value")),
+                "held": True,
+                "watchlist": False,
+                "costBasis": 0,
+                "unrealizedPnl": num(pos.get("unrealized_pnl")),
+            }
+        )
+
+    if total <= 0:
+        total = sum(a["value"] for a in assets)
+    return assets, total
+
+
+def fetch_product(product_id: str) -> dict[str, Any]:
+    if not product_id:
+        return {}
+    try:
+        return public_get(
+            f"/api/v3/brokerage/market/products/{urllib.parse.quote(product_id, safe='')}"
+        )
+    except RuntimeError:
+        return {}
+
+
+def _candle_ttl(seconds: int) -> int:
+    if seconds <= 3600:
+        return 10
+    if seconds <= 86400:
+        return 15
+    if seconds <= 7 * 86400:
+        return 30
+    return 120
+
+
+def _parse_candles(payload: Any) -> list[tuple[int, float]]:
+    rows = payload.get("candles") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    out: list[tuple[int, float]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            ts = int(num(row.get("start")))
+            close = num(row.get("close"))
+        elif isinstance(row, (list, tuple)) and len(row) >= 5:
+            ts = int(num(row[0]))
+            close = num(row[4])
+        else:
+            continue
+        if ts and close:
+            out.append((ts, close))
+    return out
+
+
+def _cached_candles(key: str) -> tuple[list[tuple[int, float]], float]:
+    with candle_cache_lock():
+        cache = read_json(CANDLES_CACHE, {})
+    if not isinstance(cache, dict):
+        return [], 0
+    entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return [], 0
+    rows: list[tuple[int, float]] = []
+    for item in entry.get("candles") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            ts = int(num(item[0]))
+            price = num(item[1])
+            if ts and price:
+                rows.append((ts, price))
+    return rows, num(entry.get("fetchedAt"))
+
+
+def _store_cached_candles(key: str, candles: list[tuple[int, float]]) -> None:
+    if not candles:
+        return
+    with candle_cache_lock():
+        cache = read_json(CANDLES_CACHE, {})
+        if not isinstance(cache, dict):
+            cache = {}
+        cache[key] = {"fetchedAt": int(time.time()), "candles": candles}
+        if len(cache) > CANDLE_CACHE_LIMIT:
+            oldest = sorted(
+                cache.items(),
+                key=lambda item: num((item[1] or {}).get("fetchedAt") if isinstance(item[1], dict) else 0),
+            )
+            for stale_key, _ in oldest[: len(cache) - CANDLE_CACHE_LIMIT]:
+                cache.pop(stale_key, None)
+        write_json(CANDLES_CACHE, cache)
+
+
+def _fetch_candle_window(product_id: str, granularity: str, start: int, end: int) -> list[tuple[int, float]]:
+    try:
+        payload = public_get(
+            f"/api/v3/brokerage/market/products/{urllib.parse.quote(product_id, safe='')}/candles",
+            {"start": str(start), "end": str(end), "granularity": granularity},
+            timeout=8,
+        )
+    except RuntimeError:
+        return []
+    return _parse_candles(payload)
+
+
+def fetch_candles(product_id: str, granularity: str, seconds: int) -> list[tuple[int, float]]:
+    if not product_id:
+        return []
+    end = int(time.time())
+    start = max(0, end - seconds)
+    key = f"{product_id}|{granularity}|{seconds}"
+    cached, cached_at = _cached_candles(key)
+    if cached and cached_at > time.time() - _candle_ttl(seconds):
+        return cached
+
+    gsec = GRANULARITY_SECS.get(granularity, 3600)
+    window = max(gsec, MAX_CANDLES * gsec)
+    spans: list[tuple[int, int]] = []
+    t = start
+    while t < end:
+        wend = min(end, t + window)
+        spans.append((t, wend))
+        t = wend
+    found: list[tuple[int, float]] = []
+    if len(spans) <= 1:
+        found = _fetch_candle_window(product_id, granularity, start, end)
+    else:
+        with ThreadPoolExecutor(max_workers=min(6, len(spans))) as pool:
+            futs = [pool.submit(_fetch_candle_window, product_id, granularity, a, b) for a, b in spans]
+            for fut in as_completed(futs):
+                found.extend(fut.result())
+    found.sort(key=lambda item: item[0])
+    deduped: list[tuple[int, float]] = []
+    seen_ts = set()
+    for ts, price in found:
+        if ts in seen_ts:
+            continue
+        seen_ts.add(ts)
+        deduped.append((ts, price))
+
+    if deduped:
+        _store_cached_candles(key, deduped)
+        return deduped
+    if cached and cached_at > time.time() - CANDLE_STALE_SECONDS:
+        return cached
+    return []
+
+
+def scale_sparkline(values: list[float], start: float, end: float) -> list[float]:
+    if not values:
+        return [round(start, 2), round(end, 2)] if start or end else []
+    if len(values) == 1:
+        return [round(start, 2), round(end, 2)]
+    first = values[0]
+    last = values[-1]
+    span = last - first
+    target = end - start
+    out = []
+    last_index = len(values) - 1
+    for i, value in enumerate(values):
+        if i == 0:
+            out.append(round(start, 2))
+        elif i == last_index:
+            out.append(round(end, 2))
+        elif abs(span) < 1e-9:
+            frac = i / last_index
+            out.append(round(start + target * frac, 2))
+        else:
+            out.append(round(start + (value - first) / span * target, 2))
+    return out
+
+
+def downsample(values: list[float], count: int) -> list[float]:
+    if len(values) <= count:
+        return values
+    if count <= 1:
+        return values[-1:]
+    out = []
+    last_index = len(values) - 1
+    for i in range(count):
+        idx = round(i * last_index / (count - 1))
+        out.append(values[idx])
+    return out
+
+
+def sparkline_point_count(seconds: int, candle_n: int) -> int:
+    if seconds <= 3600:
+        return max(24, min(60, candle_n + 1))
+    if seconds <= 86400:
+        return SPARKLINE_POINTS
+    return 96
+
+
+def price_decimals(value: Any) -> int:
+    price = abs(num(value))
+    if price >= 100:
+        return 2
+    if price >= 1:
+        return 4
+    if price >= 0.01:
+        return 6
+    return 8
+
+
+def sparkline_for_period(
+    candles: list[tuple[int, float]],
+    live_price: float,
+    seconds: int,
+) -> list[float]:
+    end = time.time()
+    start = end - max(1, int(seconds))
+    series: list[tuple[float, float]] = []
+    seen: set[int] = set()
+    for ts, price in candles:
+        ts_i = int(ts)
+        px = num(price)
+        if px <= 0 or ts_i in seen:
+            continue
+        if ts_i < start - 7200 or ts_i > end + 120:
+            continue
+        seen.add(ts_i)
+        series.append((float(ts_i), px))
+    live = num(live_price)
+    if live > 0:
+        series.append((end, live))
+    series.sort(key=lambda item: item[0])
+    if len(series) < 2:
+        if live > 0:
+            decimals = price_decimals(live)
+            return [round(live, decimals), round(live, decimals)]
+        return []
+    count = sparkline_point_count(seconds, max(0, len(series) - (1 if live > 0 else 0)))
+    if count < 2:
+        count = 2
+    span = end - start
+    decimals = price_decimals(live or series[-1][1])
+    out: list[float] = []
+    for i in range(count):
+        ts = start + span * i / (count - 1)
+        out.append(round(interpolate(series, ts), decimals))
+    if live > 0:
+        out[-1] = round(live, decimals)
+    return out
+
+
+def enrich_with_products(assets: list[dict[str, Any]]) -> None:
+    needed = [a["productId"] for a in assets if a.get("productId")]
+    found: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(fetch_product, pid): pid for pid in needed}
+        for fut in as_completed(futs):
+            found[futs[fut]] = fut.result() or {}
+    for asset in assets:
+        product = found.get(asset.get("productId") or "", {})
+        det = product.get("equity_product_details") or {}
+        price = num(
+            product.get("price")
+            or product.get("mid_market_price")
+            or det.get("last_market_day_close_price")
+            or det.get("open_price"),
+            num(asset.get("price")),
+        )
+        change_24h = num(
+            product.get("price_percentage_change_24h")
+            or det.get("price_percentage_change_market_hours")
+            or det.get("price_percentage_change_extended_hours")
+        )
+        if price:
+            asset["price"] = price
+        asset["change24h"] = change_24h
+        if product.get("base_name") and asset.get("kind") == "crypto":
+            asset["name"] = product.get("base_name") or asset["name"]
+        ptype = str(product.get("product_type") or product.get("productType") or "")
+        ticker = str(asset.get("id") or "").upper()
+        if "EQUITY" in ptype:
+            asset["kind"] = "commodity" if ticker in {t for t, _ in COMMODITY_ETFS} else "stock"
+        elif "FUTURE" in ptype or "PERP" in ptype:
+            asset["kind"] = "derivative"
+        if asset["kind"] != "fiat" and asset.get("quantity") and not asset.get("value"):
+            asset["value"] = asset["quantity"] * asset["price"]
+        start_24h = price / (1 + change_24h / 100) if price and change_24h != -100 else price
+        qty = num(asset.get("quantity"))
+        if asset["kind"] == "fiat":
+            asset["dayPnl"] = 0
+            asset["dayPnlPercent"] = 0
+        else:
+            value = num(asset.get("value"))
+            if value:
+                start_value = value / (1 + change_24h / 100) if price and change_24h != -100 else value
+                asset["dayPnl"] = value - start_value
+            else:
+                asset["dayPnl"] = (price - start_24h) * qty if qty else 0
+            asset["dayPnlPercent"] = change_24h
+        asset["url"] = asset_url(asset["kind"], asset["id"], asset.get("productId") or "", asset.get("name") or "")
+        trades = trade_urls(str(asset.get("id") or ""), str(asset.get("name") or ""), str(asset.get("kind") or "crypto"))
+        asset["buyUrl"] = trades["buy"]
+        asset["sellUrl"] = trades["sell"]
+
+
+def fill_asset_pnl(asset: dict[str, Any], period: str, candles_map: dict[str, list[tuple[int, float]]]) -> None:
+    if asset.get("kind") == "fiat":
+        asset["pnl"] = 0
+        asset["pnlPercent"] = 0
+        return
+    price = num(asset.get("price"))
+    qty = num(asset.get("quantity"))
+    if period == "day":
+        pct = num(asset.get("dayPnlPercent"))
+        value = num(asset.get("value"))
+        asset["pnlPercent"] = pct
+        if value:
+            start_value = value / (1 + pct / 100.0) if pct != -100 else value
+            asset["pnl"] = value - start_value
+        else:
+            start = price / (1 + pct / 100.0) if price and pct != -100 else 0
+            unit = (price - start) if start else 0
+            asset["pnl"] = unit * qty if qty else unit
+        return
+    if period == "all" and qty and num(asset.get("unrealizedPnl")):
+        asset["pnl"] = num(asset.get("unrealizedPnl"))
+        cost = num(asset.get("costBasis"))
+        asset["pnlPercent"] = (asset["pnl"] / cost * 100) if cost else 0
+        return
+    candles = candles_map.get(asset.get("productId") or "") or []
+    start_price = candles[0][1] if candles else num(asset.get("averageEntry")) or price
+    unit = (price - start_price) if start_price else 0
+    asset["pnlPercent"] = (unit / start_price * 100) if start_price else 0
+    asset["pnl"] = unit * qty if qty else unit
+
+
+def apply_period_pnl(
+    assets: list[dict[str, Any]],
+    period: str,
+    *,
+    lead: dict[str, Any] | None = None,
+) -> tuple[list[float], float, float]:
+    spec = PERIODS.get(period) or PERIODS["day"]
+    held = [a for a in assets if a.get("held") and a.get("productId") and a["kind"] != "fiat"]
+    market = [a for a in assets if a.get("market") and a.get("productId") and a["kind"] != "fiat"]
+    held.sort(key=lambda a: a.get("value") or 0, reverse=True)
+    if held:
+        fetch_for = [a for a in held if a.get("kind") in {"crypto", "stock"}][:6] or held[:6]
+    else:
+        fetch_for = [lead] if lead and lead.get("productId") else market[:1]
+
+    candles_map: dict[str, list[tuple[int, float]]] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {}
+        for asset in fetch_for:
+            key = str(asset.get("productId") or asset.get("id") or "")
+            if not key:
+                continue
+            if asset.get("kind") in {"stock", "commodity"}:
+                futs[pool.submit(fetch_yahoo_candles, yahoo_symbol_for(asset), period)] = key
+            elif asset.get("kind") == "crypto":
+                futs[
+                    pool.submit(
+                        fetch_crypto_candles,
+                        asset["productId"],
+                        str(asset.get("id") or ""),
+                        spec["granularity"],
+                        spec["seconds"],
+                        period,
+                    )
+                ] = key
+            else:
+                futs[pool.submit(fetch_candles, asset["productId"], spec["granularity"], spec["seconds"])] = key
+        for fut in as_completed(futs):
+            try:
+                candles_map[futs[fut]] = fut.result() or []
+            except Exception:  # noqa: BLE001
+                candles_map[futs[fut]] = []
+
+    for asset in assets:
+        fill_asset_pnl(asset, period, candles_map)
+
+    if held:
+        sparkline = build_sparkline(assets, held[:6], candles_map)
+        cash = sum(num(a.get("value")) for a in assets if a.get("kind") == "fiat")
+        total = sum(num(a.get("value")) for a in held) + cash
+        pnl = sum(num(a.get("pnl")) for a in held)
+        start = total - pnl
+        percent = (pnl / start * 100) if start else 0
+        if sparkline and start:
+            sparkline = scale_sparkline(sparkline, start, total)
+        elif total:
+            sparkline = [round(start, 2), round(total, 2)]
+        return sparkline, pnl, percent
+
+    lead = lead or next((a for a in assets if a.get("id") == "BTC"), market[0] if market else None)
+    sparkline: list[float] = []
+    if lead:
+        candles = candles_map.get(lead.get("productId") or "") or []
+        price = num(lead.get("price"))
+        sparkline = sparkline_for_period(candles, price, spec["seconds"])
+        if len(sparkline) < 2:
+            sparkline = two_point_sparkline(lead)
+        start = sparkline[0] if sparkline else 0
+        end_price = price or (sparkline[-1] if sparkline else 0)
+        pnl = end_price - start if start else 0
+        percent = (pnl / start * 100) if start else 0
+        lead["pnl"] = pnl
+        lead["pnlPercent"] = percent
+        return sparkline, pnl, percent
+    return sparkline, 0, 0
+
+
+def two_point_sparkline(asset: dict[str, Any]) -> list[float]:
+    price = num(asset.get("price"))
+    pct = num(asset.get("pnlPercent") or asset.get("dayPnlPercent"))
+    if not price:
+        return []
+    start = price / (1 + pct / 100.0) if pct != -100 else price
+    decimals = price_decimals(price)
+    return [round(start, decimals), round(price, decimals)]
+
+
+def build_sparkline(
+    all_assets: list[dict[str, Any]],
+    priced: list[dict[str, Any]],
+    candles_map: dict[str, list[tuple[int, float]]],
+) -> list[float]:
+    cash = sum(num(a.get("value")) for a in all_assets if a["kind"] == "fiat")
+    priced_ids = {id(a) for a in priced}
+    leftover = sum(num(a.get("value")) for a in all_assets if id(a) not in priced_ids and a["kind"] != "fiat")
+    series: list[list[tuple[int, float]]] = []
+    qtys: list[float] = []
+    for asset in priced:
+        candles = candles_map.get(asset.get("productId") or "") or []
+        if len(candles) < 2:
+            continue
+        series.append(candles)
+        price = num(asset.get("price"))
+        value = num(asset.get("value"))
+        qty = (value / price) if price else num(asset.get("quantity"))
+        qtys.append(qty)
+    if not series:
+        total = cash + leftover + sum(num(a.get("value")) for a in priced)
+        return [total, total] if total else []
+
+    start = min(s[0][0] for s in series)
+    end = max(s[-1][0] for s in series)
+    steps = 48
+    span = max(1, end - start)
+    values = []
+    for i in range(steps):
+        ts = start + span * i / (steps - 1)
+        total = cash + leftover
+        for candles, qty in zip(series, qtys):
+            price = interpolate(candles, ts)
+            total += price * qty
+        values.append(round(total, 2))
+    return downsample(values, 48)
+
+
+def interpolate(candles: list[tuple[float, float]] | list[tuple[int, float]], ts: float) -> float:
+    if ts <= candles[0][0]:
+        return candles[0][1]
+    if ts >= candles[-1][0]:
+        return candles[-1][1]
+    for i in range(1, len(candles)):
+        t0, p0 = candles[i - 1]
+        t1, p1 = candles[i]
+        if t0 <= ts <= t1:
+            if t1 == t0:
+                return p1
+            frac = (ts - t0) / (t1 - t0)
+            return p0 + (p1 - p0) * frac
+    return candles[-1][1]
+
+
+def _watch_keys(asset: dict[str, Any]) -> list[str]:
+    keys = []
+    kind = str(asset.get("kind") or "")
+    aid = str(asset.get("id") or "").upper()
+    pid = str(asset.get("productId") or "").upper()
+    if kind and aid:
+        keys.append(f"{kind}:{aid}")
+    if pid:
+        keys.append(f"pid:{pid}")
+    if aid:
+        keys.append(f"id:{aid}")
+        keys.append(f"id:{aid.split('-')[0]}")
+    return keys
+
+
+def _index_assets(assets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for asset in assets:
+        for key in _watch_keys(asset):
+            index.setdefault(key, asset)
+    return index
+
+
+def watchlist_kind_for_product(product: dict[str, Any]) -> str:
+    ptype = str(product.get("product_type") or "").upper()
+    det = product.get("equity_product_details") or {}
+    ticker = str(det.get("ticker") or product.get("base_display_symbol") or product.get("base_currency_id") or "").upper()
+    if ptype == "EQUITY":
+        return "commodity" if ticker in {t for t, _ in COMMODITY_ETFS} else "stock"
+    if ptype == "FUTURE":
+        return "derivative"
+    return "crypto"
+
+
+def is_watchlist_spot_pair(product: dict[str, Any]) -> bool:
+    quote = str(product.get("quote_currency_id") or product.get("quote_display_symbol") or "").upper()
+    pid = str(product.get("product_id") or "").upper()
+    if quote:
+        return quote == "USD"
+    return pid.endswith("-USD")
+
+
+def fetch_auth_products(
+    token: str,
+    product_type: str,
+    extra: dict[str, str] | None = None,
+    *,
+    limit: int = 250,
+    max_pages: int = 6,
+) -> list[dict[str, Any]] | None:
+    found: list[dict[str, Any]] = []
+    cursor = ""
+    offset = 0
+    empty_pages = 0
+    pages = 0
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"product_type": product_type, "limit": limit}
+        if extra:
+            params.update(extra)
+        if cursor:
+            params["cursor"] = cursor
+        else:
+            params["offset"] = offset
+        try:
+            payload = api_get("/api/v3/brokerage/products", token, params)
+        except RuntimeError:
+            return found if pages else None
+        pages += 1
+        if not isinstance(payload, dict):
+            return found if pages > 1 else None
+        products = payload.get("products") or []
+        if not isinstance(products, list):
+            return found if pages > 1 else None
+        products = [product for product in products if isinstance(product, dict)]
+        if not products:
+            break
+        page_watched = [p for p in products if p.get("watched")]
+        if product_type == "SPOT":
+            page_watched = [p for p in page_watched if is_watchlist_spot_pair(p)]
+        found.extend(page_watched)
+        pag = payload.get("pagination") or {}
+        if not isinstance(pag, dict):
+            break
+        if not page_watched:
+            empty_pages += 1
+            if empty_pages >= 1 and offset >= limit:
+                break
+        else:
+            empty_pages = 0
+        if not pag.get("has_next"):
+            break
+        cursor = str(pag.get("next_cursor") or "")
+        offset += len(products)
+        if not cursor:
+            break
+    return found
+
+
+def slim_watch_entry(product: dict[str, Any]) -> dict[str, Any] | None:
+    kind = watchlist_kind_for_product(product)
+    row = product_from_row(product, kind)
+    if not row:
+        det = product.get("equity_product_details") or {}
+        pid = str(product.get("product_id") or "")
+        ticker = str(det.get("ticker") or product.get("base_display_symbol") or product.get("base_currency_id") or pid.split("-")[0] or "").upper()
+        if not ticker:
+            return None
+        name = str(det.get("short_name") or product.get("base_name") or product.get("display_name") or ticker)
+        return {"id": ticker, "name": name, "kind": kind, "productId": pid or product_id_for(ticker)}
+    return {
+        "id": str(row.get("id") or "").upper(),
+        "name": str(row.get("name") or row.get("id") or ""),
+        "kind": kind,
+        "productId": str(row.get("productId") or ""),
+        "price": num(row.get("price")),
+        "dayPnl": num(row.get("dayPnl")),
+        "dayPnlPercent": num(row.get("dayPnlPercent")),
+        "marketCap": num(row.get("marketCap")),
+    }
+
+
+def parse_watchlist_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("products") or payload.get("watchlist") or payload.get("items") or []
+    if isinstance(payload.get("product_ids"), list) and not raw:
+        raw = payload.get("product_ids") or []
+    if isinstance(raw, dict):
+        raw = raw.get("products") or raw.get("items") or []
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            pid = item.strip()
+            if not pid:
+                continue
+            product = {"product_id": pid, "product_type": "SPOT" if "-" in pid else "EQUITY"}
+            entry = slim_watch_entry(product)
+        elif isinstance(item, dict):
+            if item.get("watched") is False:
+                continue
+            if item.get("product_id") or item.get("equity_product_details"):
+                entry = slim_watch_entry(item)
+            else:
+                pid = str(item.get("productId") or item.get("product_id") or item.get("id") or "").strip()
+                symbol = str(item.get("symbol") or item.get("ticker") or item.get("id") or pid.split("-")[0]).upper()
+                kind = str(item.get("kind") or ("stock" if item.get("ticker") else "crypto"))
+                entry = {
+                    "id": symbol,
+                    "name": str(item.get("name") or symbol),
+                    "kind": kind,
+                    "productId": pid or product_id_for(symbol),
+                }
+        else:
+            continue
+        if not entry:
+            continue
+        key = f"{entry.get('kind')}:{entry.get('id')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+    return entries
+
+
+def fetch_coinbase_watchlist(token: str, *, force: bool = False) -> list[dict[str, Any]]:
+    state = load_watchlist_state()
+    cached = state.get("coinbase")
+    cached_at = num(state.get("coinbaseAt"))
+    if not force and isinstance(cached, list) and cached and time.time() - cached_at < WATCHLIST_TTL:
+        return [row for row in cached if isinstance(row, dict)]
+
+    entries: list[dict[str, Any]] = []
+    try:
+        payload = http_json(
+            "GET",
+            API + "/api/v3/brokerage/watchlist",
+            headers={"Authorization": f"Bearer {token}"},
+            allow_statuses=(401, 403, 404, 422),
+        )
+        status = int(payload.get("_http_status") or 200)
+        if status == 200:
+            entries = parse_watchlist_payload(payload)
+    except RuntimeError:
+        entries = []
+
+    api_ok = bool(entries)
+    if not entries:
+        jobs = (
+            ("SPOT", None),
+            ("EQUITY", None),
+            ("FUTURE", {"contract_expiry_type": "PERPETUAL"}),
+        )
+        fetched: dict[str, list[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = {pool.submit(fetch_auth_products, token, ptype, extra): ptype for ptype, extra in jobs}
+            for fut in as_completed(futs):
+                ptype = futs[fut]
+                try:
+                    result = fut.result()
+                except Exception:  # noqa: BLE001
+                    result = None
+                if result is None:
+                    fetched[ptype] = []
+                else:
+                    fetched[ptype] = result
+                    api_ok = True
+        seen: set[str] = set()
+        for ptype, _extra in jobs:
+            for product in fetched.get(ptype) or []:
+                entry = slim_watch_entry(product)
+                if not entry:
+                    continue
+                key = f"{entry.get('kind')}:{entry.get('id')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append(entry)
+
+    if api_ok:
+        save_watchlist_state(coinbase=entries, coinbaseAt=int(time.time()))
+        return entries
+    if isinstance(cached, list) and cached:
+        return [row for row in cached if isinstance(row, dict)]
+    return []
+
+
+def asset_from_watch_entry(entry: dict[str, Any], order: int) -> dict[str, Any]:
+    kind = str(entry.get("kind") or "crypto")
+    symbol = str(entry.get("id") or "").upper()
+    name = str(entry.get("name") or symbol)
+    pid = str(entry.get("productId") or "")
+    if kind in {"stock", "commodity"}:
+        row = coinbase_stock_row(symbol, name, pid)
+        row["kind"] = kind
+    else:
+        row = market_row(
+            symbol,
+            name,
+            kind,
+            pid or product_id_for(symbol),
+            price=num(entry.get("price")),
+            dayPnl=num(entry.get("dayPnl")),
+            dayPnlPercent=num(entry.get("dayPnlPercent")),
+            marketCap=num(entry.get("marketCap")),
+        )
+    row["watchlist"] = True
+    row["watchlistOrder"] = order
+    row["held"] = False
+    return row
+
+
+def mark_watchlist_asset(asset: dict[str, Any], order: int) -> None:
+    asset["watchlist"] = True
+    prev = asset.get("watchlistOrder")
+    if prev is None or (isinstance(prev, (int, float)) and order < int(prev)):
+        asset["watchlistOrder"] = order
+
+
+def merge_watchlist_entries(
+    assets: list[dict[str, Any]], entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    extras: list[dict[str, Any]] = []
+    index = _index_assets(assets)
+
+    for asset in assets:
+        asset["watchlist"] = False
+        asset.pop("watchlistOrder", None)
+
+    def attach(entry: dict[str, Any], order: int) -> None:
+        pid = str(entry.get("productId") or "").upper()
+        symbol = str(entry.get("id") or "").upper()
+        kind = str(entry.get("kind") or "")
+        existing = (
+            (kind and symbol and index.get(f"{kind}:{symbol}"))
+            or index.get(f"pid:{pid}")
+            or index.get(f"id:{symbol}")
+            or index.get(f"id:{pid}")
+        )
+        if existing:
+            mark_watchlist_asset(existing, order)
+            return
+        extra = asset_from_watch_entry(entry, order)
+        extras.append(extra)
+        for key in _watch_keys(extra):
+            index.setdefault(key, extra)
+
+    for i, entry in enumerate(entries):
+        attach(entry, i)
+
+    return assets + extras
+
+
+def merge_watchlist(assets: list[dict[str, Any]], token: str = "") -> list[dict[str, Any]]:
+    entries = fetch_coinbase_watchlist(token) if token else []
+    return merge_watchlist_entries(assets, entries)
+
+
+def market_row(symbol: str, name: str, kind: str, product_id: str = "", **extra: Any) -> dict[str, Any]:
+    row = {
+        "id": symbol,
+        "name": name,
+        "kind": kind,
+        "productId": product_id,
+        "price": extra.get("price", 0),
+        "quantity": 0,
+        "value": 0,
+        "held": False,
+        "market": True,
+        "watchlist": False,
+        "marketCap": extra.get("marketCap", 0),
+        "costBasis": 0,
+        "unrealizedPnl": 0,
+        "dayPnl": extra.get("dayPnl", 0),
+        "dayPnlPercent": extra.get("dayPnlPercent", 0),
+        "url": extra.get("url") or asset_url(kind, symbol, product_id, name),
+        "rowSpark": extra.get("rowSpark") or [],
+        "rowSparkPeriod": extra.get("rowSparkPeriod") or "",
+        "rowSparkCache": extra.get("rowSparkCache") or {},
+        "yahoo": extra.get("yahoo") or (symbol if kind in {"stock", "commodity"} else ""),
+        "buyUrl": extra.get("buyUrl") or trade_urls(symbol, name, kind)["buy"],
+        "sellUrl": extra.get("sellUrl") or trade_urls(symbol, name, kind)["sell"],
+    }
+    return row
+
+
+def fetch_typed_products(product_type: str, extra: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"product_type": product_type}
+    if extra:
+        params.update(extra)
+    try:
+        payload = public_get("/api/v3/brokerage/market/products", params)
+    except RuntimeError:
+        return []
+    return payload.get("products") or []
+
+
+def product_from_row(p: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    pid = str(p.get("product_id") or "")
+    det = p.get("equity_product_details") or {}
+    price = num(p.get("price") or p.get("mid_market_price") or p.get("best_bid_price") or det.get("last_market_day_close_price") or det.get("open_price"))
+    pct = num(
+        p.get("price_percentage_change_24h")
+        or det.get("price_percentage_change_market_hours")
+        or det.get("price_percentage_change_extended_hours")
+    )
+    ticker = str(det.get("ticker") or p.get("base_display_symbol") or p.get("base_currency_id") or "")
+    if kind == "crypto":
+        ticker = str(p.get("product_id") or "").split("-")[0]
+    name = str(det.get("short_name") or p.get("base_name") or p.get("display_name") or ticker or pid)
+    if not pid:
+        return None
+    if kind != "stock" and not price:
+        return None
+    start = price / (1 + pct / 100.0) if price and pct != -100 else 0
+    return market_row(
+        (ticker or pid).upper(),
+        name,
+        kind,
+        pid,
+        price=price,
+        dayPnl=(price - start) if start else 0,
+        dayPnlPercent=pct,
+        marketCap=num(p.get("market_cap") or p.get("approximate_quote_24h_volume")),
+    )
+
+
+def crypto_majors(limit: int = 10) -> list[dict[str, Any]]:
+    rows = fetch_typed_products("SPOT")
+    ranked = []
+    for p in rows:
+        pid = str(p.get("product_id") or "")
+        if not pid.endswith("-USD"):
+            continue
+        symbol = pid.split("-")[0]
+        if symbol in STABLES or symbol in WRAPPED or symbol.startswith("USD"):
+            continue
+        price = num(p.get("price"))
+        if not price:
+            continue
+        ranked.append((num(p.get("approximate_quote_24h_volume")), p))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    assets = []
+    seen = set()
+    for _, p in ranked:
+        row = product_from_row(p, "crypto")
+        if not row or row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        assets.append(row)
+        if len(assets) >= limit:
+            break
+    if assets:
+        return assets
+    return [market_row(sym, name, "crypto", product_id_for(sym)) for sym, name in FALLBACK_MAJORS[:limit]]
+
+
+def derivative_majors(limit: int = 8) -> list[dict[str, Any]]:
+    rows = fetch_typed_products("FUTURE", {"contract_expiry_type": "PERPETUAL"})
+    ranked = []
+    for p in rows:
+        pid = str(p.get("product_id") or "")
+        price = num(p.get("price"))
+        if not pid or not price:
+            continue
+        ranked.append((num(p.get("approximate_quote_24h_volume")), p))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    assets = []
+    for _, p in ranked[:limit]:
+        pid = str(p.get("product_id") or "")
+        name = str(p.get("display_name") or p.get("base_name") or pid)
+        symbol = name.replace(" PERP", "").replace("PERP", "").strip() or pid.split("-")[0]
+        pct = num(p.get("price_percentage_change_24h"))
+        price = num(p.get("price"))
+        start = price / (1 + pct / 100.0) if pct != -100 and price else 0
+        assets.append(
+            market_row(
+                symbol,
+                name,
+                "derivative",
+                pid,
+                price=price,
+                dayPnl=price - start if start else 0,
+                dayPnlPercent=pct,
+            )
+        )
+    return assets
+
+
+def is_opaque_equity_id(value: str) -> bool:
+    raw = str(value or "").lower()
+    return raw.startswith("v1:equity") or (len(raw) > 40 and "equity" in raw)
+
+
+def is_junk_symbol(value: str) -> bool:
+    raw = str(value or "")
+    if is_opaque_equity_id(raw):
+        return True
+    if len(raw) >= 16 and set(raw) <= set("01"):
+        return True
+    return False
+
+
+def equity_hash(value: str) -> str:
+    raw = str(value or "")
+    parts = [p for p in raw.split(":") if p and p.lower() not in {"v1", "equity"}]
+    return parts[-1].strip(":") if parts else ""
+
+
+def load_equity_index() -> list[dict[str, str]]:
+    with product_cache_lock():
+        cache = read_json(PRODUCTS_CACHE, {})
+    cached = cache.get("equityIndex") if isinstance(cache, dict) else None
+    fetched = num(cache.get("equityIndexFetchedAt") if isinstance(cache, dict) else 0)
+    if isinstance(cached, list) and cached and fetched > time.time() - 6 * 3600:
+        return cached
+
+    catalog: list[dict[str, str]] = []
+    seen: set[str] = set()
+    wanted = {t for t, _ in MEGA_STOCKS} | {t for t, _ in COMMODITY_ETFS}
+    cursor = ""
+    for _ in range(12):
+        params: dict[str, Any] = {"product_type": "EQUITY"}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            payload = public_get("/api/v3/brokerage/market/products", params, timeout=20)
+        except RuntimeError:
+            break
+        for p in payload.get("products") or []:
+            det = p.get("equity_product_details") or {}
+            ticker = str(det.get("ticker") or p.get("base_display_symbol") or p.get("base_currency_id") or "").upper()
+            if not ticker or ticker in seen or "-" in ticker:
+                continue
+            seen.add(ticker)
+            catalog.append(
+                {
+                    "ticker": ticker,
+                    "name": str(det.get("short_name") or p.get("display_name") or ticker),
+                    "productId": str(p.get("product_id") or ""),
+                }
+            )
+        if wanted.issubset(seen):
+            break
+        pag = payload.get("pagination") or {}
+        if not pag.get("has_next"):
+            break
+        cursor = str(pag.get("next_cursor") or "")
+        if not cursor:
+            break
+
+    if catalog:
+        with product_cache_lock():
+            latest = read_json(PRODUCTS_CACHE, {})
+            latest = latest if isinstance(latest, dict) else {}
+            latest["equityIndex"] = catalog
+            latest["equityIndexFetchedAt"] = int(time.time())
+            write_json(PRODUCTS_CACHE, latest)
+    return catalog
+
+
+def _equity_by_ticker() -> dict[str, dict[str, str]]:
+    return {str(row.get("ticker") or "").upper(): row for row in load_equity_index()}
+
+
+def coinbase_stock_row(ticker: str, name: str, product_id: str = "") -> dict[str, Any]:
+    ticker = str(ticker or "").upper()
+    item = market_row(ticker, name or ticker, "stock", product_id or f"{ticker}-USD")
+    item["yahoo"] = ticker
+    trades = trade_urls(ticker, name or ticker, "stock")
+    item["buyUrl"] = trades["buy"]
+    item["sellUrl"] = trades["sell"]
+    item["url"] = trades["url"]
+    return item
+
+
+def stock_majors(limit: int = 16) -> list[dict[str, Any]]:
+    cache = read_json(PRODUCTS_CACHE, {})
+    idx = cache.get("equityIndex") if isinstance(cache, dict) else None
+    by_ticker = {str(row.get("ticker") or "").upper(): row for row in idx} if isinstance(idx, list) else {}
+    assets: list[dict[str, Any]] = []
+    for symbol, name in MEGA_STOCKS:
+        info = by_ticker.get(symbol.upper()) or {}
+        assets.append(coinbase_stock_row(symbol, str(info.get("name") or name), str(info.get("productId") or "")))
+        if len(assets) >= limit:
+            break
+    return assets
+
+
+def apply_stock_identity(asset: dict[str, Any], ticker: str, name: str, product_id: str = "") -> None:
+    ticker = str(ticker or "").upper()
+    if not ticker:
+        return
+    asset["id"] = ticker
+    asset["name"] = name or ticker
+    asset["kind"] = "stock"
+    asset["yahoo"] = ticker
+    asset["productId"] = product_id or f"{ticker}-USD"
+    trades = trade_urls(ticker, name or ticker, "stock")
+    asset["buyUrl"] = trades["buy"]
+    asset["sellUrl"] = trades["sell"]
+    asset["url"] = trades["url"]
+
+
+def resolve_stock_holdings(assets: list[dict[str, Any]]) -> None:
+    index = load_equity_index()
+    by_id = {str(row.get("productId") or ""): row for row in index}
+    known = [a for a in assets if a.get("kind") == "stock" and not is_opaque_equity_id(str(a.get("id") or ""))]
+    for asset in assets:
+        current = str(asset.get("id") or "")
+        if not is_opaque_equity_id(current):
+            continue
+        hid = equity_hash(current)
+        info = by_id.get(hid)
+        if not info:
+            px = num(asset.get("price"))
+            best = None
+            best_d = 1.0
+            for other in known:
+                other_px = num(other.get("price"))
+                if not px or not other_px:
+                    continue
+                delta = abs(other_px - px) / px
+                if delta < best_d:
+                    best_d = delta
+                    best = other
+            if best is not None and best_d <= 0.02:
+                apply_stock_identity(asset, str(best.get("id") or ""), str(best.get("name") or ""), str(best.get("productId") or ""))
+                continue
+            asset["name"] = "Stock"
+            continue
+        apply_stock_identity(asset, info.get("ticker") or "", info.get("name") or "", info.get("productId") or "")
+
+
+def dedupe_stock_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: dict[str, dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    for asset in assets:
+        if asset.get("kind") != "stock":
+            out.append(asset)
+            continue
+        ticker = str(asset.get("id") or "").upper()
+        prev = seen.get(ticker)
+        if prev is None:
+            seen[ticker] = asset
+            out.append(asset)
+            continue
+        if asset.get("held"):
+            prev["held"] = True
+            prev["quantity"] = asset.get("quantity") or prev.get("quantity")
+            prev["value"] = asset.get("value") or prev.get("value")
+        if asset.get("watchlist"):
+            prev["watchlist"] = True
+            if asset.get("watchlistOrder") is not None:
+                prev_order = prev.get("watchlistOrder")
+                if prev_order is None or num(asset.get("watchlistOrder")) < num(prev_order):
+                    prev["watchlistOrder"] = asset.get("watchlistOrder")
+        if not prev.get("rowSpark") and asset.get("rowSpark"):
+            prev["rowSpark"] = asset.get("rowSpark")
+            prev["rowSparkPeriod"] = asset.get("rowSparkPeriod")
+        previous_cache = remember_row_spark(prev)
+        for period, values in remember_row_spark(asset).items():
+            previous_cache.setdefault(period, values)
+        if previous_cache:
+            prev["rowSparkCache"] = previous_cache
+        if not num(prev.get("price")) and num(asset.get("price")):
+            prev["price"] = asset.get("price")
+            prev["pnlPercent"] = asset.get("pnlPercent")
+        if not num(prev.get("marketCap")) and num(asset.get("marketCap")):
+            prev["marketCap"] = asset.get("marketCap")
+    return out
+
+
+def commodity_majors() -> list[dict[str, Any]]:
+    by_ticker = _equity_by_ticker()
+    assets = []
+    for symbol, name in COMMODITY_ETFS:
+        row = by_ticker.get(symbol.upper())
+        if not row:
+            continue
+        item = dict(row)
+        item["name"] = name
+        item["kind"] = "commodity"
+        assets.append(item)
+    return assets
+
+
+def market_assets() -> list[dict[str, Any]]:
+    assets = crypto_majors() + derivative_majors() + stock_majors()
+    seen = set()
+    out = []
+    for asset in assets:
+        key = (asset.get("kind"), asset.get("id"), asset.get("productId"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(asset)
+    return out
+
+
+def find_asset(assets: list[dict[str, Any]], pref: dict[str, str] | None = None) -> dict[str, Any] | None:
+    pref = pref or bar_preference()
+    product = str(pref.get("product") or "").upper()
+    symbol = str(pref.get("symbol") or "").upper()
+    if product:
+        for asset in assets:
+            if str(asset.get("productId") or "").upper() == product:
+                return asset
+    if symbol:
+        for asset in assets:
+            if str(asset.get("id") or "").upper() == symbol:
+                return asset
+    return None
+
+
+def fetch_bar_asset(pref: dict[str, str] | None = None) -> dict[str, Any] | None:
+    pref = pref or bar_preference()
+    pid = pref.get("product") or product_id_for(pref.get("symbol") or "BTC")
+    product = fetch_product(pid)
+    if not product:
+        return None
+    ptype = str(product.get("product_type") or product.get("productType") or "")
+    kind = "crypto"
+    if "EQUITY" in ptype.upper():
+        row = product_from_row(product, "stock")
+        if row:
+            row["yahoo"] = str(row.get("id") or "").split("-")[0]
+        return row
+    if "FUTURE" in ptype.upper() or "PERP" in ptype.upper():
+        kind = "derivative"
+    return product_from_row(product, kind)
+
+
+def lead_asset(assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return find_asset(assets) or next((a for a in assets if a.get("id") == "BTC"), assets[0] if assets else None)
+
+
+def ensure_bar_asset(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pref = bar_preference()
+    if find_asset(assets, pref) is not None:
+        return assets
+    extra = fetch_bar_asset(pref)
+    if extra:
+        return assets + [extra]
+    return assets
+
+
+def snapshot_bar(
+    assets: list[dict[str, Any]],
+    *,
+    portfolio: bool,
+    total: float,
+    pnl: float,
+    pnl_percent: float,
+    period: str,
+) -> dict[str, Any]:
+    if portfolio:
+        return {
+            "pnl": round(pnl, 2),
+            "pnlPercent": round(pnl_percent, 2),
+            "period": period,
+            "symbol": "",
+            "productId": "",
+            "name": "",
+            "price": round(total, 2),
+        }
+    lead = lead_asset(assets) or {}
+    return {
+        "pnl": round(pnl, 2),
+        "pnlPercent": round(pnl_percent, 2),
+        "period": period,
+        "symbol": str(lead.get("id") or "BTC"),
+        "productId": str(lead.get("productId") or ""),
+        "name": str(lead.get("name") or ""),
+        "kind": str(lead.get("kind") or "crypto"),
+        "price": round(num(lead.get("price")), 2),
+    }
+
+
+def enrich_yahoo_assets(assets: list[dict[str, Any]]) -> None:
+    stocks = [
+        a
+        for a in assets
+        if a.get("kind") in {"stock", "commodity"} and not is_opaque_equity_id(str(a.get("id") or ""))
+    ]
+    if not stocks:
+        return
+    quotes = fetch_yahoo_spark([yahoo_symbol_for(a) for a in stocks])
+    sizing = stock_market_caps([yahoo_symbol_for(a) for a in stocks])
+    caps = sizing.get("caps") or {}
+    shares = sizing.get("shares") or {}
+    for asset in stocks:
+        symbol = yahoo_symbol_for(asset)
+        quote = quotes.get(symbol)
+        if quote:
+            if quote["price"]:
+                asset["price"] = quote["price"]
+            if quote["name"] and (not asset.get("name") or asset.get("name") == asset.get("id")):
+                asset["name"] = quote["name"]
+            asset["dayPnlPercent"] = quote["changePercent"]
+            asset["pnlPercent"] = quote["changePercent"]
+            asset["pnl"] = quote["change"]
+            if quote["closes"] and str(asset.get("rowSparkPeriod") or "day") == "day":
+                asset["rowSpark"] = quote["closes"]
+                asset["rowSparkPeriod"] = "day"
+            asset["yahoo"] = quote["symbol"]
+        cap = num(quote.get("marketCap") if quote else 0) or num(caps.get(symbol))
+        if not cap:
+            share_count = num(shares.get(symbol))
+            price = num(asset.get("price"))
+            if share_count and price:
+                cap = share_count * price
+        if cap:
+            asset["marketCap"] = cap
+
+
+def _valid_row_spark(values: Any) -> bool:
+    return isinstance(values, list) and len(values) >= 2 and all(num(value) > 0 for value in values)
+
+
+def remember_row_spark(asset: dict[str, Any]) -> dict[str, list[float]]:
+    raw = asset.get("rowSparkCache")
+    cache: dict[str, list[float]] = {}
+    if isinstance(raw, dict):
+        for key, values in raw.items():
+            if key in PERIODS and _valid_row_spark(values):
+                cache[key] = [num(value) for value in values]
+    current_period = str(asset.get("rowSparkPeriod") or "")
+    current = asset.get("rowSpark")
+    if current_period in PERIODS and _valid_row_spark(current):
+        cache[current_period] = [num(value) for value in current]
+    if cache:
+        asset["rowSparkCache"] = cache
+    else:
+        asset.pop("rowSparkCache", None)
+    return cache
+
+
+def activate_cached_row_sparks(assets: list[dict[str, Any]], period: str) -> None:
+    for asset in assets:
+        cache = remember_row_spark(asset)
+        values = cache.get(period) or []
+        if _valid_row_spark(values):
+            asset["rowSpark"] = values
+            asset["rowSparkPeriod"] = period
+        elif str(asset.get("rowSparkPeriod") or "") != period:
+            asset["rowSpark"] = []
+            asset["rowSparkPeriod"] = period
+
+
+def restore_row_spark_cache(assets: list[dict[str, Any]], previous: list[dict[str, Any]]) -> None:
+    index = _index_assets(assets)
+    for old in previous:
+        if not isinstance(old, dict):
+            continue
+        old_cache = remember_row_spark(old)
+        if not old_cache:
+            continue
+        current = None
+        for key in _watch_keys(old):
+            current = index.get(key)
+            if current is not None:
+                break
+        if current is None:
+            continue
+        merged = remember_row_spark(current)
+        for period, values in old_cache.items():
+            merged.setdefault(period, values)
+        current["rowSparkCache"] = merged
+
+
+def apply_period_row_spark(asset: dict[str, Any], period: str, candles: list[tuple[int, float]]) -> None:
+    spec = PERIODS.get(period) or PERIODS["day"]
+    cache = remember_row_spark(asset)
+    if len(candles) < 2:
+        values = cache.get(period) or []
+        if _valid_row_spark(values):
+            asset["rowSpark"] = values
+            asset["rowSparkPeriod"] = period
+        return
+    spark = sparkline_for_period(candles, num(asset.get("price")), spec["seconds"])
+    if len(spark) < 2:
+        values = cache.get(period) or []
+        if _valid_row_spark(values):
+            asset["rowSpark"] = values
+            asset["rowSparkPeriod"] = period
+        return
+    row_spark = downsample(spark, ROW_SPARK_POINTS)
+    asset["rowSpark"] = row_spark
+    asset["rowSparkPeriod"] = period
+    cache[period] = row_spark
+    asset["rowSparkCache"] = cache
+    start = num(row_spark[0])
+    end = num(row_spark[-1])
+    if not start:
+        return
+    unit = end - start
+    asset["pnlPercent"] = unit / start * 100
+    quantity = num(asset.get("quantity"))
+    asset["pnl"] = unit * quantity if quantity else unit
+
+
+def fill_period_row_sparks(assets: list[dict[str, Any]], period: str) -> None:
+    spec = PERIODS.get(period) or PERIODS["day"]
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for asset in assets:
+        kind = str(asset.get("kind") or "")
+        if kind == "fiat":
+            continue
+        if kind in {"stock", "commodity"}:
+            source = yahoo_symbol_for(asset)
+            source_kind = "yahoo"
+        else:
+            source = str(asset.get("productId") or "")
+            source_kind = "crypto" if kind == "crypto" else "coinbase"
+        if not source:
+            continue
+        grouped.setdefault((source_kind, source, str(asset.get("id") or "")), []).append(asset)
+    if not grouped:
+        return
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {}
+        for (source_kind, source, symbol), rows in grouped.items():
+            if source_kind == "yahoo":
+                fut = pool.submit(fetch_yahoo_candles, source, period)
+            elif source_kind == "crypto":
+                fut = pool.submit(
+                    fetch_crypto_candles,
+                    source,
+                    symbol,
+                    spec["granularity"],
+                    spec["seconds"],
+                    period,
+                )
+            else:
+                fut = pool.submit(fetch_candles, source, spec["granularity"], spec["seconds"])
+            futs[fut] = rows
+        for fut in as_completed(futs):
+            try:
+                candles = fut.result() or []
+            except Exception:  # noqa: BLE001
+                candles = []
+            for asset in futs[fut]:
+                apply_period_row_spark(asset, period, candles)
+
+
+def fill_crypto_row_sparks(assets: list[dict[str, Any]], period: str) -> None:
+    candidates = [
+        a
+        for a in assets
+        if a.get("kind") not in {"stock", "commodity", "fiat"}
+        and a.get("productId")
+        and (str(a.get("rowSparkPeriod") or "") != period or len(a.get("rowSpark") or []) < 2)
+    ]
+    candidates.sort(key=lambda a: (not a.get("watchlist"), not a.get("held")))
+    fill_period_row_sparks(candidates[:16], period)
+
+
+def write_market_snapshot(
+    assets: list[dict[str, Any]],
+    period: str,
+    *,
+    error: str = "",
+    catalog_at: int = 0,
+    row_sparks: bool = False,
+) -> dict[str, Any]:
+    enrich_yahoo_assets(assets)
+    activate_cached_row_sparks(assets, period)
+    lead = lead_asset(assets) or {}
+    sparkline, pnl, pnl_percent = apply_period_pnl(assets, period, lead=lead)
+    if len(sparkline) < 2:
+        sparkline = two_point_sparkline(lead)
+    if row_sparks:
+        fill_crypto_row_sparks(assets, period)
+    if lead and sparkline:
+        lead["rowSpark"] = downsample(sparkline, ROW_SPARK_POINTS)
+    snap = empty_snapshot(
+        authenticated=False,
+        error=error,
+        period=period,
+        mode="market",
+        total=round(num(lead.get("price")), 2),
+        pnl=round(pnl, 2),
+        pnlPercent=round(pnl_percent, 2),
+        sparkline=sparkline,
+        assets=assets,
+        catalogAt=int(catalog_at or time.time()),
+        bar=snapshot_bar(
+            assets,
+            portfolio=False,
+            total=0,
+            pnl=pnl,
+            pnl_percent=pnl_percent,
+            period=period,
+        ),
+    )
+    write_snapshot(snap)
+    return snap
+
+
+def build_market_snapshot(period: str, *, error: str = "") -> dict[str, Any]:
+    assets = ensure_bar_asset(market_assets())
+    lead = lead_asset(assets)
+    if lead and lead.get("productId"):
+        enrich_with_products([lead])
+    assets = [a for a in assets if num(a.get("price")) > 0 or a.get("kind") in {"stock", "commodity"}]
+    enrich_yahoo_assets(assets)
+    assets = [a for a in assets if num(a.get("price")) > 0]
+    assets = ensure_bar_asset(assets)
+    lead = lead_asset(assets)
+    if lead and lead.get("productId") and num(lead.get("price")) <= 0 and lead.get("kind") not in {"stock", "commodity"}:
+        enrich_with_products([lead])
+    return write_market_snapshot(assets, period, error=error, catalog_at=int(time.time()), row_sparks=True)
+
+
+def refresh_live_snapshot(
+    period: str,
+    *,
+    previous: dict[str, Any],
+    error: str = "",
+) -> dict[str, Any]:
+    assets = [dict(a) for a in (previous.get("assets") or []) if isinstance(a, dict)]
+    if not assets:
+        return build_market_snapshot(period, error=error)
+    assets = ensure_bar_asset(assets)
+    lead = lead_asset(assets)
+    need = []
+    if lead and lead.get("productId") and lead.get("kind") not in {"stock", "commodity"}:
+        need.append(lead)
+    if need:
+        enrich_with_products(need)
+    catalog_at = int(num(previous.get("catalogAt")) or time.time())
+    return write_market_snapshot(assets, period, error=error, catalog_at=catalog_at, row_sparks=False)
+
+
+def market_snapshot(period: str, *, error: str = "") -> dict[str, Any]:
+    previous = read_json(SNAPSHOT_FILE, {})
+    assets = previous.get("assets") if isinstance(previous, dict) else None
+    catalog_at = num(previous.get("catalogAt")) if isinstance(previous, dict) else 0
+    if isinstance(assets, list) and assets and catalog_at and time.time() - catalog_at < CATALOG_TTL:
+        return refresh_live_snapshot(period, previous=previous, error=error)
+    return build_market_snapshot(period, error=error)
+
+
+def tidy_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept = []
+    for asset in assets:
+        if asset.get("watchlist"):
+            kept.append(asset)
+            continue
+        if num(asset.get("value")) >= 0.5 or num(asset.get("quantity")) > 0:
+            kept.append(asset)
+    kept.sort(key=lambda a: (not a.get("held"), -(num(a.get("value")))))
+    return kept
+
+
+def build_snapshot(period: str) -> dict[str, Any]:
+    period = period if period in PERIODS else "day"
+    with snapshot_lock():
+        return assemble_snapshot(period)
+
+
+def assemble_snapshot(period: str) -> dict[str, Any]:
+    previous = read_json(SNAPSHOT_FILE, {})
+    update_prefs(period=period)
+
+    try:
+        token = valid_access_token()
+    except RuntimeError as exc:
+        message = str(exc)
+        public_error = "" if message in {"needsSetup", "not signed in"} else message
+        try:
+            return market_snapshot(period, error=public_error)
+        except Exception as market_exc:  # noqa: BLE001
+            snap = empty_snapshot(
+                needsSetup=message == "needsSetup",
+                error=public_error or str(market_exc),
+                period=period,
+            )
+            write_snapshot(snap)
+            return snap
+
+    try:
+        user = fetch_user(token)
+        try:
+            assets, total = fetch_breakdown(token)
+        except RuntimeError:
+            assets = fetch_v2_accounts(token)
+            total = sum(num(a.get("value")) for a in assets)
+        assets = merge_watchlist(assets, token)
+        enrich_with_products(assets)
+        assets = tidy_assets(assets)
+        held_keys = {(a.get("kind"), str(a.get("id") or "").upper()) for a in assets}
+        for row in market_assets():
+            key = (row.get("kind"), str(row.get("id") or "").upper())
+            if key in held_keys:
+                continue
+            assets.append(row)
+            held_keys.add(key)
+        enrich_yahoo_assets(assets)
+        resolve_stock_holdings(assets)
+        assets = dedupe_stock_assets(assets)
+        previous_assets = previous.get("assets") if isinstance(previous, dict) else []
+        restore_row_spark_cache(assets, previous_assets if isinstance(previous_assets, list) else [])
+        activate_cached_row_sparks(assets, period)
+        if total <= 0:
+            total = sum(num(a.get("value")) for a in assets if a.get("held"))
+        sparkline, pnl, pnl_percent = apply_period_pnl(assets, period)
+        fill_crypto_row_sparks(assets, period)
+        if total <= 0:
+            total = sum(num(a.get("value")) for a in assets if a.get("held"))
+        start_total = total - pnl
+        pnl_percent = (pnl / start_total * 100) if start_total else 0
+        if sparkline:
+            sparkline = scale_sparkline(sparkline, start_total, total)
+        elif total:
+            sparkline = [round(start_total, 2), round(total, 2)]
+        snap = {
+            "authenticated": True,
+            "needsSetup": False,
+            "usesBroker": using_broker(),
+            "error": "",
+            "user": user,
+            "total": round(total, 2),
+            "nativeCurrency": "USD",
+            "period": period,
+            "mode": "portfolio",
+            "pnl": round(pnl, 2),
+            "pnlPercent": round(pnl_percent, 2),
+            "sparkline": sparkline,
+            "assets": assets,
+            "barDisplay": bar_display(),
+            "bar": snapshot_bar(
+                assets,
+                portfolio=True,
+                total=total,
+                pnl=pnl,
+                pnl_percent=pnl_percent,
+                period=period,
+            ),
+            "actions": ACTION_URLS,
+            "fetchedAt": now_iso(),
+        }
+        write_snapshot(snap)
+        refresh_products_cache()
+        return snap
+    except Exception as exc:  # noqa: BLE001
+        snap = empty_snapshot(authenticated=True, error=str(exc), period=period)
+        # Keep last-good numbers if we already had a snapshot.
+        previous = read_json(SNAPSHOT_FILE, {})
+        if isinstance(previous, dict) and previous.get("authenticated"):
+            previous["error"] = str(exc)
+            previous["fetchedAt"] = now_iso()
+            write_snapshot(previous)
+            return previous
+        write_snapshot(snap)
+        return snap
+
+
+def refresh_products_cache() -> None:
+    with product_cache_lock():
+        cache = read_json(PRODUCTS_CACHE, {})
+    products = cache.get("products") if isinstance(cache, dict) else None
+    fresh = isinstance(cache, dict) and num(cache.get("fetchedAtUnix")) > time.time() - 6 * 3600
+    priced = isinstance(products, list) and products and isinstance(products[0], dict) and "price" in products[0]
+    if fresh and priced:
+        return
+    try:
+        payload = public_get("/api/v3/brokerage/market/products")
+    except RuntimeError:
+        return
+    rows = payload.get("products") or [] if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return
+    slim = []
+    for row in rows[:800]:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("product_id") or "")
+        if not pid:
+            continue
+        base = str(row.get("base_currency_id") or pid.split("-")[0] or "")
+        quote = str(row.get("quote_currency_id") or (pid.split("-")[1] if "-" in pid else ""))
+        base_name = str(row.get("base_name") or "")
+        pct = num(row.get("price_percentage_change_24h"))
+        slim.append(
+            {
+                "id": pid,
+                "base": base,
+                "quote": quote,
+                "baseName": base_name,
+                "name": base_name or row.get("display_name") or pid,
+                "kind": str(row.get("product_type") or "SPOT"),
+                "url": asset_url("crypto", base, pid, base_name),
+                "price": num(row.get("price")),
+                "dayPnlPercent": pct,
+                "volume": num(row.get("approximate_quote_24h_volume") or row.get("market_cap")),
+            }
+        )
+    with product_cache_lock():
+        latest = read_json(PRODUCTS_CACHE, {})
+        latest = latest if isinstance(latest, dict) else {}
+        latest["fetchedAtUnix"] = int(time.time())
+        latest["products"] = slim
+        write_json(PRODUCTS_CACHE, latest)
+
+
+def cmd_snapshot(period: str | None, fast: bool = False) -> None:
+    prefs = load_prefs()
+    chosen = period or str(prefs.get("period") or "day")
+    if chosen not in PERIODS:
+        chosen = "day"
+    update_prefs(period=chosen)
+    snap: dict[str, Any] | None = None
+    if fast:
+        with snapshot_lock():
+            if retarget_snapshot(chosen):
+                loaded = read_json(SNAPSHOT_FILE, {})
+                if isinstance(loaded, dict):
+                    snap = loaded
+    if snap is None:
+        snap = build_snapshot(chosen)
+    print(json.dumps(snap))
+
+
+def cmd_search(query: str) -> None:
+    query = (query or "").strip().lower()
+    if len(query) < 1:
+        print("[]")
+        return
+    terms = [term for term in query.split() if term]
+    refresh_products_cache()
+    cached = read_json(PRODUCTS_CACHE, {})
+    products = cached.get("products") or [] if isinstance(cached, dict) else []
+    if not isinstance(products, list):
+        products = []
+    quotes = STABLES | {"USD", "EUR", "GBP", "BTC", "ETH"}
+    best: dict[str, dict[str, Any]] = {}
+    for row in products:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("id") or "")
+        kind = str(row.get("kind") or "")
+        if "FUTURE" in kind.upper() or "PERP" in pid.upper() or "INTX" in pid.upper():
+            continue
+        base = str(row.get("base") or "").upper()
+        quote = str(row.get("quote") or "").upper()
+        if not base and "-" in pid:
+            left, right = pid.split("-", 1)
+            base = left.upper()
+            quote = right.split("-")[0].upper()
+        if not base or "-" in base:
+            continue
+        if quote and quote not in quotes and len(quote) > 6:
+            continue
+        base_name = str(row.get("baseName") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not base_name:
+            base_name = name if name and "-" not in name and name.upper() != pid.upper() else base
+        hay = f"{base} {base_name}".lower()
+        if not all(term in hay for term in terms):
+            continue
+        score = 1
+        if quote == "USD":
+            score += 3
+        elif quote in {"USDC", "USDT"}:
+            score += 1
+        if base.lower() == query:
+            score += 20
+        elif base.lower().startswith(query):
+            score += 8
+        if base_name.lower() == query:
+            score += 10
+        elif base_name.lower().startswith(query):
+            score += 3
+        volume = num(row.get("volume"))
+        prev = best.get(base)
+        if prev is not None:
+            prev_score = int(prev.get("_score") or 0)
+            if score < prev_score or (score == prev_score and volume <= num(prev.get("marketCap"))):
+                continue
+        product_id = f"{base}-USD" if quote != "USD" else pid
+        price = num(row.get("price"))
+        pct = num(row.get("dayPnlPercent"))
+        start = price / (1 + pct / 100.0) if price and pct != -100 else 0
+        best[base] = {
+            "id": base,
+            "name": base_name,
+            "productId": product_id,
+            "kind": "crypto",
+            "url": asset_url("crypto", base, product_id, base_name),
+            "price": price,
+            "dayPnlPercent": pct,
+            "pnlPercent": pct,
+            "dayPnl": (price - start) if start else 0,
+            "marketCap": volume,
+            "_score": score,
+        }
+    ranked = sorted(
+        best.values(),
+        key=lambda row: (-int(row.get("_score") or 0), -num(row.get("marketCap")), str(row.get("id") or "")),
+    )
+    out = []
+    for row in ranked[:8]:
+        row.pop("_score", None)
+        out.append(row)
+    seen_ids = {str(row.get("id") or "").upper() for row in out}
+    q = query.lower()
+    equity_hits: list[tuple[int, dict[str, Any]]] = []
+    for entry in load_equity_index():
+        ticker = str(entry.get("ticker") or "").upper()
+        name = str(entry.get("name") or "")
+        hay = f"{ticker} {name}".lower()
+        if not all(term in hay for term in terms):
+            continue
+        score = 40
+        if ticker.lower() == q:
+            score = 100
+        elif ticker.lower().startswith(q):
+            score = 80
+        elif name.lower().startswith(q):
+            score = 60
+        equity_hits.append((score, coinbase_stock_row(ticker, name, str(entry.get("productId") or ""))))
+    equity_hits.sort(key=lambda item: -item[0])
+    for _, row in equity_hits:
+        hid = str(row.get("id") or "").upper()
+        if hid in seen_ids:
+            continue
+        out.append(row)
+        seen_ids.add(hid)
+        if len(out) >= 12:
+            break
+    print(json.dumps(out))
+
+
+def cmd_display() -> None:
+    with prefs_lock():
+        prefs = load_prefs()
+        current = str(prefs.get("barDisplay") or "full")
+        if current not in BAR_DISPLAY_MODES:
+            current = "full"
+        nxt = BAR_DISPLAY_MODES[(BAR_DISPLAY_MODES.index(current) + 1) % len(BAR_DISPLAY_MODES)]
+        prefs["barDisplay"] = nxt
+        write_json(PREFS_FILE, prefs)
+    with snapshot_lock():
+        snap = read_json(SNAPSHOT_FILE, {})
+        if isinstance(snap, dict) and snap:
+            snap["barDisplay"] = nxt
+            write_snapshot(snap)
+    print(json.dumps({"barDisplay": nxt}))
+
+
+def cmd_chart(product_id: str, period: str | None = None, symbol: str = "", kind: str = "") -> None:
+    period = period if period in PERIODS else str(load_prefs().get("period") or "day")
+    if period not in PERIODS:
+        period = "day"
+    pid = str(product_id or "").strip()
+    symbol_out = str(symbol or pid.split("-")[0] or "").upper()
+    kind_out = str(kind or "").strip().lower()
+    if not kind_out:
+        if "PERP" in pid.upper() or "INTX" in pid.upper():
+            kind_out = "derivative"
+        elif pid.upper().endswith("-USD") and symbol_out in {t for t, _ in MEGA_STOCKS} | {t for t, _ in COMMODITY_ETFS}:
+            kind_out = "stock"
+        else:
+            kind_out = "crypto"
+    spec = PERIODS[period]
+    product: dict[str, Any] = {}
+    yahoo: dict[str, Any] = {}
+    gecko: dict[str, Any] = {}
+    if kind_out in {"stock", "commodity"}:
+        yahoo = yahoo_chart_bundle(symbol_out, period)
+        candles = yahoo.get("candles") or []
+        price = num(yahoo.get("price"))
+        pct = num(yahoo.get("changePercent"))
+        name = str(yahoo.get("name") or symbol_out)
+    else:
+        product_id = pid or product_id_for(symbol_out)
+        if kind_out == "crypto":
+            candles = fetch_crypto_candles(product_id, symbol_out, spec["granularity"], spec["seconds"], period)
+        else:
+            candles = fetch_candles(product_id, spec["granularity"], spec["seconds"])
+        product = fetch_product(pid or product_id_for(symbol_out)) or {}
+        price = num(product.get("price"))
+        pct = num(product.get("price_percentage_change_24h"))
+        name = str(product.get("base_name") or symbol_out)
+        if not price and candles:
+            price = candles[-1][1]
+        gecko = fetch_coingecko_detail(symbol_out)
+        if gecko.get("name") and (not name or name == symbol_out):
+            name = str(gecko.get("name"))
+    spark = sparkline_for_period(candles, price, spec["seconds"])
+    if len(spark) < 2:
+        spark = two_point_sparkline({"price": price, "pnlPercent": pct})
+    start = spark[0] if spark else 0
+    pnl = (price - start) if start else 0
+    percent = (pnl / start * 100) if start else pct
+    stats, ohlc = asset_stats(kind=kind_out, product=product, yahoo=yahoo, gecko=gecko)
+    trades = trade_urls(symbol_out, name, kind_out)
+    print(
+        json.dumps(
+            {
+                "id": symbol_out,
+                "name": name,
+                "kind": kind_out,
+                "productId": pid or product_id_for(symbol_out),
+                "price": price,
+                "pnl": pnl,
+                "pnlPercent": percent,
+                "sparkline": spark,
+                "rowSpark": downsample(spark, ROW_SPARK_POINTS),
+                "buyUrl": trades["buy"],
+                "sellUrl": trades["sell"],
+                "url": trades["url"],
+                "period": period,
+                "open": ohlc.get("open") or 0,
+                "high": ohlc.get("high") or 0,
+                "low": ohlc.get("low") or 0,
+                "volume": ohlc.get("volume") or 0,
+                "stats": stats,
+            }
+        )
+    )
+
+
+def cmd_rows(period: str | None = None, tab: str = "") -> None:
+    chosen = period if period in PERIODS else str(load_prefs().get("period") or "day")
+    if chosen not in PERIODS:
+        chosen = "day"
+    tab = str(tab or "").strip().lower()
+    with snapshot_lock():
+        snap = read_json(SNAPSHOT_FILE, {})
+        if not isinstance(snap, dict):
+            snap = {}
+        if str(snap.get("period") or "day") != chosen or str(load_prefs().get("period") or "day") != chosen:
+            print(json.dumps(snap))
+            return
+        assets = [dict(a) for a in (snap.get("assets") or []) if isinstance(a, dict)]
+        if tab == "watchlist":
+            targets = [a for a in assets if a.get("watchlist")]
+        elif tab in {"crypto", "stock", "derivative"}:
+            targets = [a for a in assets if str(a.get("kind") or "") == tab]
+        else:
+            targets = assets
+        fill_period_row_sparks(targets, chosen)
+        snap["assets"] = assets
+        write_snapshot(snap)
+    print(json.dumps(snap))
+
+
+def cmd_watchlist_refresh() -> None:
+    with snapshot_lock():
+        snap = read_json(SNAPSHOT_FILE, {})
+        if not isinstance(snap, dict):
+            snap = {}
+        if not snap.get("authenticated"):
+            print(json.dumps(snap))
+            return
+        try:
+            token = valid_access_token()
+        except RuntimeError:
+            print(json.dumps(snap))
+            return
+        assets = [dict(a) for a in (snap.get("assets") or []) if isinstance(a, dict)]
+        entries = fetch_coinbase_watchlist(token, force=True)
+        snap["assets"] = merge_watchlist_entries(assets, entries)
+        write_snapshot(snap)
+    print(json.dumps(snap))
+
+
+def retarget_portfolio_snapshot(period: str, previous: dict[str, Any]) -> bool:
+    assets = list(previous.get("assets") or [])
+    if not assets:
+        return False
+    activate_cached_row_sparks(assets, period)
+    sparkline, pnl, pnl_percent = apply_period_pnl(assets, period)
+    total = num(previous.get("total"))
+    start_total = total - pnl
+    pnl_percent = (pnl / start_total * 100) if start_total else 0
+    if sparkline:
+        sparkline = scale_sparkline(sparkline, start_total, total)
+    elif total:
+        sparkline = [round(start_total, 2), round(total, 2)]
+    previous["period"] = period
+    previous["sparkline"] = sparkline
+    previous["pnl"] = round(pnl, 2)
+    previous["pnlPercent"] = round(pnl_percent, 2)
+    previous["bar"] = snapshot_bar(
+        assets,
+        portfolio=True,
+        total=total,
+        pnl=pnl,
+        pnl_percent=pnl_percent,
+        period=period,
+    )
+    previous["fetchedAt"] = now_iso()
+    write_snapshot(previous)
+    return True
+
+
+def retarget_snapshot(period: str) -> bool:
+    previous = read_json(SNAPSHOT_FILE, {})
+    if not isinstance(previous, dict) or not isinstance(previous.get("assets"), list):
+        return False
+    if previous.get("authenticated"):
+        return retarget_portfolio_snapshot(period, previous)
+    return retarget_market_snapshot(period)
+
+
+def retarget_market_snapshot(period: str) -> bool:
+    previous = read_json(SNAPSHOT_FILE, {})
+    if not isinstance(previous, dict) or previous.get("authenticated") or not isinstance(previous.get("assets"), list):
+        return False
+    assets = [a for a in (previous.get("assets") or []) if isinstance(a, dict)]
+    if not assets:
+        return False
+    assets = ensure_bar_asset(assets)
+    lead = lead_asset(assets)
+    if lead and lead.get("productId"):
+        enrich_with_products([lead])
+    write_market_snapshot(
+        assets,
+        period,
+        error=str(previous.get("error") or ""),
+        catalog_at=int(num(previous.get("catalogAt")) or time.time()),
+    )
+    return True
+
+
+def cmd_ticker(product_id: str, symbol: str = "") -> None:
+    save_bar_preference(product_id, symbol)
+    if load_tokens().get("access_token"):
+        print("ok")
+        return
+    period = str(load_prefs().get("period") or "day")
+    with snapshot_lock():
+        if retarget_market_snapshot(period):
+            print("ok")
+            return
+    build_snapshot(period)
+    print("ok")
+
+
+def cmd_oauth_check() -> None:
+    base = broker_url()
+    print(f"broker: {base or '(missing broker.url)'}")
+    if not base:
+        print("No broker URL. Deploy broker/ or set COINBASE_OAUTH_BROKER.")
+        return
+    redirect = base.rstrip("/") + "/oauth/callback"
+    print(f"redirect_uri: {redirect}")
+    try:
+        health = http_json("GET", base.rstrip("/") + "/health")
+        print(f"health: {health}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"health failed: {exc}")
+        return
+    try:
+        started = http_json("POST", base.rstrip("/") + "/oauth/start")
+    except Exception as exc:  # noqa: BLE001
+        print(f"oauth/start failed: {exc}")
+        return
+    print(f"broker redirect_uri: {started.get('redirect_uri')}")
+    print(f"oauth/start: {'ok' if started.get('session_id') and started.get('authorize_url') else 'invalid response'}")
+    print()
+    print("In CDP OAuth settings the redirect URI must be EXACTLY:")
+    print(f"  {started.get('redirect_uri') or redirect}")
+    print("If Coinbase shows 'We're having connection issues' after Allow,")
+    print("the authorize request never reached this worker — usually a")
+    print("redirect URI mismatch, or Coinbase blocking workers.dev.")
+    print("Fix: add a custom HTTPS domain in Cloudflare, put that origin")
+    print("in broker.url, and register the new /oauth/callback in CDP.")
+
+
+def cmd_status() -> None:
+    app = load_app()
+    tokens = load_tokens()
+    print(
+        json.dumps(
+            {
+                "needsSetup": not using_broker() and not bool(app.get("clientId")),
+                "usesBroker": using_broker(),
+                "broker": broker_url(),
+                "authenticated": bool(tokens.get("access_token")),
+                "redirectUri": (broker_url() + "/oauth/callback") if using_broker() else REDIRECT_URI,
+                "scopes": SCOPES,
+            }
+        )
+    )
+
+
+def main() -> None:
+    ensure_state()
+    parser = argparse.ArgumentParser(prog="coinbase")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    setup = sub.add_parser("setup")
+    setup.add_argument("client_id", nargs="?", default="")
+    setup.add_argument("client_secret", nargs="?", default="")
+    setup.add_argument("--stdin", action="store_true")
+
+    sub.add_parser("login")
+    sub.add_parser("logout")
+    sub.add_parser("status")
+
+    snap = sub.add_parser("snapshot")
+    snap.add_argument("--period", default=None)
+    snap.add_argument("--fast", action="store_true")
+
+    search = sub.add_parser("search")
+    search.add_argument("query")
+
+    sub.add_parser("watchlist-refresh")
+
+    ticker = sub.add_parser("ticker")
+    ticker.add_argument("product_id")
+    ticker.add_argument("--symbol", default="")
+
+    chart = sub.add_parser("chart")
+    chart.add_argument("product_id")
+    chart.add_argument("--period", default=None)
+    chart.add_argument("--symbol", default="")
+    chart.add_argument("--kind", default="")
+
+    rows = sub.add_parser("rows")
+    rows.add_argument("--period", default=None)
+    rows.add_argument("--tab", default="")
+
+    sub.add_parser("display")
+
+    opener = sub.add_parser("open")
+    opener.add_argument("url")
+
+    sub.add_parser("oauth-check")
+
+    args = parser.parse_args()
+    if args.cmd == "setup":
+        cmd_setup(args.client_id, args.client_secret, args.stdin)
+    elif args.cmd == "login":
+        cmd_login()
+    elif args.cmd == "logout":
+        cmd_logout()
+    elif args.cmd == "snapshot":
+        cmd_snapshot(args.period, fast=args.fast)
+    elif args.cmd == "search":
+        cmd_search(args.query)
+    elif args.cmd == "watchlist-refresh":
+        cmd_watchlist_refresh()
+    elif args.cmd == "ticker":
+        cmd_ticker(args.product_id, args.symbol)
+    elif args.cmd == "chart":
+        cmd_chart(args.product_id, args.period, args.symbol, args.kind)
+    elif args.cmd == "rows":
+        cmd_rows(args.period, args.tab)
+    elif args.cmd == "display":
+        cmd_display()
+    elif args.cmd == "open":
+        open_browser(args.url)
+    elif args.cmd == "oauth-check":
+        cmd_oauth_check()
+    elif args.cmd == "status":
+        cmd_status()
+
+
+if __name__ == "__main__":
+    main()
