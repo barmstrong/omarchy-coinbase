@@ -16,6 +16,6 @@ Routes:
 
 - `POST /oauth/start` — create a session, return Coinbase authorize URL
 - `GET /oauth/callback` — Coinbase redirect; exchange the code
-- `GET /oauth/session/:id` — one-time token handoff for that random session ID
+- `POST /oauth/session` — one-time JSON token handoff using a random session ID
 - `POST /oauth/refresh` — `{ "refresh_token": "..." }`
 - `POST /oauth/revoke` — revoke the supplied access token on logout

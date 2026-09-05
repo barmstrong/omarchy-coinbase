@@ -1328,8 +1328,9 @@ def login_via_broker() -> None:
     while time.time() < deadline:
         time.sleep(1)
         row = http_json(
-            "GET",
-            f"{base}/oauth/session/{urllib.parse.quote(str(session_id), safe='')}",
+            "POST",
+            f"{base}/oauth/session",
+            body={"session_id": str(session_id)},
             allow_statuses=(202, 400, 404),
         )
         status = int(row.get("_http_status") or 200)

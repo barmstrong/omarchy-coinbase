@@ -20,8 +20,10 @@ export default {
       }
       if (url.pathname === "/oauth/callback" && request.method === "GET")
         return callback(request, env, url);
-      if (url.pathname.startsWith("/oauth/session/") && request.method === "GET")
-        return session(env, url.pathname.slice("/oauth/session/".length));
+      if (url.pathname === "/oauth/session" && request.method === "POST") {
+        if (!(await allowed(env.OAUTH_SESSION_LIMITER, request))) return limited();
+        return session(request, env);
+      }
       if (url.pathname === "/oauth/refresh" && request.method === "POST") {
         if (!(await allowed(env.OAUTH_TOKEN_LIMITER, request))) return limited();
         return refresh(request, env);
@@ -97,12 +99,18 @@ async function pkce() {
 async function start(env, url) {
   requireSecrets(env);
   if (url.protocol !== "https:") return json({ error: "https required" }, 400);
-  const id = b64url(crypto.getRandomValues(new Uint8Array(18)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(18)));
+  const id = b64url(crypto.getRandomValues(new Uint8Array(32)));
   const { verifier, challenge } = await pkce();
   const redirectUri = `${url.origin}/oauth/callback`;
   await env.SESSIONS.put(
-    id,
-    JSON.stringify({ status: "pending", verifier, createdAt: Date.now() }),
+    `oauth-state:${state}`,
+    JSON.stringify({ status: "pending", verifier, sessionId: id, createdAt: Date.now() }),
+    { expirationTtl: SESSION_TTL },
+  );
+  await env.SESSIONS.put(
+    `oauth-session:${id}`,
+    JSON.stringify({ status: "pending", createdAt: Date.now() }),
     { expirationTtl: SESSION_TTL },
   );
   const authorize = new URL(AUTH_URL);
@@ -110,7 +118,7 @@ async function start(env, url) {
   authorize.searchParams.set("client_id", env.COINBASE_CLIENT_ID);
   authorize.searchParams.set("redirect_uri", redirectUri);
   authorize.searchParams.set("scope", SCOPES);
-  authorize.searchParams.set("state", id);
+  authorize.searchParams.set("state", state);
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "S256");
   return json({ session_id: id, authorize_url: authorize.toString(), redirect_uri: redirectUri });
@@ -138,21 +146,37 @@ async function tokenRequest(env, body) {
 
 async function callback(request, env, url) {
   requireSecrets(env);
-  const id = url.searchParams.get("state") || "";
+  const state = url.searchParams.get("state") || "";
   const code = url.searchParams.get("code") || "";
   const error = url.searchParams.get("error") || "";
-  const row = /^[A-Za-z0-9_-]{24}$/.test(id) ? await env.SESSIONS.get(id, "json") : null;
+  const row = /^[A-Za-z0-9_-]{24}$/.test(state)
+    ? await env.SESSIONS.get(`oauth-state:${state}`, "json")
+    : null;
   if (!row)
     return donePage(false, "This sign-in session expired. Return to Omarchy and try again.");
-  if (row.status !== "pending" || !row.verifier)
+  const sessionKey = `oauth-session:${row.sessionId || ""}`;
+  const sessionRow = row.sessionId ? await env.SESSIONS.get(sessionKey, "json") : null;
+  if (row.status !== "pending" || !row.verifier || !sessionRow || sessionRow.status !== "pending") {
+    await env.SESSIONS.delete(`oauth-state:${state}`);
     return donePage(false, "This sign-in session has already been used.");
+  }
   if (error) {
     const message = error.slice(0, 200);
-    await env.SESSIONS.put(id, JSON.stringify({ status: "error", error: message }), { expirationTtl: 120 });
+    await env.SESSIONS.put(sessionKey, JSON.stringify({ status: "error", error: message }), { expirationTtl: 120 });
+    await env.SESSIONS.delete(`oauth-state:${state}`);
     return donePage(false, message);
   }
-  if (!code || code.length > 4096)
+  if (!code || code.length > 4096) {
+    const message = "Coinbase did not return an authorization code.";
+    await env.SESSIONS.put(
+      sessionKey,
+      JSON.stringify({ status: "error", error: message }),
+      { expirationTtl: 120 },
+    );
+    await env.SESSIONS.delete(`oauth-state:${state}`);
     return donePage(false, "Coinbase did not return an authorization code.");
+  }
+  await env.SESSIONS.delete(`oauth-state:${state}`);
   try {
     const tokens = await tokenRequest(env, {
       grant_type: "authorization_code",
@@ -168,22 +192,28 @@ async function callback(request, env, url) {
       token_type: tokens.token_type || "bearer",
       scope: tokens.scope || "",
     };
-    await env.SESSIONS.put(id, JSON.stringify(complete), { expirationTtl: COMPLETE_TTL });
+    await env.SESSIONS.put(sessionKey, JSON.stringify(complete), { expirationTtl: COMPLETE_TTL });
     return donePage(true, "You can close this tab and return to Omarchy.");
   } catch (err) {
     const message = String(err.message || err).slice(0, 500);
-    await env.SESSIONS.put(
-      id,
-      JSON.stringify({ status: "error", error: message }),
-      { expirationTtl: 120 },
-    );
+    const current = await env.SESSIONS.get(sessionKey, "json");
+    if (!current || current.status !== "complete")
+      await env.SESSIONS.put(
+        sessionKey,
+        JSON.stringify({ status: "error", error: message }),
+        { expirationTtl: 120 },
+      );
     return donePage(false, message);
   }
 }
 
-async function session(env, id) {
-  const key = decodeURIComponent(id || "").trim();
-  if (!/^[A-Za-z0-9_-]{24}$/.test(key)) return json({ error: "invalid session" }, 400);
+async function session(request, env) {
+  const parsed = await readJson(request);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const id = String(body.session_id || "");
+  if (!/^[A-Za-z0-9_-]{43}$/.test(id)) return json({ error: "invalid session" }, 400);
+  const key = `oauth-session:${id}`;
   const row = await env.SESSIONS.get(key, "json");
   if (!row) return json({ status: "missing" }, 404);
   if (row.status === "pending") return json({ status: "pending" }, 202);
@@ -205,8 +235,9 @@ async function session(env, id) {
 
 async function refresh(request, env) {
   requireSecrets(env);
-  if (!isJson(request)) return json({ error: "application/json required" }, 415);
-  const body = await request.json().catch(() => ({}));
+  const parsed = await readJson(request);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
   const refreshToken = String(body.refresh_token || "");
   if (!refreshToken || refreshToken.length > 4096)
     return json({ error: "valid refresh_token required" }, 400);
@@ -225,8 +256,9 @@ async function refresh(request, env) {
 
 async function revoke(request, env) {
   requireSecrets(env);
-  if (!isJson(request)) return json({ error: "application/json required" }, 415);
-  const body = await request.json().catch(() => ({}));
+  const parsed = await readJson(request);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
   const token = String(body.access_token || "");
   if (!token || token.length > 4096) return json({ error: "valid access_token required" }, 400);
   const payload = new URLSearchParams({
@@ -249,6 +281,36 @@ async function revoke(request, env) {
 
 function isJson(request) {
   return (request.headers.get("content-type") || "").toLowerCase().startsWith("application/json");
+}
+
+async function readJson(request, maxBytes = 16384) {
+  if (!isJson(request)) return { response: json({ error: "application/json required" }, 415) };
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (Number.isFinite(declared) && declared > maxBytes)
+    return { response: json({ error: "request body too large" }, 413) };
+  if (!request.body) return { response: json({ error: "invalid JSON body" }, 400) };
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let size = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maxBytes) {
+      await reader.cancel();
+      return { response: json({ error: "request body too large" }, 413) };
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  try {
+    const body = JSON.parse(text);
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("not an object");
+    return { body };
+  } catch {
+    return { response: json({ error: "invalid JSON body" }, 400) };
+  }
 }
 
 function donePage(ok, message) {

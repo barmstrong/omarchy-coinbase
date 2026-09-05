@@ -67,8 +67,9 @@ directory.
 The default hosted Cloudflare Worker in `broker/` holds the OAuth application's
 client secret. During sign-in it temporarily holds an authorization session and
 the returned tokens for up to ten minutes so the plugin can collect them using a
-random 144-bit session ID. Refresh and revocation requests also pass through the
-broker because Coinbase requires the application's client secret. The Worker
+random 256-bit session ID that is separate from the browser-visible OAuth state.
+Refresh and revocation requests also pass through the broker because Coinbase
+requires the application's client secret. The Worker
 source is included for review and can be self-hosted. Native Cloudflare rate
 limits protect its session-creation and token endpoints from basic abuse.
 

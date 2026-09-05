@@ -41,33 +41,72 @@ assert.equal((await request("/oauth/start")).status, 404);
 response = await request("/oauth/start", { method: "POST" });
 assert.equal(response.status, 200);
 const started = await response.json();
-assert.match(started.session_id, /^[A-Za-z0-9_-]{24}$/);
+assert.match(started.session_id, /^[A-Za-z0-9_-]{43}$/);
 const authorize = new URL(started.authorize_url);
+const state = authorize.searchParams.get("state");
+assert.match(state, /^[A-Za-z0-9_-]{24}$/);
+assert.notEqual(state, started.session_id);
 assert.equal(authorize.origin, "https://login.coinbase.com");
 assert.equal(
   authorize.searchParams.get("scope"),
   "wallet:user:read,wallet:accounts:read,offline_access",
 );
 
-response = await request("/oauth/session/not-valid");
+assert.equal((await request(`/oauth/session/${started.session_id}`)).status, 404);
+response = await request("/oauth/session", { method: "POST" });
+assert.equal(response.status, 415);
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: "x".repeat(17000) }),
+});
+assert.equal(response.status, 413);
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: "not-valid" }),
+});
 assert.equal(response.status, 400);
-response = await request(`/oauth/session/${started.session_id}`);
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: started.session_id }),
+});
 assert.equal(response.status, 202);
 assert.deepEqual(await response.json(), { status: "pending" });
 
 await kv.put(
-  started.session_id,
+  `oauth-session:${started.session_id}`,
   JSON.stringify({ status: "complete", access_token: "access", refresh_token: "refresh" }),
 );
-response = await request(`/oauth/callback?state=${started.session_id}&code=replay`);
+response = await request(`/oauth/callback?state=${state}&code=replay`);
 assert.equal(response.status, 200);
 assert.match(await response.text(), /already been used/);
-assert.equal((await kv.get(started.session_id, "json")).access_token, "access");
+assert.equal((await kv.get(`oauth-session:${started.session_id}`, "json")).access_token, "access");
+assert.equal(await kv.get(`oauth-state:${state}`, "json"), null);
 
-response = await request(`/oauth/session/${started.session_id}`);
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: started.session_id }),
+});
 assert.equal(response.status, 200);
 assert.equal((await response.json()).access_token, "access");
-assert.equal(await kv.get(started.session_id, "json"), null);
+assert.equal(await kv.get(`oauth-session:${started.session_id}`, "json"), null);
+
+response = await request("/oauth/start", { method: "POST" });
+const denied = await response.json();
+const deniedState = new URL(denied.authorize_url).searchParams.get("state");
+response = await request(`/oauth/callback?state=${deniedState}&error=access_denied`);
+assert.match(await response.text(), /access_denied/);
+assert.equal(await kv.get(`oauth-state:${deniedState}`, "json"), null);
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: denied.session_id }),
+});
+assert.equal(response.status, 400);
+assert.equal((await response.json()).status, "error");
 
 assert.equal((await request("/oauth/refresh", { method: "POST" })).status, 415);
 assert.equal((await request("/oauth/revoke", { method: "POST" })).status, 415);

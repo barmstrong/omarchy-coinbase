@@ -24,6 +24,14 @@
         "limit": 30,
         "period": 60
       }
+    },
+    {
+      "name": "OAUTH_SESSION_LIMITER",
+      "namespace_id": "63841003",
+      "simple": {
+        "limit": 240,
+        "period": 60
+      }
     }
   ]
 }
