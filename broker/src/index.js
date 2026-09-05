@@ -16,21 +16,21 @@ export default {
       if (url.pathname === "/health" && request.method === "GET") return json({ ok: true });
       if (url.pathname === "/oauth/start" && request.method === "POST") {
         if (!(await allowed(env.OAUTH_START_LIMITER, request))) return limited();
-        return start(env, url);
+        return await start(env, url);
       }
       if (url.pathname === "/oauth/callback" && request.method === "GET")
-        return callback(request, env, url);
+        return await callback(request, env, url);
       if (url.pathname === "/oauth/session" && request.method === "POST") {
         if (!(await allowed(env.OAUTH_SESSION_LIMITER, request))) return limited();
-        return session(request, env);
+        return await session(request, env);
       }
       if (url.pathname === "/oauth/refresh" && request.method === "POST") {
         if (!(await allowed(env.OAUTH_TOKEN_LIMITER, request))) return limited();
-        return refresh(request, env);
+        return await refresh(request, env);
       }
       if (url.pathname === "/oauth/revoke" && request.method === "POST") {
         if (!(await allowed(env.OAUTH_TOKEN_LIMITER, request))) return limited();
-        return revoke(request, env);
+        return await revoke(request, env);
       }
       return json({ error: "not found" }, 404);
     } catch (err) {
@@ -130,10 +130,14 @@ async function tokenRequest(env, body) {
   payload.set("client_secret", env.COINBASE_CLIENT_SECRET);
   const response = await fetch(TOKEN_URL, {
     method: "POST",
-    redirect: "error",
+    // Cloudflare Workers supports only "follow" and "manual". Keep redirects
+    // manual so credentials are never forwarded to a different endpoint.
+    redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: payload.toString(),
   });
+  if (response.status >= 300 && response.status < 400)
+    throw new Error("token endpoint redirected unexpectedly");
   const data = await response.json().catch(() => ({}));
   if (!response.ok)
     throw new Error(data.error_description || data.error || `token http ${response.status}`);
@@ -154,9 +158,20 @@ async function callback(request, env, url) {
     : null;
   if (!row)
     return donePage(false, "This sign-in session expired. Return to Omarchy and try again.");
-  const sessionKey = `oauth-session:${row.sessionId || ""}`;
-  const sessionRow = row.sessionId ? await env.SESSIONS.get(sessionKey, "json") : null;
-  if (row.status !== "pending" || !row.verifier || !sessionRow || sessionRow.status !== "pending") {
+  const sessionId = String(row.sessionId || "");
+  const sessionKey = `oauth-session:${sessionId}`;
+  const sessionRow = /^[A-Za-z0-9_-]{43}$/.test(sessionId)
+    ? await env.SESSIONS.get(sessionKey, "json")
+    : null;
+  // A newly-created KV row can briefly be invisible in another edge location.
+  // The single-use state row is authoritative; only reject the session row
+  // when it exists and proves that this authorization was already consumed.
+  if (
+    row.status !== "pending" ||
+    !row.verifier ||
+    !/^[A-Za-z0-9_-]{43}$/.test(sessionId) ||
+    (sessionRow && sessionRow.status !== "pending")
+  ) {
     await env.SESSIONS.delete(`oauth-state:${state}`);
     return donePage(false, "This sign-in session has already been used.");
   }
@@ -268,13 +283,15 @@ async function revoke(request, env) {
   });
   const response = await fetch(REVOKE_URL, {
     method: "POST",
-    redirect: "error",
+    redirect: "manual",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
       authorization: `Bearer ${token}`,
     },
     body: payload.toString(),
   });
+  if (response.status >= 300 && response.status < 400)
+    throw new Error("revoke endpoint redirected unexpectedly");
   if (!response.ok) throw new Error(`revoke http ${response.status}`);
   return json({ ok: true });
 }

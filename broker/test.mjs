@@ -108,6 +108,47 @@ response = await request("/oauth/session", {
 assert.equal(response.status, 400);
 assert.equal((await response.json()).status, "error");
 
+// The callback must survive KV propagation lag between the start and callback
+// requests. The single-use state record still ties the browser to this session.
+response = await request("/oauth/start", { method: "POST" });
+const lagged = await response.json();
+const laggedState = new URL(lagged.authorize_url).searchParams.get("state");
+await kv.delete(`oauth-session:${lagged.session_id}`);
+response = await request(`/oauth/callback?state=${laggedState}&error=access_denied`);
+assert.match(await response.text(), /access_denied/);
+assert.equal(
+  (await kv.get(`oauth-session:${lagged.session_id}`, "json")).status,
+  "error",
+);
+
+// Cloudflare Workers does not implement redirect: "error". Use "manual" and
+// reject redirects before OAuth credentials can be sent anywhere else.
+response = await request("/oauth/start", { method: "POST" });
+const redirected = await response.json();
+const redirectedState = new URL(redirected.authorize_url).searchParams.get("state");
+const nativeFetch = globalThis.fetch;
+let redirectMode = "";
+globalThis.fetch = async (_url, init) => {
+  redirectMode = init.redirect;
+  return new Response("", { status: 302, headers: { location: "https://example.invalid" } });
+};
+try {
+  response = await request(`/oauth/callback?state=${redirectedState}&code=test-code`);
+  assert.equal(redirectMode, "manual");
+  assert.match(await response.text(), /token endpoint redirected unexpectedly/);
+
+  response = await request("/oauth/revoke", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ access_token: "test-token" }),
+  });
+  assert.equal(redirectMode, "manual");
+  assert.equal(response.status, 500);
+  assert.equal((await response.json()).error, "revoke endpoint redirected unexpectedly");
+} finally {
+  globalThis.fetch = nativeFetch;
+}
+
 assert.equal((await request("/oauth/refresh", { method: "POST" })).status, 415);
 assert.equal((await request("/oauth/revoke", { method: "POST" })).status, 415);
 assert.equal((await request("/oauth/claim", { method: "POST" })).status, 404);
