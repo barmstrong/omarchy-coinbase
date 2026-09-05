@@ -74,4 +74,15 @@ assert.equal((await request("/oauth/revoke", { method: "POST" })).status, 415);
 assert.equal((await request("/oauth/claim", { method: "POST" })).status, 404);
 assert.equal((await request("/oauth/debug")).status, 404);
 
+const blockedEnv = {
+  ...env,
+  OAUTH_START_LIMITER: { limit: async () => ({ success: false }) },
+};
+response = await worker.fetch(
+  new Request("https://broker.example/oauth/start", { method: "POST" }),
+  blockedEnv,
+);
+assert.equal(response.status, 429);
+assert.equal(response.headers.get("retry-after"), "60");
+
 console.log("broker security tests passed");

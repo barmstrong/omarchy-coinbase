@@ -7,5 +7,23 @@
     {
       "binding": "SESSIONS"
     }
+  ],
+  "ratelimits": [
+    {
+      "name": "OAUTH_START_LIMITER",
+      "namespace_id": "63841001",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "OAUTH_TOKEN_LIMITER",
+      "namespace_id": "63841002",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    }
   ]
 }

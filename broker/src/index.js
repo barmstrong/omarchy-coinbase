@@ -14,16 +14,22 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/health" && request.method === "GET") return json({ ok: true });
-      if (url.pathname === "/oauth/start" && request.method === "POST")
+      if (url.pathname === "/oauth/start" && request.method === "POST") {
+        if (!(await allowed(env.OAUTH_START_LIMITER, request))) return limited();
         return start(env, url);
+      }
       if (url.pathname === "/oauth/callback" && request.method === "GET")
         return callback(request, env, url);
       if (url.pathname.startsWith("/oauth/session/") && request.method === "GET")
         return session(env, url.pathname.slice("/oauth/session/".length));
-      if (url.pathname === "/oauth/refresh" && request.method === "POST")
+      if (url.pathname === "/oauth/refresh" && request.method === "POST") {
+        if (!(await allowed(env.OAUTH_TOKEN_LIMITER, request))) return limited();
         return refresh(request, env);
-      if (url.pathname === "/oauth/revoke" && request.method === "POST")
+      }
+      if (url.pathname === "/oauth/revoke" && request.method === "POST") {
+        if (!(await allowed(env.OAUTH_TOKEN_LIMITER, request))) return limited();
         return revoke(request, env);
+      }
       return json({ error: "not found" }, 404);
     } catch (err) {
       return json({ error: String(err.message || err) }, 500);
@@ -31,7 +37,7 @@ export default {
   },
 };
 
-function json(body, status = 200) {
+function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
@@ -39,8 +45,20 @@ function json(body, status = 200) {
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
+      ...extraHeaders,
     },
   });
+}
+
+async function allowed(limiter, request) {
+  if (!limiter || typeof limiter.limit !== "function") return true;
+  const key = request.headers.get("cf-connecting-ip") || "unknown";
+  const result = await limiter.limit({ key });
+  return result.success === true;
+}
+
+function limited() {
+  return json({ error: "too many requests" }, 429, { "retry-after": "60" });
 }
 
 function html(body, status = 200) {

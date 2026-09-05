@@ -69,7 +69,8 @@ client secret. During sign-in it temporarily holds an authorization session and
 the returned tokens for up to ten minutes so the plugin can collect them using a
 random 144-bit session ID. Refresh and revocation requests also pass through the
 broker because Coinbase requires the application's client secret. The Worker
-source is included for review and can be self-hosted.
+source is included for review and can be self-hosted. Native Cloudflare rate
+limits protect its session-creation and token endpoints from basic abuse.
 
 The plugin contacts these services:
 
