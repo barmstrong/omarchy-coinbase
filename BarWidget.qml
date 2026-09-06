@@ -34,10 +34,10 @@ BarWidget {
     return "full"
   }
   readonly property bool showTicker: !signedIn && !authLoading && barDisplay !== "price"
-  readonly property bool showPrice: hasQuote && (!authLoading || signedIn) && (!signedIn || barDisplay !== "price")
+  readonly property bool showPrice: hasQuote && !authLoading && (!signedIn || barDisplay !== "price")
   readonly property bool showPnl: !authLoading && hasQuote && barDisplay === "full" && isFinite(pnlPercent)
   readonly property string chipText: authLoading
-    ? (signedIn && hasQuote && barDisplay !== "price" ? totalText : "CB")
+    ? "CB"
     : (signedIn
       ? (hasQuote ? (barDisplay === "full" ? (totalText + "  " + pnlText) : (barDisplay === "quote" ? totalText : "CB")) : "CB")
       : (hasQuote ? (barDisplay === "price" ? totalText : (barDisplay === "quote" ? (tickerText + "  " + totalText) : (tickerText + "  " + totalText + "  " + pnlText))) : tickerText))
