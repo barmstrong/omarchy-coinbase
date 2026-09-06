@@ -32,6 +32,85 @@ def configure_state(helper, state):
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_future_products_are_classified_by_underlying(self):
+        helper = load_helper()
+
+        def product(underlying):
+            return {
+                "product_type": "FUTURE",
+                "future_product_details": {
+                    "perpetual_details": {"underlying_type": underlying}
+                },
+            }
+
+        self.assertEqual(helper.market_category_for_product(product("SPOT")), "crypto")
+        self.assertEqual(helper.market_category_for_product(product("EQUITY")), "stock")
+        self.assertEqual(helper.market_category_for_product(product("EQUITY_ETF")), "stock")
+        self.assertEqual(helper.market_category_for_product(product("COMMOD")), "commodity")
+        self.assertEqual(helper.market_category_for_product(product("INDEX")), "index")
+        self.assertEqual(helper.market_category_for_product(product("PREIPO")), "preipo")
+
+    def test_public_product_catalog_follows_pagination(self):
+        helper = load_helper()
+        calls = []
+
+        def fake_public_get(_path, params):
+            calls.append(dict(params))
+            if len(calls) == 1:
+                return {
+                    "products": [{"product_id": "BTC-PERP-INTX"}],
+                    "pagination": {"has_next": True, "next_cursor": "next"},
+                }
+            return {
+                "products": [{"product_id": "GOLD-PERP-INTX"}],
+                "pagination": {"has_next": False},
+            }
+
+        helper.public_get = fake_public_get
+        rows = helper.fetch_typed_products("FUTURE", {"contract_expiry_type": "PERPETUAL"})
+
+        self.assertEqual([row["product_id"] for row in rows], ["BTC-PERP-INTX", "GOLD-PERP-INTX"])
+        self.assertEqual(calls[0]["limit"], 250)
+        self.assertEqual(calls[1]["cursor"], "next")
+
+    def test_row_sparklines_are_batched_within_selected_category(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            helper.load_prefs = lambda: {"period": "day"}
+            rows = [
+                helper.market_row(
+                    f"C{i}",
+                    f"Commodity {i}",
+                    "derivative",
+                    f"C{i}-PERP-INTX",
+                    price=100 + i,
+                    marketCategory="commodity",
+                    volume24h=i,
+                )
+                for i in range(30)
+            ]
+            rows.append(
+                helper.market_row(
+                    "BTC", "Bitcoin", "crypto", "BTC-USD", price=100, volume24h=1_000_000
+                )
+            )
+            helper.write_snapshot(helper.empty_snapshot(period="day", assets=rows))
+            fetched = []
+
+            def fake_fill(targets, period):
+                self.assertEqual(period, "day")
+                fetched.extend(targets)
+
+            helper.fill_period_row_sparks = fake_fill
+            with contextlib.redirect_stdout(io.StringIO()):
+                helper.cmd_rows("day", "commodity")
+
+            self.assertEqual(len(fetched), helper.ROW_SPARK_BATCH)
+            self.assertTrue(all(row["marketCategory"] == "commodity" for row in fetched))
+            self.assertEqual(fetched[0]["id"], "C29")
+
     def test_recent_detail_cache_skips_network_refresh(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

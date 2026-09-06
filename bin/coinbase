@@ -84,6 +84,7 @@ CATALOG_TTL = 300
 WATCHLIST_TTL = 180
 STOCK_CAP_TTL = 6 * 3600
 ROW_SPARK_POINTS = 24
+ROW_SPARK_BATCH = 24
 CANDLE_CACHE_LIMIT = 600
 CANDLE_STALE_SECONDS = 7 * 86400
 DETAIL_CACHE_TTL = 60
@@ -92,6 +93,7 @@ DETAIL_CACHE_LIMIT = 96
 DETAIL_METADATA_TTL = 6 * 3600
 DETAIL_METADATA_LIMIT = 64
 BAR_DISPLAY_MODES = ("full", "quote", "price")
+MARKET_CATEGORIES = frozenset({"crypto", "stock", "commodity", "index", "preipo"})
 YAHOO_UA = "Mozilla/5.0"
 YAHOO_RANGES = {
     "hour": ("1d", "5m"),
@@ -780,6 +782,7 @@ def _quote_from_yahoo_meta(meta: dict[str, Any], closes: list[float], symbol: st
     change = num(meta.get("regularMarketChange"))
     if not change and price and prev:
         change = price - prev
+    share_volume = num(meta.get("regularMarketVolume"))
     return {
         "symbol": str(meta.get("symbol") or symbol).upper(),
         "name": str(meta.get("shortName") or meta.get("longName") or symbol),
@@ -788,6 +791,7 @@ def _quote_from_yahoo_meta(meta: dict[str, Any], closes: list[float], symbol: st
         "change": change,
         "changePercent": pct,
         "marketCap": num(meta.get("marketCap")),
+        "volume24h": share_volume * price if share_volume and price else 0,
         "closes": downsample(closes, ROW_SPARK_POINTS) if len(closes) > ROW_SPARK_POINTS else closes,
         "series": [(0, px) for px in closes],
     }
@@ -2255,6 +2259,10 @@ def enrich_with_products(assets: list[dict[str, Any]]) -> None:
             asset["kind"] = "commodity" if ticker in {t for t, _ in COMMODITY_ETFS} else "stock"
         elif "FUTURE" in ptype or "PERP" in ptype:
             asset["kind"] = "derivative"
+        asset["marketCategory"] = market_category_for_product(product, str(asset.get("kind") or ""))
+        volume = num(product.get("approximate_quote_24h_volume") or product.get("volume_24h"))
+        if volume:
+            asset["volume24h"] = volume
         if asset["kind"] != "fiat" and asset.get("quantity") and not asset.get("value"):
             asset["value"] = asset["quantity"] * asset["price"]
         start_24h = price / (1 + change_24h / 100) if price and change_24h != -100 else price
@@ -2471,6 +2479,68 @@ def _index_assets(assets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return index
 
 
+def market_category_for_product(product: dict[str, Any], fallback_kind: str = "") -> str:
+    future = product.get("future_product_details") or {}
+    if not isinstance(future, dict):
+        future = {}
+    perpetual = future.get("perpetual_details") or {}
+    if not isinstance(perpetual, dict):
+        perpetual = {}
+    underlying = str(
+        perpetual.get("underlying_type")
+        or future.get("futures_asset_type")
+        or product.get("futures_underlying_type")
+        or ""
+    ).upper()
+    underlying = underlying.removeprefix("FUTURES_UNDERLYING_TYPE_")
+    if "PREIPO" in underlying:
+        return "preipo"
+    if "COMMOD" in underlying:
+        return "commodity"
+    if "INDEX" in underlying:
+        return "index"
+    if underlying in {"EQUITY", "EQUITY_ETF", "ADR", "FOREIGN_EQUITY", "OTC"}:
+        return "stock"
+    if underlying == "SPOT":
+        return "crypto"
+
+    ptype = str(product.get("product_type") or product.get("productType") or "").upper()
+    if ptype == "EQUITY":
+        det = product.get("equity_product_details") or {}
+        ticker = str(
+            det.get("ticker")
+            or product.get("base_display_symbol")
+            or product.get("base_currency_id")
+            or ""
+        ).upper()
+        return "commodity" if ticker in {t for t, _ in COMMODITY_ETFS} else "stock"
+
+    fallback = str(fallback_kind or "").lower()
+    if fallback in MARKET_CATEGORIES:
+        return fallback
+    return "crypto"
+
+
+def market_category_for_asset(asset: dict[str, Any]) -> str:
+    category = str(asset.get("marketCategory") or "").lower()
+    if category in MARKET_CATEGORIES:
+        return category
+    kind = str(asset.get("kind") or "crypto").lower()
+    if kind == "stock":
+        return "stock"
+    if kind == "commodity":
+        return "commodity"
+    return "crypto"
+
+
+def market_volume(asset: dict[str, Any]) -> float:
+    if "volume24h" in asset:
+        return num(asset.get("volume24h"))
+    if "volume" in asset:
+        return num(asset.get("volume"))
+    return num(asset.get("marketCap"))
+
+
 def watchlist_kind_for_product(product: dict[str, Any]) -> str:
     ptype = str(product.get("product_type") or "").upper()
     det = product.get("equity_product_details") or {}
@@ -2556,7 +2626,14 @@ def slim_watch_entry(product: dict[str, Any]) -> dict[str, Any] | None:
         if not ticker:
             return None
         name = str(det.get("short_name") or product.get("base_name") or product.get("display_name") or ticker)
-        return {"id": ticker, "name": name, "kind": kind, "productId": pid or product_id_for(ticker)}
+        return {
+            "id": ticker,
+            "name": name,
+            "kind": kind,
+            "productId": pid or product_id_for(ticker),
+            "marketCategory": market_category_for_product(product, kind),
+            "volume24h": num(product.get("approximate_quote_24h_volume")),
+        }
     return {
         "id": str(row.get("id") or "").upper(),
         "name": str(row.get("name") or row.get("id") or ""),
@@ -2566,6 +2643,8 @@ def slim_watch_entry(product: dict[str, Any]) -> dict[str, Any] | None:
         "dayPnl": num(row.get("dayPnl")),
         "dayPnlPercent": num(row.get("dayPnlPercent")),
         "marketCap": num(row.get("marketCap")),
+        "marketCategory": market_category_for_asset(row),
+        "volume24h": market_volume(row),
     }
 
 
@@ -2638,7 +2717,11 @@ def asset_from_watch_entry(entry: dict[str, Any], order: int) -> dict[str, Any]:
             dayPnl=num(entry.get("dayPnl")),
             dayPnlPercent=num(entry.get("dayPnlPercent")),
             marketCap=num(entry.get("marketCap")),
+            marketCategory=str(entry.get("marketCategory") or ""),
+            volume24h=num(entry.get("volume24h")),
         )
+    row["marketCategory"] = str(entry.get("marketCategory") or market_category_for_asset(row))
+    row["volume24h"] = num(entry.get("volume24h") or row.get("volume24h"))
     row["watchlist"] = True
     row["watchlistOrder"] = order
     row["held"] = False
@@ -2704,6 +2787,8 @@ def market_row(symbol: str, name: str, kind: str, product_id: str = "", **extra:
         "market": True,
         "watchlist": False,
         "marketCap": extra.get("marketCap", 0),
+        "marketCategory": extra.get("marketCategory") or market_category_for_product({}, kind),
+        "volume24h": extra.get("volume24h", extra.get("volume", 0)),
         "costBasis": 0,
         "unrealizedPnl": 0,
         "dayPnl": extra.get("dayPnl", 0),
@@ -2719,15 +2804,46 @@ def market_row(symbol: str, name: str, kind: str, product_id: str = "", **extra:
     return row
 
 
-def fetch_typed_products(product_type: str, extra: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    params: dict[str, Any] = {"product_type": product_type}
-    if extra:
-        params.update(extra)
-    try:
-        payload = public_get("/api/v3/brokerage/market/products", params)
-    except RuntimeError:
-        return []
-    return payload.get("products") or []
+def fetch_typed_products(
+    product_type: str,
+    extra: dict[str, str] | None = None,
+    *,
+    limit: int = 250,
+    max_pages: int = 6,
+) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    cursor = ""
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"product_type": product_type, "limit": limit}
+        if extra:
+            params.update(extra)
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            payload = public_get("/api/v3/brokerage/market/products", params)
+        except RuntimeError:
+            break
+        if not isinstance(payload, dict):
+            break
+        products = payload.get("products") or []
+        if not isinstance(products, list) or not products:
+            break
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            pid = str(product.get("product_id") or "")
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            found.append(product)
+        pagination = payload.get("pagination") or {}
+        if not isinstance(pagination, dict) or not pagination.get("has_next"):
+            break
+        cursor = str(pagination.get("next_cursor") or "")
+        if not cursor:
+            break
+    return found
 
 
 def product_from_row(p: dict[str, Any], kind: str) -> dict[str, Any] | None:
@@ -2756,7 +2872,9 @@ def product_from_row(p: dict[str, Any], kind: str) -> dict[str, Any] | None:
         price=price,
         dayPnl=(price - start) if start else 0,
         dayPnlPercent=pct,
-        marketCap=num(p.get("market_cap") or p.get("approximate_quote_24h_volume")),
+        marketCap=num(p.get("market_cap")),
+        marketCategory=market_category_for_product(p, kind),
+        volume24h=num(p.get("approximate_quote_24h_volume") or p.get("volume_24h")),
     )
 
 
@@ -2790,7 +2908,7 @@ def crypto_majors(limit: int = 10) -> list[dict[str, Any]]:
     return [market_row(sym, name, "crypto", product_id_for(sym)) for sym, name in FALLBACK_MAJORS[:limit]]
 
 
-def derivative_majors(limit: int = 8) -> list[dict[str, Any]]:
+def derivative_majors(limit: int = 200) -> list[dict[str, Any]]:
     rows = fetch_typed_products("FUTURE", {"contract_expiry_type": "PERPETUAL"})
     ranked = []
     for p in rows:
@@ -2801,7 +2919,7 @@ def derivative_majors(limit: int = 8) -> list[dict[str, Any]]:
         ranked.append((num(p.get("approximate_quote_24h_volume")), p))
     ranked.sort(key=lambda item: item[0], reverse=True)
     assets = []
-    for _, p in ranked[:limit]:
+    for volume, p in ranked[:limit]:
         pid = str(p.get("product_id") or "")
         name = str(p.get("display_name") or p.get("base_name") or pid)
         symbol = name.replace(" PERP", "").replace("PERP", "").strip() or pid.split("-")[0]
@@ -2817,6 +2935,8 @@ def derivative_majors(limit: int = 8) -> list[dict[str, Any]]:
                 price=price,
                 dayPnl=price - start if start else 0,
                 dayPnlPercent=pct,
+                marketCategory=market_category_for_product(p, "derivative"),
+                volume24h=volume,
             )
         )
     return assets
@@ -3003,6 +3123,10 @@ def dedupe_stock_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             prev["pnlPercent"] = asset.get("pnlPercent")
         if not num(prev.get("marketCap")) and num(asset.get("marketCap")):
             prev["marketCap"] = asset.get("marketCap")
+        if not market_volume(prev) and market_volume(asset):
+            prev["volume24h"] = market_volume(asset)
+        if not prev.get("marketCategory") and asset.get("marketCategory"):
+            prev["marketCategory"] = asset.get("marketCategory")
     return out
 
 
@@ -3016,6 +3140,7 @@ def commodity_majors() -> list[dict[str, Any]]:
         item = dict(row)
         item["name"] = name
         item["kind"] = "commodity"
+        item["marketCategory"] = "commodity"
         assets.append(item)
     return assets
 
@@ -3030,6 +3155,7 @@ def market_assets() -> list[dict[str, Any]]:
             continue
         seen.add(key)
         out.append(asset)
+    out.sort(key=lambda row: (-market_volume(row), str(row.get("id") or "")))
     return out
 
 
@@ -3171,6 +3297,8 @@ def enrich_yahoo_assets(assets: list[dict[str, Any]]) -> None:
                 asset["rowSpark"] = quote["closes"]
                 asset["rowSparkPeriod"] = "day"
             asset["yahoo"] = quote["symbol"]
+            if quote["volume24h"]:
+                asset["volume24h"] = quote["volume24h"]
         cap = num(quote.get("marketCap") if quote else 0) or num(caps.get(symbol))
         if not cap:
             share_count = num(shares.get(symbol))
@@ -3319,7 +3447,7 @@ def fill_crypto_row_sparks(assets: list[dict[str, Any]], period: str) -> None:
         and a.get("productId")
         and (str(a.get("rowSparkPeriod") or "") != period or len(a.get("rowSpark") or []) < 2)
     ]
-    candidates.sort(key=lambda a: (not a.get("watchlist"), not a.get("held")))
+    candidates.sort(key=lambda a: (not a.get("watchlist"), not a.get("held"), -market_volume(a)))
     fill_period_row_sparks(candidates[:16], period)
 
 
@@ -3331,8 +3459,8 @@ def merge_missing_market_categories(
     if not usable_snapshot(previous) or not previous.get("assets"):
         return assets
     out = [dict(row) for row in assets if isinstance(row, dict)]
-    limits = {"crypto": 10, "stock": 16, "derivative": 8}
-    counts = {kind: sum(str(row.get("kind") or "") == kind for row in out) for kind in limits}
+    limits = {"crypto": 120, "stock": 60, "commodity": 20, "index": 20, "preipo": 20}
+    counts = {category: sum(market_category_for_asset(row) == category for row in out) for category in limits}
     seen = {
         (str(row.get("kind") or ""), str(row.get("productId") or row.get("id") or "").upper())
         for row in out
@@ -3340,15 +3468,15 @@ def merge_missing_market_categories(
     for row in previous.get("assets") or []:
         if not isinstance(row, dict) or row.get("market") is not True:
             continue
-        kind = str(row.get("kind") or "")
-        if kind not in limits or counts[kind] >= limits[kind]:
+        category = market_category_for_asset(row)
+        if category not in limits or counts[category] >= limits[category]:
             continue
-        key = (kind, str(row.get("productId") or row.get("id") or "").upper())
+        key = (str(row.get("kind") or ""), str(row.get("productId") or row.get("id") or "").upper())
         if key in seen:
             continue
         out.append(dict(row))
         seen.add(key)
-        counts[kind] += 1
+        counts[category] += 1
     return out
 
 
@@ -3926,11 +4054,19 @@ def cmd_rows(period: str | None = None, tab: str = "") -> None:
         assets = [dict(a) for a in (snap.get("assets") or []) if isinstance(a, dict)]
         if tab == "watchlist":
             targets = [a for a in assets if a.get("watchlist")]
-        elif tab in {"crypto", "stock", "derivative"}:
-            targets = [a for a in assets if str(a.get("kind") or "") == tab]
+            targets.sort(key=lambda row: (num(row.get("watchlistOrder"), 1e9), str(row.get("id") or "")))
+        elif tab in MARKET_CATEGORIES:
+            targets = [a for a in assets if market_category_for_asset(a) == tab]
+            targets.sort(key=lambda row: (-market_volume(row), str(row.get("id") or "")))
         else:
-            targets = assets
-        fill_period_row_sparks(targets, chosen)
+            targets = [a for a in assets if str(a.get("kind") or "") != "fiat"]
+            targets.sort(key=lambda row: (-market_volume(row), str(row.get("id") or "")))
+        missing = [
+            row
+            for row in targets
+            if str(row.get("rowSparkPeriod") or "") != chosen or len(row.get("rowSpark") or []) < 2
+        ]
+        fill_period_row_sparks(missing[:ROW_SPARK_BATCH], chosen)
         snap["assets"] = assets
         write_snapshot(snap)
     print(json.dumps(snap))

@@ -8,6 +8,20 @@ assert.equal(Model.shouldHandleLoginStatus("opening", true, false), true)
 assert.equal(Model.shouldHandleLoginStatus("done", false, false), false)
 assert.equal(Model.shouldHandleLoginStatus("done", true, false), true)
 
+assert.equal(Model.marketCategory({ kind: "crypto" }), "crypto")
+assert.equal(Model.marketCategory({ kind: "derivative", marketCategory: "commodity" }), "commodity")
+assert.equal(Model.marketCategory({ kind: "derivative", marketCategory: "preipo" }), "preipo")
+assert.equal(Model.marketVolume({ volume24h: 0, marketCap: 1000000 }), 0)
+assert.equal(Model.marketVolume({ marketCap: 1000000 }), 1000000)
+assert.deepEqual(
+  [
+    { id: "LOW", volume24h: 10 },
+    { id: "HIGH", volume24h: 100 },
+    { id: "MID", volume24h: 50 }
+  ].sort(Model.compareMarketVolume).map(function(row) { return row.id }),
+  ["HIGH", "MID", "LOW"]
+)
+
 const detail = {
   id: "BTC",
   productId: "BTC-USD",

@@ -27,7 +27,7 @@ Item {
   property string clientIdDraft: ""
   property string clientSecretDraft: ""
   property int listCursor: -1
-  property string marketTab: "crypto"
+  property string marketTab: "all"
   property bool hoverSelectEnabled: false
   property bool tabSynced: false
   property var detailAsset: null
@@ -59,15 +59,21 @@ Item {
   readonly property var marketTabs: root.signedIn
     ? [
         { value: "watchlist", label: "Watchlist" },
+        { value: "all", label: "All" },
         { value: "crypto", label: "Crypto" },
         { value: "stock", label: "Stocks" },
-        { value: "derivative", label: "Perps" }
+        { value: "commodity", label: "Commodities" },
+        { value: "index", label: "Indices" },
+        { value: "preipo", label: "Pre-IPO" }
       ]
     : [
+        { value: "all", label: "All" },
         { value: "crypto", label: "Crypto" },
         { value: "stock", label: "Stocks" },
-        { value: "derivative", label: "Perps" }
-  ]
+        { value: "commodity", label: "Commodities" },
+        { value: "index", label: "Indices" },
+        { value: "preipo", label: "Pre-IPO" }
+      ]
   readonly property bool showingDetail: detailAsset !== null
   readonly property string period: String(snapshot.period || "day")
   readonly property var assets: snapshot.assets || []
@@ -193,7 +199,7 @@ Item {
   }
 
   function resetSignedOutView() {
-    root.marketTab = "crypto"
+    root.marketTab = "all"
     root.tabSynced = true
     root.watchlistRefreshPending = false
     root.rowsRefreshPending = true
@@ -224,6 +230,8 @@ Item {
         market: true,
         watchlist: false,
         marketCap: row.marketCap,
+        marketCategory: row.marketCategory,
+        volume24h: row.volume24h,
         costBasis: 0,
         unrealizedPnl: 0,
         dayPnl: row.dayPnl,
@@ -286,14 +294,7 @@ Item {
       root.marketTab = "watchlist"
       return
     }
-    var kind = String(barPnl.kind || "")
-    var pid = String(barPnl.productId || "").toUpperCase()
-    if (kind === "derivative" || pid.indexOf("PERP") !== -1 || pid.indexOf("INTX") !== -1)
-      root.marketTab = "derivative"
-    else if (kind === "stock" || kind === "commodity")
-      root.marketTab = "stock"
-    else
-      root.marketTab = "crypto"
+    root.marketTab = "all"
   }
 
   property real pointerX: -1
@@ -352,6 +353,13 @@ Item {
     return Model.pnlColor(root.rowPeriodPercent(row), Color.accent, Color.urgent, root.muted)
   }
 
+  function marketTypeLabel(row) {
+    var category = Model.marketCategory(row)
+    var labels = { crypto: "crypto", stock: "stock", commodity: "commodity", index: "index", preipo: "pre-IPO" }
+    var label = labels[category] || category
+    return String(row && row.kind || "") === "derivative" ? label + " perp" : label
+  }
+
   function rowsNeedRefresh() {
     var rows = root.visibleAssets || []
     for (var i = 0; i < rows.length; i++) {
@@ -379,7 +387,7 @@ Item {
     var q = String(query || "").replace(/^\s+|\s+$/g, "").toLowerCase()
     rows = rows || []
     var out = []
-    var tab = String(root.marketTab || "crypto")
+    var tab = String(root.marketTab || "all")
     var seen = {}
     var searching = q.length > 0
     for (var i = 0; i < rows.length; i++) {
@@ -392,7 +400,9 @@ Item {
       if (!searching) {
         if (tab === "watchlist") {
           if (!a.watchlist) continue
-        } else if (String(a.kind || "crypto") !== tab) continue
+        } else if (tab === "all") {
+          if (String(a.kind || "") === "fiat") continue
+        } else if (Model.marketCategory(a) !== tab) continue
       }
       if (q && root.assetSearchScore(a, q) <= 0) continue
       out.push(a)
@@ -413,8 +423,8 @@ Item {
       out.sort(function(a, b) {
         var d = root.assetSearchScore(b, q) - root.assetSearchScore(a, q)
         if (d !== 0) return d
-        var cap = Number(b.marketCap || 0) - Number(a.marketCap || 0)
-        if (cap !== 0) return cap
+        var volume = Model.marketVolume(b) - Model.marketVolume(a)
+        if (volume !== 0) return volume
         return String(a.id || "").localeCompare(String(b.id || ""))
       })
     } else if (tab === "watchlist") {
@@ -426,13 +436,7 @@ Item {
         if (ao !== bo) return ao - bo
         return String(a.id || "").localeCompare(String(b.id || ""))
       })
-    } else if (tab === "stock") {
-      out.sort(function(a, b) {
-        var cap = Number(b.marketCap || 0) - Number(a.marketCap || 0)
-        if (cap !== 0) return cap
-        return String(a.id || "").localeCompare(String(b.id || ""))
-      })
-    }
+    } else out.sort(Model.compareMarketVolume)
     return out
   }
 
@@ -966,6 +970,12 @@ Item {
   }
 
   Timer {
+    id: rowScrollDebounce
+    interval: 180
+    onTriggered: root.refreshRows(false)
+  }
+
+  Timer {
     interval: 60000
     running: root.opened && root.signedIn
     repeat: true
@@ -1060,7 +1070,7 @@ Item {
             }
           }
           Text {
-            text: [modelData.id, modelData.kind].filter(function(s) { return !!s }).join(" · ")
+            text: [modelData.id, root.marketTypeLabel(modelData)].filter(function(s) { return !!s }).join(" · ")
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1664,27 +1674,39 @@ Item {
               width: parent.width
               spacing: Style.space(8)
 
-              Row {
-                spacing: Style.space(4)
-                Repeater {
-                  model: root.marketTabs
-                  Button {
-                    required property var modelData
-                    text: modelData.label
-                    selected: modelData.value === root.marketTab
-                    bordered: true
-                    foreground: root.foreground
-                    accent: Color.accent
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    horizontalPadding: Style.space(8)
-                    verticalPadding: Style.space(3)
-                    focusable: false
-                    onClicked: {
-                      root.marketTab = modelData.value
-                      root.resetHoverSelect()
-                      if (flick) flick.contentY = 0
-                      Qt.callLater(function() { root.refreshRows(false) })
+              Flickable {
+                width: parent.width
+                height: marketTabRow.implicitHeight
+                contentWidth: marketTabRow.implicitWidth
+                contentHeight: height
+                clip: true
+                interactive: contentWidth > width
+                flickableDirection: Flickable.HorizontalFlick
+                boundsBehavior: Flickable.StopAtBounds
+
+                Row {
+                  id: marketTabRow
+                  spacing: Style.space(4)
+                  Repeater {
+                    model: root.marketTabs
+                    Button {
+                      required property var modelData
+                      text: modelData.label
+                      selected: modelData.value === root.marketTab
+                      bordered: true
+                      foreground: root.foreground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      fontSize: Style.font.caption
+                      horizontalPadding: Style.space(8)
+                      verticalPadding: Style.space(3)
+                      focusable: false
+                      onClicked: {
+                        root.marketTab = modelData.value
+                        root.resetHoverSelect()
+                        if (flick) flick.contentY = 0
+                        Qt.callLater(function() { root.refreshRows(false) })
+                      }
                     }
                   }
                 }
@@ -1797,6 +1819,9 @@ Item {
               boundsBehavior: Flickable.StopAtBounds
               interactive: contentHeight > height
               flickableDirection: Flickable.VerticalFlick
+              onContentYChanged: {
+                if (root.opened && moving) rowScrollDebounce.restart()
+              }
 
               HoverHandler {
                 id: listHover

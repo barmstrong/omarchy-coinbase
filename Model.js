@@ -62,6 +62,32 @@ function pnlColor(value, upColor, downColor, flatColor) {
   return n > 0 ? upColor : downColor
 }
 
+function marketCategory(row) {
+  row = row || {}
+  var category = String(row.marketCategory || "").toLowerCase()
+  if (["crypto", "stock", "commodity", "index", "preipo"].indexOf(category) !== -1)
+    return category
+  var kind = String(row.kind || "crypto").toLowerCase()
+  if (kind === "stock") return "stock"
+  if (kind === "commodity") return "commodity"
+  return "crypto"
+}
+
+function marketVolume(row) {
+  row = row || {}
+  var raw = row.volume24h
+  if (raw === undefined || raw === null) raw = row.volume
+  if (raw === undefined || raw === null) raw = row.marketCap
+  var value = Number(raw || 0)
+  return isFinite(value) && value > 0 ? value : 0
+}
+
+function compareMarketVolume(a, b) {
+  var delta = marketVolume(b) - marketVolume(a)
+  if (delta !== 0) return delta
+  return String((a && a.id) || "").localeCompare(String((b && b.id) || ""))
+}
+
 function sparklineGeometry(values, width, height) {
   var nums = []
   if (values) {
@@ -177,6 +203,9 @@ if (typeof module !== "undefined") {
     formatPercent: formatPercent,
     formatSignedUsd: formatSignedUsd,
     pnlColor: pnlColor,
+    marketCategory: marketCategory,
+    marketVolume: marketVolume,
+    compareMarketVolume: compareMarketVolume,
     sparklineGeometry: sparklineGeometry,
     isSnapshot: isSnapshot,
     parseSnapshot: parseSnapshot,
