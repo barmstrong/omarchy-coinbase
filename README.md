@@ -6,14 +6,14 @@ portfolio balance and period change.
 
 The panel includes:
 
-- Portfolio, crypto, stock, perpetual, and Advanced Trade watchlist views
+- Portfolio, crypto, stock, perpetual, and Coinbase watchlist views
 - Synchronized 1H, 1D, 1W, 1M, 1Y, and all-time charts and sparklines
 - Asset detail pages, search, market statistics, and links to Coinbase.com
 - Full keyboard navigation: arrows move through rows and tabs, Enter opens an
   asset, Escape goes back or closes, `/` focuses search, and `P` pins the
   current asset while signed out
 - Three bar display modes; right-click cycles full, balance-only, and icon-only
-- A read-only Advanced Trade watchlist refresh while the panel is open
+- A read-only Coinbase watchlist refresh while the panel is open
 - Cache-first rendering that keeps the last complete view visible while market
   and portfolio data update in the background, including when offline
 - Instant repeat asset details from an owner-only local cache; stale charts and
@@ -168,8 +168,8 @@ bin/coinbase ticker ETH-USD
 bin/coinbase logout
 ```
 
-The **Advanced** tab refreshes when the panel opens, then every 60 seconds while
-it remains open. Coinbase's supported OAuth API currently exposes the Advanced
-Trade product `watched` flag, but it does not expose the regular Coinbase app's
-watchlist or its custom order. The panel therefore preserves the order returned
-by the Advanced Trade product API.
+The **Watchlist** tab refreshes when the panel opens, then every 60 seconds while
+it remains open. Until Coinbase exposes a dedicated OAuth watchlist endpoint,
+the plugin uses the Advanced Trade product `watched` flag. That response does
+not include the user's custom watchlist order, so the panel preserves the order
+returned by the product API.
