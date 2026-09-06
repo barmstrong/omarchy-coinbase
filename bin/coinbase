@@ -1578,7 +1578,6 @@ def login_via_broker() -> None:
     write_login_status("waiting")
     print("STATUS waiting", flush=True)
     deadline = time.time() + 180
-    missing_grace_deadline = time.time() + 60
     payload = None
     while time.time() < deadline:
         time.sleep(1)
@@ -1592,10 +1591,6 @@ def login_via_broker() -> None:
         if status == 202 or row.get("status") == "pending":
             continue
         if status == 404 or row.get("status") == "missing":
-            # Cloudflare KV is eventually consistent. A session created by the
-            # start request can briefly be invisible to the polling request.
-            if time.time() < missing_grace_deadline:
-                continue
             write_login_status("error", "sign-in session expired")
             die("sign-in session expired")
         if status >= 400 or row.get("status") == "error":

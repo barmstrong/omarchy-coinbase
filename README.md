@@ -94,16 +94,21 @@ signed-out snapshot. A separate public-market snapshot is retained so logout
 and offline refreshes can switch views without an empty intermediate screen.
 
 The default hosted Cloudflare Worker in `broker/` holds the OAuth application's
-client secret. During sign-in it temporarily holds an authorization session and
-the returned tokens for up to ten minutes so the plugin can collect them using a
-random 256-bit session ID that is separate from the browser-visible OAuth state.
-Refresh and revocation requests also pass through the broker because Coinbase
-requires the application's client secret. The Worker
-source is included for review and can be self-hosted. Native Cloudflare rate
-limits protect its session-creation and token endpoints from basic abuse; the
-Worker fails closed if those bindings are absent. Both the helper and broker
-refuse to retain a token response containing scopes outside the three requested
-above.
+client secret. Each sign-in uses one isolated, strongly consistent Durable
+Object containing only its PKCE/session state. Returned tokens remain there for
+only the moment needed for the desktop's pending poll to collect them and are
+never written to Durable Object storage. A random 256-bit claim secret that is
+not sent to the browser protects that handoff; a successful claim deletes the
+object immediately, and a ten-minute alarm deletes abandoned session state.
+There is no server-side user or token table. Refresh
+and revocation requests pass through the broker because Coinbase requires the
+application's client secret, but those tokens are not written to server-side
+storage. The Worker source is included for review and can be self-hosted.
+Cloudflare rate limits protect every OAuth endpoint: anonymous entry points are
+limited per source IP, while polling and token operations also have per-session
+or per-credential limits. The Worker fails closed if a required binding is
+absent. Both the helper and broker refuse to retain a token response containing
+scopes outside the three requested above.
 
 The plugin contacts these services:
 

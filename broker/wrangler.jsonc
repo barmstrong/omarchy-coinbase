@@ -3,11 +3,20 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-29",
   "workers_dev": true,
-  "kv_namespaces": [
-    {
-      "binding": "SESSIONS"
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "OAUTH_SESSIONS",
+        "class_name": "OAuthSession"
+      }
+    ]
+  },
+  "exports": {
+    "OAuthSession": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
-  ],
+  },
   "ratelimits": [
     {
       "name": "OAUTH_START_LIMITER",
@@ -21,6 +30,14 @@
       "name": "OAUTH_TOKEN_LIMITER",
       "namespace_id": "63841002",
       "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    },
+    {
+      "name": "OAUTH_CALLBACK_LIMITER",
+      "namespace_id": "63841004",
+      "simple": {
         "limit": 30,
         "period": 60
       }
@@ -29,7 +46,23 @@
       "name": "OAUTH_SESSION_LIMITER",
       "namespace_id": "63841003",
       "simple": {
-        "limit": 240,
+        "limit": 600,
+        "period": 60
+      }
+    },
+    {
+      "name": "OAUTH_SESSION_ID_LIMITER",
+      "namespace_id": "63841005",
+      "simple": {
+        "limit": 90,
+        "period": 60
+      }
+    },
+    {
+      "name": "OAUTH_CREDENTIAL_LIMITER",
+      "namespace_id": "63841006",
+      "simple": {
+        "limit": 10,
         "period": 60
       }
     }

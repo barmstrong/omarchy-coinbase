@@ -1,36 +1,72 @@
 import assert from "node:assert/strict";
-import worker from "./src/index.js";
+import worker, { OAuthSession } from "./src/index.js";
 
-class MemoryKV {
+class MemoryStorage {
   constructor() {
     this.rows = new Map();
+    this.alarmAt = null;
   }
 
   async put(key, value) {
     this.rows.set(key, value);
   }
 
-  async get(key, type) {
-    const value = this.rows.get(key);
-    if (value === undefined) return null;
-    return type === "json" ? JSON.parse(value) : value;
+  async get(key) {
+    return this.rows.get(key);
   }
 
   async delete(key) {
     this.rows.delete(key);
   }
+
+  async setAlarm(when) {
+    this.alarmAt = when;
+  }
+
+  async deleteAll() {
+    this.rows.clear();
+    this.alarmAt = null;
+  }
 }
 
-const kv = new MemoryKV();
+class MemoryDurableObjects {
+  constructor(env) {
+    this.env = env;
+    this.objects = new Map();
+  }
+
+  idFromName(name) {
+    return { name };
+  }
+
+  object(name) {
+    if (!this.objects.has(name)) {
+      const storage = new MemoryStorage();
+      const instance = new OAuthSession({ storage }, this.env);
+      this.objects.set(name, { storage, instance });
+    }
+    return this.objects.get(name);
+  }
+
+  get(id) {
+    const target = this.object(id.name);
+    return { fetch: (url, init) => target.instance.fetch(new Request(url, init)) };
+  }
+}
+
 const allowLimiter = { limit: async () => ({ success: true }) };
 const env = {
   COINBASE_CLIENT_ID: "test-client",
   COINBASE_CLIENT_SECRET: "test-secret",
-  SESSIONS: kv,
   OAUTH_START_LIMITER: allowLimiter,
+  OAUTH_CALLBACK_LIMITER: allowLimiter,
   OAUTH_TOKEN_LIMITER: allowLimiter,
   OAUTH_SESSION_LIMITER: allowLimiter,
+  OAUTH_SESSION_ID_LIMITER: allowLimiter,
+  OAUTH_CREDENTIAL_LIMITER: allowLimiter,
 };
+const sessions = new MemoryDurableObjects(env);
+env.OAUTH_SESSIONS = sessions;
 
 async function request(path, init = {}) {
   return worker.fetch(new Request(`https://broker.example${path}`, init), env);
@@ -52,11 +88,12 @@ assert.equal((await request("/oauth/start")).status, 404);
 response = await request("/oauth/start", { method: "POST" });
 assert.equal(response.status, 200);
 const started = await response.json();
-assert.match(started.session_id, /^[A-Za-z0-9_-]{43}$/);
+assert.match(started.session_id, /^[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/);
 const authorize = new URL(started.authorize_url);
 const state = authorize.searchParams.get("state");
-assert.match(state, /^[A-Za-z0-9_-]{24}$/);
+assert.match(state, /^[A-Za-z0-9_-]{43}$/);
 assert.notEqual(state, started.session_id);
+assert.equal(started.session_id.split(".")[0], state);
 assert.equal(authorize.origin, "https://login.coinbase.com");
 assert.equal(
   authorize.searchParams.get("scope"),
@@ -85,16 +122,37 @@ response = await request("/oauth/session", {
 });
 assert.equal(response.status, 202);
 assert.deepEqual(await response.json(), { status: "pending" });
-
-await kv.put(
-  `oauth-session:${started.session_id}`,
-  JSON.stringify({ status: "complete", access_token: "access", refresh_token: "refresh" }),
+response = await worker.fetch(
+  new Request("https://broker.example/oauth/session", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: started.session_id }),
+  }),
+  { ...env, OAUTH_SESSION_ID_LIMITER: undefined },
 );
+assert.equal(response.status, 429);
+response = await worker.fetch(
+  new Request(`https://broker.example/oauth/callback?state=${state}&code=blocked`, { method: "GET" }),
+  { ...env, OAUTH_CALLBACK_LIMITER: undefined },
+);
+assert.equal(response.status, 429);
+
+const replayStorage = sessions.object(state).storage;
+const replayObject = sessions.object(state).instance;
+const replayRow = await replayStorage.get("session");
+await replayStorage.put("session", {
+  ...replayRow,
+  status: "ready",
+});
+replayObject.pendingTokens = {
+  status: "complete",
+  access_token: "access",
+  refresh_token: "refresh",
+};
 response = await request(`/oauth/callback?state=${state}&code=replay`);
 assert.equal(response.status, 200);
 assert.match(await response.text(), /already been used/);
-assert.equal((await kv.get(`oauth-session:${started.session_id}`, "json")).access_token, "access");
-assert.equal(await kv.get(`oauth-state:${state}`, "json"), null);
+assert.equal((await replayStorage.get("session")).status, "ready");
 
 response = await request("/oauth/session", {
   method: "POST",
@@ -103,7 +161,13 @@ response = await request("/oauth/session", {
 });
 assert.equal(response.status, 200);
 assert.equal((await response.json()).access_token, "access");
-assert.equal(await kv.get(`oauth-session:${started.session_id}`, "json"), null);
+assert.equal(await replayStorage.get("session"), undefined);
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: started.session_id }),
+});
+assert.equal(response.status, 404);
 
 response = await request("/oauth/start", { method: "POST" });
 const wrongOrigin = await response.json();
@@ -113,14 +177,13 @@ response = await worker.fetch(
   env,
 );
 assert.match(await response.text(), /already been used/);
-assert.equal(await kv.get(`oauth-state:${wrongOriginState}`, "json"), null);
+assert.equal(await sessions.object(wrongOriginState).storage.get("session"), undefined);
 
 response = await request("/oauth/start", { method: "POST" });
 const denied = await response.json();
 const deniedState = new URL(denied.authorize_url).searchParams.get("state");
 response = await request(`/oauth/callback?state=${deniedState}&error=access_denied`);
 assert.match(await response.text(), /access_denied/);
-assert.equal(await kv.get(`oauth-state:${deniedState}`, "json"), null);
 response = await request("/oauth/session", {
   method: "POST",
   headers: { "content-type": "application/json" },
@@ -129,18 +192,18 @@ response = await request("/oauth/session", {
 assert.equal(response.status, 400);
 assert.equal((await response.json()).status, "error");
 
-// The callback must survive KV propagation lag between the start and callback
-// requests. The single-use state record still ties the browser to this session.
+// Alarms erase even an abandoned session, so no user credential state is
+// retained beyond the short handoff window.
 response = await request("/oauth/start", { method: "POST" });
-const lagged = await response.json();
-const laggedState = new URL(lagged.authorize_url).searchParams.get("state");
-await kv.delete(`oauth-session:${lagged.session_id}`);
-response = await request(`/oauth/callback?state=${laggedState}&error=access_denied`);
-assert.match(await response.text(), /access_denied/);
-assert.equal(
-  (await kv.get(`oauth-session:${lagged.session_id}`, "json")).status,
-  "error",
-);
+const abandoned = await response.json();
+const abandonedState = new URL(abandoned.authorize_url).searchParams.get("state");
+await sessions.object(abandonedState).instance.alarm();
+response = await request("/oauth/session", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ session_id: abandoned.session_id }),
+});
+assert.equal(response.status, 404);
 
 // Cloudflare Workers does not implement redirect: "error". Use "manual" and
 // reject redirects before OAuth credentials can be sent anywhere else.
@@ -171,6 +234,37 @@ try {
 }
 
 response = await request("/oauth/start", { method: "POST" });
+const successful = await response.json();
+const successfulState = new URL(successful.authorize_url).searchParams.get("state");
+globalThis.fetch = async () =>
+  Response.json({
+    access_token: "successful-access",
+    refresh_token: "successful-refresh",
+    expires_in: 3600,
+    token_type: "bearer",
+    scope: "wallet:user:read,wallet:accounts:read,offline_access",
+  });
+try {
+  const callbackResponse = request(`/oauth/callback?state=${successfulState}&code=test-code`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const durableRow = await sessions.object(successfulState).storage.get("session");
+  assert.equal(durableRow.status, "ready");
+  assert.equal(durableRow.access_token, undefined);
+  assert.equal(durableRow.refresh_token, undefined);
+  response = await request("/oauth/session", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: successful.session_id }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).refresh_token, "successful-refresh");
+  assert.match(await (await callbackResponse).text(), /Signed in/);
+  assert.equal(await sessions.object(successfulState).storage.get("session"), undefined);
+} finally {
+  globalThis.fetch = nativeFetch;
+}
+
+response = await request("/oauth/start", { method: "POST" });
 const broadGrant = await response.json();
 const broadGrantState = new URL(broadGrant.authorize_url).searchParams.get("state");
 globalThis.fetch = async () =>
@@ -183,7 +277,7 @@ globalThis.fetch = async () =>
 try {
   response = await request(`/oauth/callback?state=${broadGrantState}&code=test-code`);
   assert.match(await response.text(), /outside this read-only app/);
-  const broadGrantSession = await kv.get(`oauth-session:${broadGrant.session_id}`, "json");
+  const broadGrantSession = await sessions.object(broadGrantState).storage.get("session");
   assert.equal(broadGrantSession.status, "error");
   assert.equal(broadGrantSession.access_token, undefined);
 } finally {
@@ -192,6 +286,15 @@ try {
 
 assert.equal((await request("/oauth/refresh", { method: "POST" })).status, 415);
 assert.equal((await request("/oauth/revoke", { method: "POST" })).status, 415);
+response = await worker.fetch(
+  new Request("https://broker.example/oauth/refresh", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ refresh_token: "refresh" }),
+  }),
+  { ...env, OAUTH_CREDENTIAL_LIMITER: undefined },
+);
+assert.equal(response.status, 429);
 assert.equal((await request("/oauth/claim", { method: "POST" })).status, 404);
 assert.equal((await request("/oauth/debug")).status, 404);
 
