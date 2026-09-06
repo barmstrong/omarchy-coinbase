@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -33,6 +34,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 APP_FILE = STATE_DIR / "oauth-app.json"
 TOKEN_FILE = STATE_DIR / "tokens.json"
 SNAPSHOT_FILE = STATE_DIR / "snapshot.json"
+MARKET_SNAPSHOT_FILE = STATE_DIR / "market-snapshot.json"
 WATCHLIST_FILE = STATE_DIR / "watchlist.json"
 PREFS_FILE = STATE_DIR / "prefs.json"
 PRODUCTS_CACHE = STATE_DIR / "products-cache.json"
@@ -56,6 +58,7 @@ SCOPES = ",".join(
         "offline_access",
     ]
 )
+READ_ONLY_SCOPES = frozenset(SCOPES.split(","))
 PERIODS = {
     "hour": {"granularity": "FIVE_MINUTE", "seconds": 3600},
     "day": {"granularity": "FIVE_MINUTE", "seconds": 86400},
@@ -211,6 +214,17 @@ def ensure_state() -> None:
         os.chmod(STATE_DIR, 0o700)
     except OSError:
         pass
+    # Snapshots contain balances and asset holdings, while cache files can
+    # contain a user's Coinbase watchlist. Keep every regular state file
+    # owner-only, not just the OAuth token file. The directory mode already
+    # protects them, but private file modes remain safe if a file is moved or
+    # inspected through an unexpected bind mount.
+    try:
+        for path in STATE_DIR.iterdir():
+            if path.is_file() and not path.is_symlink():
+                os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -281,13 +295,22 @@ def read_json(path: Path, default: Any) -> Any:
 def write_json(path: Path, data: Any, private: bool = False) -> None:
     ensure_state()
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-    if private:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+    except Exception:
         try:
-            os.chmod(tmp, 0o600)
+            tmp.unlink()
         except OSError:
             pass
-    tmp.replace(path)
+        raise
 
 
 def write_snapshot(data: dict[str, Any]) -> None:
@@ -360,6 +383,24 @@ def empty_snapshot(**extra: Any) -> dict[str, Any]:
     }
     snap.update(extra)
     return snap
+
+
+def usable_snapshot(data: Any, *, authenticated: bool | None = None) -> bool:
+    if not isinstance(data, dict) or not isinstance(data.get("authenticated"), bool):
+        return False
+    if authenticated is not None and data.get("authenticated") is not authenticated:
+        return False
+    return isinstance(data.get("assets"), list) and isinstance(data.get("bar"), dict)
+
+
+def load_market_snapshot() -> dict[str, Any]:
+    current = read_json(SNAPSHOT_FILE, {})
+    if usable_snapshot(current, authenticated=False) and current.get("assets"):
+        return current
+    cached = read_json(MARKET_SNAPSHOT_FILE, {})
+    if usable_snapshot(cached, authenticated=False) and cached.get("assets"):
+        return cached
+    return {}
 
 
 def load_app() -> dict[str, str]:
@@ -484,6 +525,20 @@ def pkce_pair() -> tuple[str, str]:
     verifier = b64url(secrets.token_bytes(32))
     challenge = b64url(hashlib.sha256(verifier.encode("ascii")).digest())
     return verifier, challenge
+
+
+def validate_token_grant(payload: dict[str, Any]) -> None:
+    """Refuse to persist a token carrying permissions this read-only app did not request."""
+    token_type = str(payload.get("token_type") or "bearer").strip().lower()
+    if token_type != "bearer":
+        raise RuntimeError("token response used an unsupported token type")
+    raw_scope = str(payload.get("scope") or "").strip()
+    if not raw_scope:
+        return
+    granted = {scope for scope in re.split(r"[\s,]+", raw_scope) if scope}
+    unexpected = sorted(granted - READ_ONLY_SCOPES)
+    if unexpected:
+        raise RuntimeError("Coinbase returned permissions outside this read-only app's requested scopes")
 
 
 def http_json(
@@ -1112,6 +1167,7 @@ def cmd_setup(client_id: str, client_secret: str, read_stdin: bool = False) -> N
 
 
 def _save_tokens_unlocked(payload: dict[str, Any]) -> dict[str, Any]:
+    validate_token_grant(payload)
     access = payload.get("access_token")
     refresh = payload.get("refresh_token") or load_tokens().get("refresh_token")
     if not isinstance(access, str) or not access or len(access) > 8192:
@@ -1329,10 +1385,9 @@ def _finish_login(payload: dict[str, Any]) -> None:
     period = str(load_prefs().get("period") or "day")
     if period not in PERIODS:
         period = "day"
-    # Switch the shell out of its signed-out state as soon as the token is
-    # safely stored. Account totals and enriched charts arrive in subsequent
-    # atomic snapshot updates.
-    write_snapshot(portfolio_loading_snapshot(period))
+    # Keep showing the last complete public snapshot while the portfolio is
+    # assembled. The UI switches modes once, when the complete authenticated
+    # snapshot is atomically published.
     write_login_status("snapshot")
     print("STATUS snapshot", flush=True)
     build_snapshot(period)
@@ -1507,8 +1562,18 @@ def cmd_logout() -> None:
     period = str(load_prefs().get("period") or "day")
     if period not in PERIODS:
         period = "day"
-    signed_out = empty_snapshot(period=period)
-    signed_out["bar"]["period"] = period
+    signed_out = load_market_snapshot()
+    if signed_out:
+        signed_out["error"] = ""
+        signed_out["usesBroker"] = using_broker()
+        signed_out["needsSetup"] = not using_broker() and not bool(load_app().get("clientId"))
+        signed_out["barDisplay"] = bar_display()
+    else:
+        signed_out = empty_snapshot(period=period)
+        signed_out["bar"]["period"] = period
+    # Delete the local bearer credentials first. Snapshot builders re-check
+    # the current token before publishing account data, so this invalidates
+    # any account refresh already in flight.
     with auth_lock():
         app = load_app()
         tokens = load_tokens()
@@ -1517,37 +1582,47 @@ def cmd_logout() -> None:
             TOKEN_FILE.unlink()
         except FileNotFoundError:
             pass
-        # Clear portfolio data and stale OAuth/API errors before revocation or
-        # public-market network requests can delay the logout UI.
+
+    # Wait for any row/watchlist writer that began before token deletion, then
+    # publish the signed-out state while holding the shared snapshot lock. This
+    # makes the signed-out snapshot the deterministic winner of that race.
+    with snapshot_lock():
+        try:
+            WATCHLIST_FILE.unlink()
+        except FileNotFoundError:
+            pass
         write_snapshot(signed_out)
-        write_login_status("logged-out")
-        if access:
-            try:
-                if using_broker():
-                    http_json(
-                        "POST",
-                        broker_url() + "/oauth/revoke",
-                        body={"access_token": access},
-                        timeout=8,
-                    )
-                elif app.get("clientId") and app.get("clientSecret"):
-                    http_json(
-                        "POST",
-                        REVOKE_URL,
-                        headers={"Authorization": f"Bearer {access}"},
-                        form={
-                            "token": access,
-                            "client_id": app["clientId"],
-                            "client_secret": app["clientSecret"],
-                        },
-                        timeout=8,
-                    )
-            except RuntimeError:
-                pass
+    write_login_status("logged-out")
+
+    if access:
+        try:
+            if using_broker():
+                http_json(
+                    "POST",
+                    broker_url() + "/oauth/revoke",
+                    body={"access_token": access},
+                    timeout=8,
+                )
+            elif app.get("clientId") and app.get("clientSecret"):
+                http_json(
+                    "POST",
+                    REVOKE_URL,
+                    headers={"Authorization": f"Bearer {access}"},
+                    form={
+                        "token": access,
+                        "client_id": app["clientId"],
+                        "client_secret": app["clientSecret"],
+                    },
+                    timeout=8,
+                )
+        except RuntimeError:
+            pass
     try:
-        build_market_snapshot(period)
+        with snapshot_lock():
+            market_snapshot(period)
     except Exception:  # noqa: BLE001
-        write_snapshot(empty_snapshot())
+        # The complete cached public snapshot is already on screen.
+        pass
     print("ok")
 
 
@@ -3166,6 +3241,35 @@ def fill_crypto_row_sparks(assets: list[dict[str, Any]], period: str) -> None:
     fill_period_row_sparks(candidates[:16], period)
 
 
+def merge_missing_market_categories(
+    assets: list[dict[str, Any]],
+    previous: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Fill incomplete upstream categories from the last public catalog."""
+    if not usable_snapshot(previous) or not previous.get("assets"):
+        return assets
+    out = [dict(row) for row in assets if isinstance(row, dict)]
+    limits = {"crypto": 10, "stock": 16, "derivative": 8}
+    counts = {kind: sum(str(row.get("kind") or "") == kind for row in out) for kind in limits}
+    seen = {
+        (str(row.get("kind") or ""), str(row.get("productId") or row.get("id") or "").upper())
+        for row in out
+    }
+    for row in previous.get("assets") or []:
+        if not isinstance(row, dict) or row.get("market") is not True:
+            continue
+        kind = str(row.get("kind") or "")
+        if kind not in limits or counts[kind] >= limits[kind]:
+            continue
+        key = (kind, str(row.get("productId") or row.get("id") or "").upper())
+        if key in seen:
+            continue
+        out.append(dict(row))
+        seen.add(key)
+        counts[kind] += 1
+    return out
+
+
 def write_market_snapshot(
     assets: list[dict[str, Any]],
     period: str,
@@ -3174,6 +3278,8 @@ def write_market_snapshot(
     catalog_at: int = 0,
     row_sparks: bool = False,
 ) -> dict[str, Any]:
+    if not assets:
+        raise RuntimeError("market data is unavailable")
     enrich_yahoo_assets(assets)
     activate_cached_row_sparks(assets, period)
     lead = lead_asset(assets) or {}
@@ -3204,11 +3310,19 @@ def write_market_snapshot(
             period=period,
         ),
     )
+    cached = dict(snap)
+    cached["error"] = ""
+    write_json(MARKET_SNAPSHOT_FILE, cached)
     write_snapshot(snap)
     return snap
 
 
-def build_market_snapshot(period: str, *, error: str = "") -> dict[str, Any]:
+def build_market_snapshot(
+    period: str,
+    *,
+    error: str = "",
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     assets = ensure_bar_asset(market_assets())
     lead = lead_asset(assets)
     if lead and lead.get("productId"):
@@ -3216,6 +3330,7 @@ def build_market_snapshot(period: str, *, error: str = "") -> dict[str, Any]:
     assets = [a for a in assets if num(a.get("price")) > 0 or a.get("kind") in {"stock", "commodity"}]
     enrich_yahoo_assets(assets)
     assets = [a for a in assets if num(a.get("price")) > 0]
+    assets = merge_missing_market_categories(assets, previous)
     assets = ensure_bar_asset(assets)
     lead = lead_asset(assets)
     if lead and lead.get("productId") and num(lead.get("price")) <= 0 and lead.get("kind") not in {"stock", "commodity"}:
@@ -3231,7 +3346,7 @@ def refresh_live_snapshot(
 ) -> dict[str, Any]:
     assets = [dict(a) for a in (previous.get("assets") or []) if isinstance(a, dict)]
     if not assets:
-        return build_market_snapshot(period, error=error)
+        return build_market_snapshot(period, error=error, previous=previous)
     assets = ensure_bar_asset(assets)
     lead = lead_asset(assets)
     need = []
@@ -3244,12 +3359,17 @@ def refresh_live_snapshot(
 
 
 def market_snapshot(period: str, *, error: str = "") -> dict[str, Any]:
-    previous = read_json(SNAPSHOT_FILE, {})
-    assets = previous.get("assets") if isinstance(previous, dict) else None
-    catalog_at = num(previous.get("catalogAt")) if isinstance(previous, dict) else 0
-    if isinstance(assets, list) and assets and catalog_at and time.time() - catalog_at < CATALOG_TTL:
-        return refresh_live_snapshot(period, previous=previous, error=error)
-    return build_market_snapshot(period, error=error)
+    previous = load_market_snapshot()
+    assets = previous.get("assets") if previous else None
+    catalog_at = num(previous.get("catalogAt")) if previous else 0
+    try:
+        if isinstance(assets, list) and assets and catalog_at and time.time() - catalog_at < CATALOG_TTL:
+            return refresh_live_snapshot(period, previous=previous, error=error)
+        return build_market_snapshot(period, error=error, previous=previous)
+    except Exception:  # noqa: BLE001
+        if previous:
+            return previous
+        raise
 
 
 def tidy_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3278,10 +3398,17 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
         token = valid_access_token()
     except RuntimeError as exc:
         message = str(exc)
+        if message not in {"needsSetup", "not signed in"} and usable_snapshot(previous, authenticated=True):
+            # Refresh-token and network failures must never replace a complete
+            # portfolio with a signed-out or empty view.
+            return previous
         public_error = "" if message in {"needsSetup", "not signed in"} else message
         try:
             return market_snapshot(period, error=public_error)
         except Exception as market_exc:  # noqa: BLE001
+            cached_market = load_market_snapshot()
+            if cached_market:
+                return cached_market
             snap = empty_snapshot(
                 needsSetup=message == "needsSetup",
                 error=public_error or str(market_exc),
@@ -3299,20 +3426,12 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
             total = sum(num(a.get("value")) for a in assets)
         if not token_is_current(token):
             return market_snapshot(period)
-        quick_assets = tidy_assets([dict(asset) for asset in assets])
-        write_snapshot(
-            portfolio_loading_snapshot(
-                period,
-                user=user,
-                assets=quick_assets,
-                total=total,
-            )
-        )
         assets = merge_watchlist(assets, token)
         enrich_with_products(assets)
         assets = tidy_assets(assets)
         held_keys = {(a.get("kind"), str(a.get("id") or "").upper()) for a in assets}
-        for row in market_assets():
+        public_rows = merge_missing_market_categories(market_assets(), previous)
+        for row in public_rows:
             key = (row.get("kind"), str(row.get("id") or "").upper())
             if key in held_keys:
                 continue
@@ -3430,12 +3549,29 @@ def refresh_products_cache() -> None:
         write_json(PRODUCTS_CACHE, latest)
 
 
-def cmd_snapshot(period: str | None, fast: bool = False) -> None:
+def cmd_snapshot(period: str | None, fast: bool = False, max_age: int = 0) -> None:
     prefs = load_prefs()
     chosen = period or str(prefs.get("period") or "day")
     if chosen not in PERIODS:
         chosen = "day"
     update_prefs(period=chosen)
+    max_age = max(0, min(300, int(max_age or 0)))
+    if max_age:
+        cached = read_json(SNAPSHOT_FILE, {})
+        token_present = bool(load_tokens().get("access_token"))
+        try:
+            age = time.time() - SNAPSHOT_FILE.stat().st_mtime
+        except OSError:
+            age = float("inf")
+        if (
+            usable_snapshot(cached)
+            and cached.get("assets")
+            and str(cached.get("period") or "day") == chosen
+            and bool(cached.get("authenticated")) == token_present
+            and age <= max_age
+        ):
+            print(json.dumps(cached))
+            return
     snap: dict[str, Any] | None = None
     if fast:
         with snapshot_lock():
@@ -3831,6 +3967,7 @@ def main() -> None:
     snap = sub.add_parser("snapshot")
     snap.add_argument("--period", default=None)
     snap.add_argument("--fast", action="store_true")
+    snap.add_argument("--max-age", type=int, default=0)
 
     search = sub.add_parser("search")
     search.add_argument("query")
@@ -3866,7 +4003,7 @@ def main() -> None:
     elif args.cmd == "logout":
         cmd_logout()
     elif args.cmd == "snapshot":
-        cmd_snapshot(args.period, fast=args.fast)
+        cmd_snapshot(args.period, fast=args.fast, max_age=args.max_age)
     elif args.cmd == "search":
         cmd_search(args.query)
     elif args.cmd == "watchlist-refresh":

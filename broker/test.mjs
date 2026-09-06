@@ -22,10 +22,14 @@ class MemoryKV {
 }
 
 const kv = new MemoryKV();
+const allowLimiter = { limit: async () => ({ success: true }) };
 const env = {
   COINBASE_CLIENT_ID: "test-client",
   COINBASE_CLIENT_SECRET: "test-secret",
   SESSIONS: kv,
+  OAUTH_START_LIMITER: allowLimiter,
+  OAUTH_TOKEN_LIMITER: allowLimiter,
+  OAUTH_SESSION_LIMITER: allowLimiter,
 };
 
 async function request(path, init = {}) {
@@ -36,6 +40,13 @@ let response = await request("/health");
 assert.equal(response.status, 200);
 assert.equal(response.headers.get("cache-control"), "no-store");
 assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+assert.match(response.headers.get("permissions-policy"), /payment=\(\)/);
+
+response = await worker.fetch(
+  new Request("https://broker.example/oauth/start", { method: "POST" }),
+  { ...env, OAUTH_START_LIMITER: undefined },
+);
+assert.equal(response.status, 429);
 
 assert.equal((await request("/oauth/start")).status, 404);
 response = await request("/oauth/start", { method: "POST" });
@@ -95,6 +106,16 @@ assert.equal((await response.json()).access_token, "access");
 assert.equal(await kv.get(`oauth-session:${started.session_id}`, "json"), null);
 
 response = await request("/oauth/start", { method: "POST" });
+const wrongOrigin = await response.json();
+const wrongOriginState = new URL(wrongOrigin.authorize_url).searchParams.get("state");
+response = await worker.fetch(
+  new Request(`https://other.example/oauth/callback?state=${wrongOriginState}&code=wrong-origin`),
+  env,
+);
+assert.match(await response.text(), /already been used/);
+assert.equal(await kv.get(`oauth-state:${wrongOriginState}`, "json"), null);
+
+response = await request("/oauth/start", { method: "POST" });
 const denied = await response.json();
 const deniedState = new URL(denied.authorize_url).searchParams.get("state");
 response = await request(`/oauth/callback?state=${deniedState}&error=access_denied`);
@@ -145,6 +166,26 @@ try {
   assert.equal(redirectMode, "manual");
   assert.equal(response.status, 500);
   assert.equal((await response.json()).error, "revoke endpoint redirected unexpectedly");
+} finally {
+  globalThis.fetch = nativeFetch;
+}
+
+response = await request("/oauth/start", { method: "POST" });
+const broadGrant = await response.json();
+const broadGrantState = new URL(broadGrant.authorize_url).searchParams.get("state");
+globalThis.fetch = async () =>
+  Response.json({
+    access_token: "over-scoped-access",
+    refresh_token: "over-scoped-refresh",
+    token_type: "bearer",
+    scope: "wallet:accounts:read,wallet:transactions:send",
+  });
+try {
+  response = await request(`/oauth/callback?state=${broadGrantState}&code=test-code`);
+  assert.match(await response.text(), /outside this read-only app/);
+  const broadGrantSession = await kv.get(`oauth-session:${broadGrant.session_id}`, "json");
+  assert.equal(broadGrantSession.status, "error");
+  assert.equal(broadGrantSession.access_token, undefined);
 } finally {
   globalThis.fetch = nativeFetch;
 }

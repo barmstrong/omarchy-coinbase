@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Shapes
 import qs.Commons
 import "Model.js" as Model
 
@@ -20,21 +21,26 @@ Item {
 
   readonly property real plotWidth: Math.max(1, width - axisWidth)
   readonly property var geo: Model.sparklineGeometry(values, plotWidth, Math.max(0, height))
+  readonly property var linePoints: {
+    var out = []
+    var points = geo.points || []
+    for (var i = 0; i < points.length; i++)
+      out.push(Qt.point(Number(points[i].x), Number(points[i].y)))
+    return out
+  }
+  readonly property var fillPoints: {
+    if (linePoints.length < 2) return []
+    var out = [Qt.point(linePoints[0].x, height)]
+    for (var i = 0; i < linePoints.length; i++) out.push(linePoints[i])
+    out.push(Qt.point(linePoints[linePoints.length - 1].x, height))
+    return out
+  }
   readonly property real hoverPrice: {
     if (!hoverActive || hoverIndex < 0 || !geo.values || hoverIndex >= geo.values.length) return NaN
     return Number(geo.values[hoverIndex])
   }
 
   signal hovered(bool active, real price, int index)
-
-  onValuesChanged: paintSoon.restart()
-  onWidthChanged: paintSoon.restart()
-  onHeightChanged: paintSoon.restart()
-  onStrokeChanged: paintSoon.restart()
-  onHoverIndexChanged: paintSoon.restart()
-  onHoverActiveChanged: paintSoon.restart()
-  onVisibleChanged: if (visible) paintSoon.restart()
-  Component.onCompleted: paintSoon.restart()
 
   function indexAt(x) {
     var pts = geo.points
@@ -43,51 +49,31 @@ Item {
     return Math.round(t * (pts.length - 1))
   }
 
-  Timer {
-    id: paintSoon
-    interval: 16
-    onTriggered: canvas.requestPaint()
-  }
-
-  Canvas {
-    id: canvas
+  Shape {
+    id: chartShape
     width: root.plotWidth
     height: parent.height
     antialiasing: true
-    renderStrategy: Canvas.Immediate
-    onPaint: {
-      var ctx = getContext("2d")
-      if (!ctx) return
-      ctx.reset()
-      var pts = root.geo.points
-      if (!pts || pts.length < 2 || width < 2 || height < 2) return
+    preferredRendererType: Shape.CurveRenderer
+    visible: root.linePoints.length >= 2
 
-      ctx.globalAlpha = 0.42
-      ctx.beginPath()
-      ctx.moveTo(pts[0].x, height)
-      for (var i = 0; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
-      ctx.lineTo(pts[pts.length - 1].x, height)
-      ctx.closePath()
-      ctx.fillStyle = root.fill
-      ctx.fill()
+    ShapePath {
+      fillColor: root.fill
+      strokeColor: "transparent"
+      startX: root.fillPoints.length ? root.fillPoints[0].x : 0
+      startY: root.fillPoints.length ? root.fillPoints[0].y : 0
+      PathPolyline { path: root.fillPoints }
+    }
 
-      ctx.beginPath()
-      ctx.moveTo(pts[0].x, pts[0].y)
-      for (var j = 1; j < pts.length; j++) ctx.lineTo(pts[j].x, pts[j].y)
-      ctx.strokeStyle = root.stroke
-      ctx.lineWidth = root.lineWidth
-      ctx.lineJoin = "round"
-      ctx.lineCap = "round"
-      ctx.stroke()
-      ctx.globalAlpha = 1
-
-      if (root.hoverActive && root.hoverIndex >= 0 && root.hoverIndex < pts.length) {
-        var p = pts[root.hoverIndex]
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2)
-        ctx.fillStyle = root.stroke
-        ctx.fill()
-      }
+    ShapePath {
+      fillColor: "transparent"
+      strokeColor: root.stroke
+      strokeWidth: root.lineWidth
+      capStyle: ShapePath.RoundCap
+      joinStyle: ShapePath.RoundJoin
+      startX: root.linePoints.length ? root.linePoints[0].x : 0
+      startY: root.linePoints.length ? root.linePoints[0].y : 0
+      PathPolyline { path: root.linePoints }
     }
   }
 

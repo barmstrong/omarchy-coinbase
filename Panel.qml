@@ -14,6 +14,11 @@ Item {
   property var manifest: null
   property bool opened: false
   property var snapshot: ({})
+  property bool snapshotReady: false
+  property string lastSnapshotRaw: ""
+  property string pendingSnapshotRaw: ""
+  property bool acceptSnapshotReload: false
+  property bool applySnapshotOnExit: false
   property bool refreshing: false
   property bool signingIn: false
   property string loginStatus: ""
@@ -144,19 +149,103 @@ Item {
     return url
   }
 
-  function applySnapshot(raw) {
+  function receiveSnapshot(raw) {
+    var serialized = String(raw || "")
+    if (serialized !== "" && serialized === root.lastSnapshotRaw) {
+      root.acceptSnapshotReload = false
+      return true
+    }
+    var next = Model.parseSnapshot(serialized, null)
+    if (!next) return false
+    if (root.opened && root.snapshotReady && !root.acceptSnapshotReload) {
+      root.pendingSnapshotRaw = serialized
+      return true
+    }
+    root.acceptSnapshotReload = false
+    root.pendingSnapshotRaw = ""
+    return root.applySnapshot(serialized, next)
+  }
+
+  function applySnapshot(raw, parsed) {
+    var serialized = String(raw || "")
+    var next = parsed || Model.parseSnapshot(serialized, null)
+    if (!next) return false
+    root.lastSnapshotRaw = serialized
     var wasSigned = root.signedIn
-    snapshot = Model.parseSnapshot(raw)
+    snapshot = next
+    root.snapshotReady = true
     root.capturePortfolio(snapshot)
     if (root.signedIn && !wasSigned) {
       root.marketTab = "watchlist"
       root.tabSynced = true
-      return
+      return true
+    }
+    if (!root.signedIn && wasSigned) {
+      root.resetSignedOutView()
+      return true
     }
     if (root.opened && !root.tabSynced) {
       root.syncTabToPin()
       root.tabSynced = true
     }
+    return true
+  }
+
+  function resetSignedOutView() {
+    root.marketTab = "crypto"
+    root.tabSynced = true
+    root.watchlistRefreshPending = false
+    root.rowsRefreshPending = true
+    root.searchQuery = ""
+    root.searchResults = []
+    root.listCursor = 0
+    root.lastPortfolio = ({})
+    if (searchField) searchField.text = ""
+    root.closeDetail()
+    if (flick) flick.contentY = 0
+  }
+
+  function publicCachedRows(rows) {
+    var out = []
+    rows = rows || []
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      if (!row || row.market !== true || String(row.kind || "") === "fiat") continue
+      out.push({
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        productId: row.productId,
+        price: row.price,
+        quantity: 0,
+        value: 0,
+        held: false,
+        market: true,
+        watchlist: false,
+        marketCap: row.marketCap,
+        costBasis: 0,
+        unrealizedPnl: 0,
+        dayPnl: row.dayPnl,
+        dayPnlPercent: row.dayPnlPercent,
+        pnl: row.pnl,
+        pnlPercent: row.pnlPercent,
+        url: row.url,
+        buyUrl: row.buyUrl,
+        sellUrl: row.sellUrl,
+        rowSpark: row.rowSpark || [],
+        rowSparkPeriod: row.rowSparkPeriod || "",
+        rowSparkCache: row.rowSparkCache || ({}),
+        yahoo: row.yahoo || ""
+      })
+    }
+    return out
+  }
+
+  function leadPublicAsset(rows) {
+    rows = rows || []
+    for (var i = 0; i < rows.length; i++)
+      if (String(rows[i].kind || "") === "crypto" && String(rows[i].id || "").toUpperCase() === "BTC") return rows[i]
+    return rows.length ? rows[0] : null
   }
 
   function capturePortfolio(snap) {
@@ -347,6 +436,11 @@ Item {
   }
 
   function open(payloadJson) {
+    if (root.pendingSnapshotRaw !== "") {
+      var pending = root.pendingSnapshotRaw
+      root.pendingSnapshotRaw = ""
+      root.applySnapshot(pending)
+    }
     opened = true
     watchlistRefreshPending = true
     listCursor = 0
@@ -448,6 +542,27 @@ Item {
 
   function pinToBar(row) {
     if (!row || root.signedIn) return
+    var price = Number(row.price) || 0
+    var values = row.rowSpark || []
+    var start = Number(values.length ? values[0] : price)
+    var pnl = isFinite(start) ? price - start : 0
+    var pct = isFinite(root.rowPeriodPercent(row)) ? root.rowPeriodPercent(row) : Number(row.pnlPercent || 0)
+    var next = Object.assign({}, root.snapshot)
+    next.total = price
+    next.pnl = pnl
+    next.pnlPercent = pct
+    next.sparkline = values
+    next.bar = {
+      pnl: pnl,
+      pnlPercent: pct,
+      period: root.period,
+      symbol: String(row.id || ""),
+      productId: root.tickerId(row),
+      name: String(row.name || row.id || ""),
+      kind: String(row.kind || "crypto"),
+      price: price
+    }
+    root.snapshot = next
     root.setBarTicker(root.tickerId(row), String(row.id || ""))
   }
 
@@ -501,6 +616,11 @@ Item {
     watchlistRefreshPending = false
     signingIn = false
     closeDetail()
+    if (root.pendingSnapshotRaw !== "") {
+      var pending = root.pendingSnapshotRaw
+      root.pendingSnapshotRaw = ""
+      root.applySnapshot(pending)
+    }
   }
 
   function dismiss() {
@@ -509,10 +629,15 @@ Item {
     else close()
   }
 
-  function refresh() {
-    if (snapshotProc.running) return
+  function refresh(force) {
+    if (snapshotProc.running) {
+      if (force === true) root.applySnapshotOnExit = true
+      return
+    }
     refreshing = true
+    root.applySnapshotOnExit = force === true
     snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", period]
+    if (!force) snapshotProc.command.push("--max-age", "20")
     snapshotProc.running = true
   }
 
@@ -538,6 +663,7 @@ Item {
     root.chartHoverIndex = -1
     root.rowsRefreshPending = true
     refreshing = true
+    root.applySnapshotOnExit = true
     snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", next, "--fast"]
     snapshotProc.running = true
     if (root.showingDetail && root.detailAsset)
@@ -575,9 +701,26 @@ Item {
     signedOut.authenticated = false
     signedOut.error = ""
     signedOut.user = ({})
-    signedOut.assets = []
-    signedOut.total = 0
+    var publicRows = root.publicCachedRows(root.assets)
+    var lead = root.leadPublicAsset(publicRows)
+    signedOut.assets = publicRows
+    signedOut.total = Number(lead && lead.price) || 0
+    signedOut.mode = "market"
+    signedOut.pnl = 0
+    signedOut.pnlPercent = 0
+    signedOut.sparkline = (lead && lead.rowSpark) || []
+    signedOut.bar = ({
+      pnl: 0,
+      pnlPercent: 0,
+      period: root.period,
+      symbol: "BTC",
+      productId: "BTC-USD",
+      name: "Bitcoin",
+      kind: "crypto",
+      price: Number(lead && lead.price) || 0
+    })
     root.snapshot = signedOut
+    root.resetSignedOutView()
     logoutProc.running = true
   }
 
@@ -593,7 +736,7 @@ Item {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.applySnapshot(text())
+    onLoaded: root.receiveSnapshot(text())
   }
 
   FileView {
@@ -606,6 +749,7 @@ Item {
       var data = {}
       try { data = JSON.parse(text() || "{}") } catch (e) { data = {} }
       var status = String(data.status || "")
+      if (!Model.shouldHandleLoginStatus(status, root.signingIn, root.signedIn)) return
       if (status === "opening") {
         root.signingIn = true
         root.loginStatus = "Opening Coinbase…"
@@ -623,6 +767,7 @@ Item {
       } else if (status === "done") {
         root.signingIn = false
         root.loginStatus = ""
+        root.acceptSnapshotReload = true
         snapshotFile.reload()
       } else if (status === "error") {
         root.signingIn = false
@@ -630,6 +775,9 @@ Item {
       } else if (status === "logged-out") {
         root.signingIn = false
         root.loginStatus = ""
+        root.resetSignedOutView()
+        root.acceptSnapshotReload = true
+        snapshotFile.reload()
       }
     }
   }
@@ -637,16 +785,12 @@ Item {
   Process {
     id: snapshotProc
     command: [root.pluginFile("bin/coinbase"), "snapshot"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var raw = String(text || "")
-        if (raw.indexOf("{") !== -1) root.applySnapshot(raw)
-      }
-    }
+    stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: {
       root.refreshing = false
+      root.acceptSnapshotReload = root.applySnapshotOnExit
+      root.applySnapshotOnExit = false
       snapshotFile.reload()
       Qt.callLater(function() { root.refreshRows(root.rowsRefreshPending) })
       if (root.watchlistRefreshPending)
@@ -692,6 +836,7 @@ Item {
     onExited: {
       root.signingIn = false
       root.loginStatus = ""
+      root.acceptSnapshotReload = true
       snapshotFile.reload()
     }
   }
@@ -741,6 +886,7 @@ Item {
     id: tickerProc
     onExited: function(code) {
       root.refreshing = false
+      root.acceptSnapshotReload = true
       snapshotFile.reload()
       if (code === 0) {
         root.searchQuery = ""
@@ -923,22 +1069,21 @@ Item {
       }
     }
 
-    HoverHandler {
-      id: rowHover
-      cursorShape: Qt.PointingHandCursor
-      onPointChanged: {
-        root.notePointerMove(rowHover)
-        if (root.hoverSelectEnabled && hovered) root.listCursor = index
-      }
-      onHoveredChanged: {
-        if (hovered && root.hoverSelectEnabled) root.listCursor = index
-      }
-    }
-
-    TapHandler {
+    MouseArea {
+      id: rowMouse
+      anchors.fill: parent
+      z: 2
+      hoverEnabled: true
       acceptedButtons: Qt.LeftButton
-      gesturePolicy: TapHandler.ReleaseWithinBounds
-      onTapped: root.chooseAsset(modelData)
+      cursorShape: Qt.PointingHandCursor
+      onEntered: {
+        if (root.hoverSelectEnabled) root.listCursor = index
+      }
+      onPositionChanged: {
+        root.hoverSelectEnabled = true
+        root.listCursor = index
+      }
+      onClicked: root.chooseAsset(modelData)
     }
   }
 
@@ -1040,7 +1185,7 @@ Item {
           return
         }
         if (event.key === Qt.Key_R && !typing) {
-          root.refresh()
+          root.refresh(true)
           event.accepted = true
           return
         }
@@ -1059,7 +1204,7 @@ Item {
         id: card
         anchors.centerIn: parent
         width: Math.min(Style.space(480), parent.width - Style.space(40))
-        height: Math.min(Style.space(580), parent.height - Style.space(36))
+        height: Math.min(Style.space(600), parent.height - Style.space(36))
         color: Color.popups.background
         radius: Style.cornerRadius
         borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
@@ -1500,18 +1645,6 @@ Item {
                 }
               }
 
-              PanelSectionHeader {
-                text: root.marketTab === "watchlist" ? "WATCHLIST" : (root.marketTab === "derivative" ? "PERPS" : (root.marketTab === "stock" ? "STOCKS" : "CRYPTO"))
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-
-              Text {
-                text: "↑↓ select · ←→ tabs · Enter open · / search · Esc back"
-                color: root.muted
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
             }
 
             Flickable {
@@ -1568,7 +1701,7 @@ Item {
                   columns: 3
                   columnSpacing: Style.space(16)
                   rowSpacing: Style.space(12)
-                  visible: detailChart.stats && detailChart.stats.length > 0
+                  visible: Array.isArray(detailChart.stats) && detailChart.stats.length > 0
 
                   Repeater {
                     model: detailChart.stats || []
@@ -1596,7 +1729,7 @@ Item {
                 }
 
                 Text {
-                  visible: !(detailChart.stats && detailChart.stats.length) && !root.detailLoading
+                  visible: (!Array.isArray(detailChart.stats) || detailChart.stats.length === 0) && !root.detailLoading
                   text: "No extra market stats for this asset yet."
                   color: root.muted
                   font.family: root.fontFamily
@@ -1631,7 +1764,7 @@ Item {
                   spacing: Style.space(8)
 
                   Text {
-                    visible: !root.authLoading && root.visibleAssets.length === 0
+                    visible: root.snapshotReady && !root.authLoading && root.visibleAssets.length === 0
                     text: root.marketTab === "watchlist" ? "Nothing on your Coinbase watchlist." : "Nothing in this tab yet."
                     color: root.muted
                     font.family: root.fontFamily
@@ -1639,8 +1772,8 @@ Item {
                   }
 
                   Text {
-                    visible: root.authLoading && root.visibleAssets.length === 0
-                    text: "Loading your Coinbase portfolio…"
+                    visible: (!root.snapshotReady || root.authLoading) && root.visibleAssets.length === 0
+                    text: root.authLoading ? "Loading your Coinbase portfolio…" : "Updating…"
                     color: root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall

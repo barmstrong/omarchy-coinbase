@@ -13,6 +13,8 @@ The panel includes:
   asset, Escape goes back or closes, and `/` focuses search
 - Three bar display modes; right-click cycles full, balance-only, and icon-only
 - A read-only Coinbase watchlist refresh while the panel is open
+- Cache-first rendering that keeps the last complete view visible while market
+  and portfolio data update in the background, including when offline
 
 This project is not affiliated with or endorsed by Coinbase. Coinbase and its
 logo are trademarks of their respective owner.
@@ -81,8 +83,11 @@ hosts.
 Access and refresh tokens are stored locally at
 `~/.local/state/omarchy/coinbase/tokens.json` with mode `0600`; the containing
 directory is mode `0700`. They are never placed in QML, command-line arguments,
-or this repository. Portfolio snapshots and caches live in the same private
-directory.
+or this repository. Portfolio snapshots, account-derived watchlist data, and
+market caches in that directory are also written with mode `0600`. Logout
+deletes the token and account-derived watchlist cache before publishing a
+signed-out snapshot. A separate public-market snapshot is retained so logout
+and offline refreshes can switch views without an empty intermediate screen.
 
 The default hosted Cloudflare Worker in `broker/` holds the OAuth application's
 client secret. During sign-in it temporarily holds an authorization session and
@@ -91,7 +96,10 @@ random 256-bit session ID that is separate from the browser-visible OAuth state.
 Refresh and revocation requests also pass through the broker because Coinbase
 requires the application's client secret. The Worker
 source is included for review and can be self-hosted. Native Cloudflare rate
-limits protect its session-creation and token endpoints from basic abuse.
+limits protect its session-creation and token endpoints from basic abuse; the
+Worker fails closed if those bindings are absent. Both the helper and broker
+refuse to retain a token response containing scopes outside the three requested
+above.
 
 The plugin contacts these services:
 
@@ -147,6 +155,7 @@ Useful development commands:
 ```bash
 omarchy plugin validate .
 node broker/test.mjs
+node tests/model.test.js
 python3 -m unittest discover -s tests -v
 bin/coinbase status
 bin/coinbase snapshot --period day

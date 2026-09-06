@@ -15,3 +15,9 @@ The plugin is intended to remain read-only. Any behavior that can trade,
 transfer funds, request a write-capable OAuth scope, send Coinbase credentials
 to a non-Coinbase API, or disclose one user's OAuth result to another user is a
 security vulnerability.
+
+Local OAuth tokens, portfolio snapshots, account-derived watchlist data, and
+cache files must remain owner-only (`0600`) inside the owner-only (`0700`)
+state directory. Logout must clear bearer credentials and account-derived
+caches before a signed-out snapshot is published. The retained
+`market-snapshot.json` cache contains public market data only.

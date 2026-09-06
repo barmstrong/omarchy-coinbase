@@ -110,12 +110,21 @@ function formatChartTime(index, count, period) {
   return Qt.formatDateTime(d, "MMM d yyyy")
 }
 
-function parseSnapshot(raw) {
+function isSnapshot(data) {
+  return !!data
+    && typeof data === "object"
+    && typeof data.authenticated === "boolean"
+    && Array.isArray(data.assets)
+    && !!data.bar
+    && typeof data.bar === "object"
+}
+
+function parseSnapshot(raw, fallback) {
   try {
     var data = JSON.parse(String(raw || ""))
-    if (data && typeof data === "object") return data
+    if (isSnapshot(data)) return data
   } catch (e) {}
-  return {}
+  return fallback === undefined ? {} : fallback
 }
 
 function parseSearch(raw) {
@@ -127,6 +136,14 @@ function parseSearch(raw) {
   }
 }
 
+function shouldHandleLoginStatus(status, signingIn, signedIn) {
+  var current = String(status || "")
+  if (["opening", "waiting", "exchanging", "snapshot", "done", "error"].indexOf(current) !== -1)
+    return signingIn === true
+  if (current === "logged-out") return signedIn === true || signingIn === true
+  return false
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     formatUsd: formatUsd,
@@ -136,8 +153,10 @@ if (typeof module !== "undefined") {
     formatSignedUsd: formatSignedUsd,
     pnlColor: pnlColor,
     sparklineGeometry: sparklineGeometry,
+    isSnapshot: isSnapshot,
     parseSnapshot: parseSnapshot,
     parseSearch: parseSearch,
+    shouldHandleLoginStatus: shouldHandleLoginStatus,
     formatChartTime: formatChartTime
   }
 }

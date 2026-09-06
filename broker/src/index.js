@@ -8,6 +8,7 @@ const SCOPES = [
 ].join(",");
 const SESSION_TTL = 600;
 const COMPLETE_TTL = 600;
+const READ_ONLY_SCOPES = new Set(SCOPES.split(","));
 
 export default {
   async fetch(request, env) {
@@ -47,13 +48,16 @@ function json(body, status = 200, extraHeaders = {}) {
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
+      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
       ...extraHeaders,
     },
   });
 }
 
 async function allowed(limiter, request) {
-  if (!limiter || typeof limiter.limit !== "function") return true;
+  // Authentication endpoints should not silently lose abuse protection when
+  // a deployment omits a binding from wrangler.jsonc.
+  if (!limiter || typeof limiter.limit !== "function") return false;
   const key = request.headers.get("cf-connecting-ip") || "unknown";
   const result = await limiter.limit({ key });
   return result.success === true;
@@ -73,6 +77,9 @@ function html(body, status = 200) {
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",
+      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+      "cross-origin-opener-policy": "same-origin",
+      "cross-origin-resource-policy": "same-origin",
     },
   });
 }
@@ -105,7 +112,7 @@ async function start(env, url) {
   const redirectUri = `${url.origin}/oauth/callback`;
   await env.SESSIONS.put(
     `oauth-state:${state}`,
-    JSON.stringify({ status: "pending", verifier, sessionId: id, createdAt: Date.now() }),
+    JSON.stringify({ status: "pending", verifier, sessionId: id, redirectUri, createdAt: Date.now() }),
     { expirationTtl: SESSION_TTL },
   );
   await env.SESSIONS.put(
@@ -145,6 +152,13 @@ async function tokenRequest(env, body) {
     throw new Error("token response missing a valid access token");
   if (data.refresh_token && (typeof data.refresh_token !== "string" || data.refresh_token.length > 8192))
     throw new Error("token response contained an invalid refresh token");
+  const tokenType = String(data.token_type || "bearer").trim().toLowerCase();
+  if (tokenType !== "bearer") throw new Error("token response used an unsupported token type");
+  const granted = String(data.scope || "")
+    .split(/[\s,]+/)
+    .filter(Boolean);
+  if (granted.some((scope) => !READ_ONLY_SCOPES.has(scope)))
+    throw new Error("Coinbase returned permissions outside this read-only app's requested scopes");
   return data;
 }
 
@@ -169,6 +183,7 @@ async function callback(request, env, url) {
   if (
     row.status !== "pending" ||
     !row.verifier ||
+    row.redirectUri !== `${url.origin}/oauth/callback` ||
     !/^[A-Za-z0-9_-]{43}$/.test(sessionId) ||
     (sessionRow && sessionRow.status !== "pending")
   ) {
@@ -196,7 +211,7 @@ async function callback(request, env, url) {
     const tokens = await tokenRequest(env, {
       grant_type: "authorization_code",
       code,
-      redirect_uri: `${url.origin}/oauth/callback`,
+      redirect_uri: row.redirectUri,
       code_verifier: row.verifier,
     });
     const complete = {

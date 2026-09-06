@@ -11,6 +11,7 @@ BarWidget {
 
   property var snapshot: ({})
   property bool refreshing: false
+  property string lastSnapshotRaw: ""
 
   readonly property int refreshSeconds: Math.max(15, parseInt(setting("refreshSeconds", 60), 10) || 60)
   readonly property bool signedIn: snapshot.authenticated === true
@@ -48,12 +49,20 @@ BarWidget {
   }
 
   function applySnapshot(raw) {
-    snapshot = Model.parseSnapshot(raw)
+    var serialized = String(raw || "")
+    if (serialized !== "" && serialized === root.lastSnapshotRaw) return
+    var next = Model.parseSnapshot(serialized, null)
+    if (next) {
+      root.lastSnapshotRaw = serialized
+      snapshot = next
+    }
   }
 
-  function refresh() {
+  function refresh(force) {
     if (snapshotProc.running) return
     refreshing = true
+    snapshotProc.command = [root.pluginFile("bin/coinbase"), "snapshot"]
+    if (!force) snapshotProc.command.push("--max-age", "20")
     snapshotProc.running = true
   }
 
@@ -85,13 +94,7 @@ BarWidget {
   Process {
     id: snapshotProc
     command: [root.pluginFile("bin/coinbase"), "snapshot"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var raw = String(text || "")
-        if (raw.indexOf("{") !== -1) root.applySnapshot(raw)
-      }
-    }
+    stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: {
       root.refreshing = false
@@ -156,7 +159,7 @@ BarWidget {
     tooltipText: ""
 
     onPressed: function(b) {
-      if (b === Qt.MiddleButton) root.refresh()
+      if (b === Qt.MiddleButton) root.refresh(true)
       else if (b === Qt.RightButton) root.cycleDisplay()
       else root.togglePanel()
     }
