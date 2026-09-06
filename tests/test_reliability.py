@@ -586,6 +586,74 @@ class ReliabilityTests(unittest.TestCase):
 
             self.assertEqual(json.loads(output.getvalue())["assets"][0]["id"], "BTC")
 
+    def test_ticker_publishes_cached_selection_without_network_delay(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            btc = helper.market_row("BTC", "Bitcoin", "crypto", "BTC-USD", price=100)
+            eth = helper.market_row("ETH", "Ethereum", "crypto", "ETH-USD", price=110)
+            eth.update(
+                {
+                    "rowSpark": [99, 105, 110],
+                    "rowSparkPeriod": "day",
+                    "rowSparkVersion": helper.ROW_SPARK_VERSION,
+                }
+            )
+            cached = helper.empty_snapshot(period="day", assets=[btc, eth])
+            helper.write_snapshot(cached)
+            helper.write_json(helper.MARKET_SNAPSHOT_FILE, cached)
+            helper.retarget_market_snapshot = lambda *_args: self.fail("cached pin must not use the network path")
+            helper.build_snapshot = lambda *_args: self.fail("cached pin must not rebuild the snapshot")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                helper.cmd_ticker("ETH-USD", "ETH")
+
+            stored = json.loads(helper.SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            self.assertEqual(stored["bar"]["symbol"], "ETH")
+            self.assertEqual(stored["bar"]["productId"], "ETH-USD")
+            self.assertEqual(stored["bar"]["price"], 110)
+            self.assertEqual(stored["sparkline"], [99, 105, 110])
+            self.assertTrue(stored["needsRefresh"])
+            self.assertEqual(json.loads(helper.PREFS_FILE.read_text())["barSymbol"], "ETH")
+
+            refreshed = []
+            helper.build_snapshot = lambda period: refreshed.append(period) or stored
+            with contextlib.redirect_stdout(io.StringIO()):
+                helper.cmd_snapshot("day", max_age=20)
+            self.assertEqual(refreshed, ["day"])
+
+    def test_ticker_accepts_sanitized_search_result_for_immediate_publish(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            cached = helper.empty_snapshot(
+                period="day",
+                assets=[helper.market_row("BTC", "Bitcoin", "crypto", "BTC-USD", price=100)],
+            )
+            helper.write_snapshot(cached)
+            pref = {"symbol": "COIN", "product": "COIN-USD"}
+            incoming = helper.sanitize_ticker_asset(
+                {
+                    "id": "COIN",
+                    "name": "Coinbase",
+                    "productId": "COIN-USD",
+                    "kind": "stock",
+                    "price": 300,
+                    "rowSpark": [290, 300],
+                    "rowSparkPeriod": "day",
+                },
+                pref,
+            )
+
+            helper.update_prefs(barSymbol="COIN", barProduct="COIN-USD")
+            self.assertTrue(helper.publish_cached_ticker(pref, incoming))
+            stored = json.loads(helper.SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            self.assertEqual(stored["bar"]["symbol"], "COIN")
+            self.assertEqual(stored["bar"]["price"], 300)
+            self.assertIn("COIN", [row["id"] for row in stored["assets"]])
+
     def test_loading_portfolio_stops_spinning_on_auth_failure(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

@@ -3958,6 +3958,7 @@ def cmd_snapshot(period: str | None, fast: bool = False, max_age: int = 0) -> No
         if (
             usable_snapshot(cached)
             and cached.get("assets")
+            and not cached.get("needsRefresh")
             and str(cached.get("period") or "day") == chosen
             and bool(cached.get("authenticated")) == token_present
             and age <= max_age
@@ -4324,13 +4325,111 @@ def retarget_market_snapshot(period: str) -> bool:
     return True
 
 
-def cmd_ticker(product_id: str, symbol: str = "") -> None:
-    save_bar_preference(product_id, symbol)
+def sanitize_ticker_asset(value: Any, pref: dict[str, str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    product = str(pref.get("product") or "").strip()
+    symbol = str(pref.get("symbol") or "").strip().upper()
+    incoming_product = str(value.get("productId") or "").strip()
+    incoming_symbol = str(value.get("id") or "").strip().upper()
+    if incoming_product.upper() != product.upper() or incoming_symbol != symbol:
+        return {}
+    row: dict[str, Any] = {
+        "id": symbol,
+        "name": str(value.get("name") or symbol)[:200],
+        "productId": product,
+        "kind": str(value.get("kind") or "crypto")[:32],
+        "marketCategory": str(value.get("marketCategory") or "")[:32],
+        "price": num(value.get("price")),
+        "pnlPercent": num(value.get("pnlPercent")),
+        "dayPnlPercent": num(value.get("dayPnlPercent")),
+        "rowSparkPeriod": str(value.get("rowSparkPeriod") or "day")[:16],
+        "rowSparkVersion": int(num(value.get("rowSparkVersion"))),
+        "volume24h": num(value.get("volume24h")),
+        "yahoo": str(value.get("yahoo") or "")[:32],
+        "url": str(value.get("url") or "")[:2048],
+        "market": True,
+    }
+    values = value.get("rowSpark")
+    if isinstance(values, list):
+        row["rowSpark"] = [num(item) for item in values[:128] if num(item) > 0]
+    return row
+
+
+def read_ticker_asset(pref: dict[str, str]) -> dict[str, Any]:
+    try:
+        raw = sys.stdin.readline(65537)
+    except OSError:
+        return {}
+    if len(raw) > 65536:
+        die("ticker input is too large")
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        die("invalid ticker input")
+    if not isinstance(payload, dict):
+        die("invalid ticker input")
+    return sanitize_ticker_asset(payload.get("asset"), pref)
+
+
+def publish_cached_ticker(pref: dict[str, str], cached_asset: dict[str, Any] | None = None) -> bool:
+    previous = read_json(SNAPSHOT_FILE, {})
+    if not usable_snapshot(previous, authenticated=False):
+        return False
+    assets = [dict(row) for row in (previous.get("assets") or []) if isinstance(row, dict)]
+    target = find_asset(assets, pref)
+    if cached_asset:
+        if target is None:
+            target = dict(cached_asset)
+            assets.append(target)
+        else:
+            target.update(cached_asset)
+    if target is None:
+        return False
+    period = str(previous.get("period") or load_prefs().get("period") or "day")
+    values = target.get("rowSpark") if str(target.get("rowSparkPeriod") or "") == period else []
+    sparkline = [num(value) for value in (values or []) if num(value) > 0]
+    if len(sparkline) < 2:
+        sparkline = two_point_sparkline(target)
+    price = num(target.get("price")) or (sparkline[-1] if sparkline else 0)
+    start = sparkline[0] if sparkline else 0
+    pnl = price - start if start else 0
+    pnl_percent = (pnl / start * 100) if start else num(target.get("pnlPercent"))
+    target["pnl"] = pnl
+    target["pnlPercent"] = pnl_percent
+    next_snapshot = dict(previous)
+    next_snapshot["assets"] = assets
+    next_snapshot["total"] = round(price, 2)
+    next_snapshot["pnl"] = round(pnl, 2)
+    next_snapshot["pnlPercent"] = round(pnl_percent, 2)
+    next_snapshot["sparkline"] = sparkline
+    next_snapshot["bar"] = snapshot_bar(
+        assets,
+        portfolio=False,
+        total=0,
+        pnl=pnl,
+        pnl_percent=pnl_percent,
+        period=period,
+    )
+    next_snapshot["needsRefresh"] = True
+    cached = dict(next_snapshot)
+    cached["error"] = ""
+    write_json(MARKET_SNAPSHOT_FILE, cached)
+    write_snapshot(next_snapshot)
+    return True
+
+
+def cmd_ticker(product_id: str, symbol: str = "", read_stdin: bool = False) -> None:
+    pref = save_bar_preference(product_id, symbol)
+    cached_asset = read_ticker_asset(pref) if read_stdin else {}
     if load_tokens().get("access_token"):
         print("ok")
         return
     period = str(load_prefs().get("period") or "day")
     with snapshot_lock():
+        if publish_cached_ticker(pref, cached_asset):
+            print("ok")
+            return
         if retarget_market_snapshot(period):
             print("ok")
             return
@@ -4413,6 +4512,7 @@ def main() -> None:
     ticker = sub.add_parser("ticker")
     ticker.add_argument("product_id")
     ticker.add_argument("--symbol", default="")
+    ticker.add_argument("--stdin", action="store_true")
 
     chart = sub.add_parser("chart")
     chart.add_argument("product_id")
@@ -4445,7 +4545,7 @@ def main() -> None:
     elif args.cmd == "watchlist-refresh":
         cmd_watchlist_refresh()
     elif args.cmd == "ticker":
-        cmd_ticker(args.product_id, args.symbol)
+        cmd_ticker(args.product_id, args.symbol, args.stdin)
     elif args.cmd == "chart":
         cmd_chart(args.product_id, args.period, args.symbol, args.kind)
     elif args.cmd == "rows":

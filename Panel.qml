@@ -41,6 +41,7 @@ Item {
   property string chartWantId: ""
   property bool rowsRefreshPending: false
   property bool watchlistRefreshPending: false
+  property var pendingTickerPayload: null
 
   readonly property bool signedIn: snapshot.authenticated === true
   readonly property bool authLoading: root.signedIn && snapshot.loading === true
@@ -391,7 +392,7 @@ Item {
 
   function refreshRows(force) {
     if (!root.opened) return
-    if (snapshotProc.running || rowProc.running) {
+    if (snapshotProc.running || rowProc.running || tickerProc.running) {
       root.rowsRefreshPending = true
       return
     }
@@ -555,11 +556,34 @@ Item {
     return String(row.productId || row.id || "")
   }
 
-  function setBarTicker(productId, symbol) {
-    if (!productId || root.signedIn) return
+  function setBarTicker(row) {
+    var productId = root.tickerId(row)
+    if (!row || !productId || root.signedIn) return
+    // A user-selected pin takes priority over any older background writer.
+    if (snapshotProc.running) snapshotProc.running = false
+    if (rowProc.running) rowProc.running = false
     if (tickerProc.running) tickerProc.running = false
     var cmd = [pluginFile("bin/coinbase"), "ticker", productId]
-    if (symbol) cmd.push("--symbol", String(symbol))
+    if (row.id) cmd.push("--symbol", String(row.id))
+    cmd.push("--stdin")
+    root.pendingTickerPayload = {
+      asset: {
+        id: String(row.id || ""),
+        name: String(row.name || row.id || ""),
+        productId: productId,
+        kind: String(row.kind || "crypto"),
+        marketCategory: String(row.marketCategory || ""),
+        price: Number(row.price) || 0,
+        pnlPercent: Number(row.pnlPercent) || 0,
+        dayPnlPercent: Number(row.dayPnlPercent) || 0,
+        rowSpark: row.rowSpark || [],
+        rowSparkPeriod: String(row.rowSparkPeriod || root.period),
+        rowSparkVersion: Number(row.rowSparkVersion) || 0,
+        volume24h: Number(row.volume24h) || 0,
+        yahoo: String(row.yahoo || ""),
+        url: String(row.url || "")
+      }
+    }
     tickerProc.command = cmd
     tickerProc.running = true
     if (!root.signedIn) refreshing = true
@@ -588,7 +612,7 @@ Item {
       price: price
     }
     root.snapshot = next
-    root.setBarTicker(root.tickerId(row), String(row.id || ""))
+    root.setBarTicker(row)
   }
 
   function chooseAsset(row) {
@@ -938,6 +962,11 @@ Item {
 
   Process {
     id: tickerProc
+    stdinEnabled: true
+    onStarted: {
+      tickerProc.write(JSON.stringify(root.pendingTickerPayload || {}) + "\n")
+      root.pendingTickerPayload = null
+    }
     onExited: function(code) {
       root.refreshing = false
       root.acceptSnapshotReload = true
@@ -947,6 +976,7 @@ Item {
         root.searchResults = []
         root.listCursor = 0
         if (searchField) searchField.text = ""
+        Qt.callLater(function() { root.refresh(false) })
       }
     }
   }
