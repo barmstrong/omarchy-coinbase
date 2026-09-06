@@ -35,7 +35,7 @@ const detail = {
   sparkline: [90, 100]
 }
 const detailCache = {
-  version: 2,
+  version: 3,
   entries: {
     "crypto|BTC-USD|BTC|week": { fetchedAt: 1, data: detail }
   }
@@ -43,7 +43,7 @@ const detailCache = {
 assert.equal(Model.detailCacheKey({ id: "btc", productId: "btc-usd", kind: "crypto" }, "week"), "crypto|BTC-USD|BTC|week")
 assert.deepEqual(Model.cachedDetail(detailCache, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "week"), detail)
 assert.deepEqual(Model.cachedDetail(detailCache, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "day"), {})
-assert.deepEqual(Model.cachedDetail({ version: 1, entries: detailCache.entries }, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "week"), {})
+assert.deepEqual(Model.cachedDetail({ version: 2, entries: detailCache.entries }, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "week"), {})
 
 const cached = {
   authenticated: false,

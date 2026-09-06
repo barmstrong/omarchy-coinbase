@@ -1748,7 +1748,14 @@ Item {
                       { label: "OPEN", value: Number(detailChart.open) > 0 ? Model.formatUsd(detailChart.open, Number(detailChart.open) >= 100 ? 2 : 4) : "—" },
                       { label: "HIGH", value: Number(detailChart.high) > 0 ? Model.formatUsd(detailChart.high, Number(detailChart.high) >= 100 ? 2 : 4) : "—" },
                       { label: "LOW", value: Number(detailChart.low) > 0 ? Model.formatUsd(detailChart.low, Number(detailChart.low) >= 100 ? 2 : 4) : "—" },
-                      { label: "VOL", value: Number(detailChart.volume) > 0 ? Model.formatCompactNumber(detailChart.volume) : "—" }
+                      {
+                        label: "24H VOL",
+                        value: Number(detailChart.volume) > 0
+                          ? (["stock", "commodity"].indexOf(String(detailChart.kind || "")) !== -1
+                              ? Model.formatCompactNumber(detailChart.volume)
+                              : Model.formatCompactUsd(detailChart.volume))
+                          : "—"
+                      }
                     ]
                     Column {
                       required property var modelData

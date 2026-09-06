@@ -93,7 +93,7 @@ DETAIL_CACHE_STALE_SECONDS = 7 * 86400
 DETAIL_CACHE_LIMIT = 96
 DETAIL_METADATA_TTL = 6 * 3600
 DETAIL_METADATA_LIMIT = 64
-DETAIL_CACHE_VERSION = 2
+DETAIL_CACHE_VERSION = 3
 BAR_DISPLAY_MODES = ("full", "quote", "price")
 MARKET_CATEGORIES = frozenset({"crypto", "stock", "commodity", "index", "preipo"})
 YAHOO_UA = "Mozilla/5.0"
@@ -1213,7 +1213,6 @@ def asset_stats(
         _add_stat(stats, "RANK", f"#{int(gecko['rank'])}")
     _add_stat(stats, "24H HIGH", format_stat_usd(high))
     _add_stat(stats, "24H LOW", format_stat_usd(low))
-    _add_stat(stats, "24H VOLUME", format_stat_usd(volume if volume > 1000 else 0) or format_stat_qty(product.get("volume_24h")))
     _add_stat(stats, "CIRCULATING", format_stat_qty(gecko.get("circulating")))
     _add_stat(stats, "MAX SUPPLY", format_stat_qty(gecko.get("maxSupply")))
     _add_stat(stats, "ATH", format_stat_usd(gecko.get("ath")))

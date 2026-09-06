@@ -114,6 +114,17 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(helper.market_volume({"marketCap": 5_000_000}), 0)
         self.assertEqual(helper.market_volume({"volume24h": 25, "marketCap": 5_000_000}), 25)
 
+    def test_detail_stats_do_not_duplicate_primary_volume_field(self):
+        helper = load_helper()
+
+        stats, ohlc = helper.asset_stats(
+            kind="stock",
+            yahoo={"volume": 132_000_000, "high": 200, "low": 190},
+        )
+
+        self.assertEqual(ohlc["volume"], 132_000_000)
+        self.assertNotIn("24H VOLUME", [row["label"] for row in stats])
+
     def test_sparse_fcm_candles_fall_back_to_coarser_history(self):
         helper = load_helper()
         calls = []
