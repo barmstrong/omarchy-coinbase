@@ -27,10 +27,69 @@ def configure_state(helper, state):
     helper.WATCHLIST_FILE = state / "watchlist.json"
     helper.LOGIN_STATUS_FILE = state / "login-status.json"
     helper.PREFS_FILE = state / "prefs.json"
+    helper.DETAIL_CACHE_FILE = state / "detail-cache.json"
     helper.BROKER_URL_FILE = state / "broker.url"
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_recent_detail_cache_skips_network_refresh(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            cached = {
+                "id": "BTC",
+                "kind": "crypto",
+                "productId": "BTC-USD",
+                "period": "week",
+                "price": 100,
+                "sparkline": [90, 100],
+                "stats": [{"label": "RANK", "value": "#1"}],
+            }
+            helper.store_detail("BTC-USD", "BTC", "crypto", "week", cached)
+            helper.build_chart_data = lambda *_args: self.fail("fresh detail cache should be reused")
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                helper.cmd_chart("BTC-USD", "week", "BTC", "crypto")
+
+            self.assertEqual(json.loads(output.getvalue()), cached)
+
+    def test_stale_detail_cache_survives_failed_refresh(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            cached = {
+                "id": "ETH",
+                "kind": "crypto",
+                "productId": "ETH-USD",
+                "period": "day",
+                "price": 100,
+                "sparkline": [90, 95, 100],
+                "stats": [],
+            }
+            helper.store_detail("ETH-USD", "ETH", "crypto", "day", cached)
+            raw = json.loads(helper.DETAIL_CACHE_FILE.read_text(encoding="utf-8"))
+            key = helper.detail_cache_key("ETH-USD", "ETH", "crypto", "day")
+            raw["entries"][key]["fetchedAt"] = int(time.time()) - helper.DETAIL_CACHE_TTL - 1
+            helper.write_json(helper.DETAIL_CACHE_FILE, raw)
+            helper.build_chart_data = lambda *_args: {
+                "id": "ETH",
+                "kind": "crypto",
+                "productId": "ETH-USD",
+                "period": "day",
+                "price": 0,
+                "sparkline": [],
+                "stats": [],
+            }
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                helper.cmd_chart("ETH-USD", "day", "ETH", "crypto")
+
+            self.assertEqual(json.loads(output.getvalue()), cached)
+
     def test_signed_out_refresh_failure_keeps_complete_cache(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

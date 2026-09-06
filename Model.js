@@ -144,6 +144,31 @@ function shouldHandleLoginStatus(status, signingIn, signedIn) {
   return false
 }
 
+function detailCacheKey(row, period) {
+  row = row || {}
+  return [
+    String(row.kind || "crypto").trim().toLowerCase(),
+    String(row.productId || row.id || "").trim().toUpperCase(),
+    String(row.id || "").trim().toUpperCase(),
+    String(period || "day").trim().toLowerCase()
+  ].join("|")
+}
+
+function cachedDetail(cache, row, period) {
+  if (!cache || typeof cache !== "object" || !row) return {}
+  var entries = cache.entries
+  if (!entries || typeof entries !== "object") return {}
+  var entry = entries[detailCacheKey(row, period)]
+  var data = entry && entry.data
+  if (!data || typeof data !== "object" || !Array.isArray(data.sparkline) || data.sparkline.length < 2)
+    return {}
+  var wanted = String(row.productId || row.id || "").toUpperCase()
+  var got = String(data.productId || data.id || "").toUpperCase()
+  if (wanted && got && got !== wanted && got.split("-")[0] !== wanted.split("-")[0]) return {}
+  if (String(data.period || "day") !== String(period || "day")) return {}
+  return data
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     formatUsd: formatUsd,
@@ -157,6 +182,8 @@ if (typeof module !== "undefined") {
     parseSnapshot: parseSnapshot,
     parseSearch: parseSearch,
     shouldHandleLoginStatus: shouldHandleLoginStatus,
+    detailCacheKey: detailCacheKey,
+    cachedDetail: cachedDetail,
     formatChartTime: formatChartTime
   }
 }

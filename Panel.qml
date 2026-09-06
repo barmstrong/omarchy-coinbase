@@ -32,6 +32,7 @@ Item {
   property bool tabSynced: false
   property var detailAsset: null
   property var detailChart: ({})
+  property var detailCache: ({})
   property bool detailLoading: false
   property var lastPortfolio: ({})
   property int chartSeq: 0
@@ -586,8 +587,8 @@ Item {
     root.chartWantId = String(root.tickerId(row) || "").toUpperCase()
     if (chartProc.running) chartProc.running = false
     root.detailLoading = true
-    root.detailChart = ({})
     var p = periodOverride || period
+    root.detailChart = Model.cachedDetail(root.detailCache, row, p)
     chartProc.command = [pluginFile("bin/coinbase"), "chart", root.tickerId(row), "--period", p, "--symbol", String(row.id || ""), "--kind", String(row.kind || "crypto")]
     chartProc.running = true
   }
@@ -779,6 +780,24 @@ Item {
         root.acceptSnapshotReload = true
         snapshotFile.reload()
       }
+    }
+  }
+
+  FileView {
+    id: detailCacheFile
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/coinbase/detail-cache.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var parsed = {}
+      try { parsed = JSON.parse(text() || "{}") } catch (e) { parsed = {} }
+      if (!parsed || typeof parsed !== "object") return
+      root.detailCache = parsed
+      if (!root.showingDetail || !root.detailLoading) return
+      var cached = Model.cachedDetail(parsed, root.detailAsset, root.period)
+      if (cached && cached.sparkline && cached.sparkline.length >= 2)
+        root.detailChart = cached
     }
   }
 

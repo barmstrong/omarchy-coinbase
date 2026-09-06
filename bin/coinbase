@@ -39,6 +39,7 @@ WATCHLIST_FILE = STATE_DIR / "watchlist.json"
 PREFS_FILE = STATE_DIR / "prefs.json"
 PRODUCTS_CACHE = STATE_DIR / "products-cache.json"
 CANDLES_CACHE = STATE_DIR / "candles-cache.json"
+DETAIL_CACHE_FILE = STATE_DIR / "detail-cache.json"
 STOCK_CAPS_FILE = STATE_DIR / "stock-caps.json"
 LOGIN_STATUS_FILE = STATE_DIR / "login-status.json"
 BROKER_URL_FILE = PLUGIN_ROOT / "broker.url"
@@ -85,6 +86,11 @@ STOCK_CAP_TTL = 6 * 3600
 ROW_SPARK_POINTS = 24
 CANDLE_CACHE_LIMIT = 600
 CANDLE_STALE_SECONDS = 7 * 86400
+DETAIL_CACHE_TTL = 60
+DETAIL_CACHE_STALE_SECONDS = 7 * 86400
+DETAIL_CACHE_LIMIT = 96
+DETAIL_METADATA_TTL = 6 * 3600
+DETAIL_METADATA_LIMIT = 64
 BAR_DISPLAY_MODES = ("full", "quote", "price")
 YAHOO_UA = "Mozilla/5.0"
 YAHOO_RANGES = {
@@ -182,6 +188,7 @@ STOCK_CIKS = {
 }
 
 _CANDLE_THREAD_LOCK = threading.Lock()
+_DETAIL_THREAD_LOCK = threading.Lock()
 _PRODUCT_THREAD_LOCK = threading.Lock()
 _PREFS_THREAD_LOCK = threading.Lock()
 MAX_HTTP_BYTES = 16 * 1024 * 1024
@@ -262,6 +269,18 @@ def candle_cache_lock():
 
 
 @contextmanager
+def detail_cache_lock():
+    ensure_state()
+    with _DETAIL_THREAD_LOCK:
+        with (STATE_DIR / "detail-cache.lock").open("w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
 def product_cache_lock():
     ensure_state()
     with _PRODUCT_THREAD_LOCK:
@@ -322,6 +341,112 @@ def write_login_status(status: str, message: str = "") -> None:
         LOGIN_STATUS_FILE,
         {"status": status, "message": message, "at": now_iso()},
     )
+
+
+def detail_cache_key(product_id: str, symbol: str, kind: str, period: str) -> str:
+    return "|".join(
+        (
+            str(kind or "crypto").strip().lower(),
+            str(product_id or "").strip().upper(),
+            str(symbol or "").strip().upper(),
+            str(period or "day").strip().lower(),
+        )
+    )
+
+
+def load_detail_cache() -> dict[str, Any]:
+    with detail_cache_lock():
+        cache = read_json(DETAIL_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        return {"version": 1, "entries": {}, "metadata": {}}
+    entries = cache.get("entries")
+    metadata = cache.get("metadata")
+    cache["version"] = 1
+    cache["entries"] = entries if isinstance(entries, dict) else {}
+    cache["metadata"] = metadata if isinstance(metadata, dict) else {}
+    return cache
+
+
+def cached_detail(
+    product_id: str,
+    symbol: str,
+    kind: str,
+    period: str,
+) -> tuple[dict[str, Any], float]:
+    cache = load_detail_cache()
+    entry = cache["entries"].get(detail_cache_key(product_id, symbol, kind, period))
+    if not isinstance(entry, dict) or not isinstance(entry.get("data"), dict):
+        return {}, 0
+    return dict(entry["data"]), num(entry.get("fetchedAt"))
+
+
+def _trim_cache_map(rows: dict[str, Any], limit: int) -> None:
+    if len(rows) <= limit:
+        return
+    oldest = sorted(
+        rows.items(),
+        key=lambda item: num((item[1] or {}).get("fetchedAt") if isinstance(item[1], dict) else 0),
+    )
+    for key, _entry in oldest[: len(rows) - limit]:
+        rows.pop(key, None)
+
+
+def store_detail(
+    product_id: str,
+    symbol: str,
+    kind: str,
+    period: str,
+    data: dict[str, Any],
+) -> None:
+    if not isinstance(data, dict) or len(data.get("sparkline") or []) < 2:
+        return
+    with detail_cache_lock():
+        cache = read_json(DETAIL_CACHE_FILE, {})
+        if not isinstance(cache, dict):
+            cache = {}
+        entries = cache.get("entries")
+        metadata = cache.get("metadata")
+        entries = entries if isinstance(entries, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        entries[detail_cache_key(product_id, symbol, kind, period)] = {
+            "fetchedAt": int(time.time()),
+            "data": data,
+        }
+        _trim_cache_map(entries, DETAIL_CACHE_LIMIT)
+        cache.update({"version": 1, "entries": entries, "metadata": metadata})
+        write_json(DETAIL_CACHE_FILE, cache)
+
+
+def cached_coingecko_detail(symbol: str) -> dict[str, Any]:
+    key = str(symbol or "").strip().upper()
+    if not key:
+        return {}
+    cache = load_detail_cache()
+    previous = cache["metadata"].get(key)
+    previous_data = previous.get("data") if isinstance(previous, dict) else None
+    previous_at = num(previous.get("fetchedAt")) if isinstance(previous, dict) else 0
+    if isinstance(previous_data, dict) and previous_at > time.time() - DETAIL_METADATA_TTL:
+        return dict(previous_data)
+
+    fresh = fetch_coingecko_detail(key)
+    if not fresh:
+        if isinstance(previous_data, dict) and previous_at > time.time() - DETAIL_CACHE_STALE_SECONDS:
+            return dict(previous_data)
+        return {}
+
+    with detail_cache_lock():
+        latest = read_json(DETAIL_CACHE_FILE, {})
+        if not isinstance(latest, dict):
+            latest = {}
+        entries = latest.get("entries")
+        metadata = latest.get("metadata")
+        entries = entries if isinstance(entries, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        metadata[key] = {"fetchedAt": int(time.time()), "data": fresh}
+        _trim_cache_map(metadata, DETAIL_METADATA_LIMIT)
+        latest.update({"version": 1, "entries": entries, "metadata": metadata})
+        write_json(DETAIL_CACHE_FILE, latest)
+    return fresh
 
 
 def broker_url() -> str:
@@ -3711,7 +3836,12 @@ def cmd_display() -> None:
     print(json.dumps({"barDisplay": nxt}))
 
 
-def cmd_chart(product_id: str, period: str | None = None, symbol: str = "", kind: str = "") -> None:
+def chart_identity(
+    product_id: str,
+    period: str | None = None,
+    symbol: str = "",
+    kind: str = "",
+) -> tuple[str, str, str, str]:
     period = period if period in PERIODS else str(load_prefs().get("period") or "day")
     if period not in PERIODS:
         period = "day"
@@ -3725,6 +3855,12 @@ def cmd_chart(product_id: str, period: str | None = None, symbol: str = "", kind
             kind_out = "stock"
         else:
             kind_out = "crypto"
+    pid = pid or product_id_for(symbol_out)
+    return pid, symbol_out, kind_out, period
+
+
+def build_chart_data(product_id: str, symbol_out: str, kind_out: str, period: str) -> dict[str, Any]:
+    pid = product_id
     spec = PERIODS[period]
     product: dict[str, Any] = {}
     yahoo: dict[str, Any] = {}
@@ -3736,18 +3872,30 @@ def cmd_chart(product_id: str, period: str | None = None, symbol: str = "", kind
         pct = num(yahoo.get("changePercent"))
         name = str(yahoo.get("name") or symbol_out)
     else:
-        product_id = pid or product_id_for(symbol_out)
-        if kind_out == "crypto":
-            candles = fetch_crypto_candles(product_id, symbol_out, spec["granularity"], spec["seconds"], period)
-        else:
-            candles = fetch_candles(product_id, spec["granularity"], spec["seconds"])
-        product = fetch_product(pid or product_id_for(symbol_out)) or {}
+        with ThreadPoolExecutor(max_workers=3 if kind_out == "crypto" else 2) as pool:
+            if kind_out == "crypto":
+                candles_future = pool.submit(
+                    fetch_crypto_candles,
+                    pid,
+                    symbol_out,
+                    spec["granularity"],
+                    spec["seconds"],
+                    period,
+                )
+                gecko_future = pool.submit(cached_coingecko_detail, symbol_out)
+            else:
+                candles_future = pool.submit(fetch_candles, pid, spec["granularity"], spec["seconds"])
+                gecko_future = None
+            product_future = pool.submit(fetch_product, pid)
+            candles = candles_future.result() or []
+            product = product_future.result() or {}
+            if gecko_future is not None:
+                gecko = gecko_future.result() or {}
         price = num(product.get("price"))
         pct = num(product.get("price_percentage_change_24h"))
         name = str(product.get("base_name") or symbol_out)
         if not price and candles:
             price = candles[-1][1]
-        gecko = fetch_coingecko_detail(symbol_out)
         if gecko.get("name") and (not name or name == symbol_out):
             name = str(gecko.get("name"))
     spark = sparkline_for_period(candles, price, spec["seconds"])
@@ -3758,30 +3906,40 @@ def cmd_chart(product_id: str, period: str | None = None, symbol: str = "", kind
     percent = (pnl / start * 100) if start else pct
     stats, ohlc = asset_stats(kind=kind_out, product=product, yahoo=yahoo, gecko=gecko)
     trades = trade_urls(symbol_out, name, kind_out)
-    print(
-        json.dumps(
-            {
-                "id": symbol_out,
-                "name": name,
-                "kind": kind_out,
-                "productId": pid or product_id_for(symbol_out),
-                "price": price,
-                "pnl": pnl,
-                "pnlPercent": percent,
-                "sparkline": spark,
-                "rowSpark": downsample(spark, ROW_SPARK_POINTS),
-                "buyUrl": trades["buy"],
-                "sellUrl": trades["sell"],
-                "url": trades["url"],
-                "period": period,
-                "open": ohlc.get("open") or 0,
-                "high": ohlc.get("high") or 0,
-                "low": ohlc.get("low") or 0,
-                "volume": ohlc.get("volume") or 0,
-                "stats": stats,
-            }
-        )
-    )
+    return {
+        "id": symbol_out,
+        "name": name,
+        "kind": kind_out,
+        "productId": pid,
+        "price": price,
+        "pnl": pnl,
+        "pnlPercent": percent,
+        "sparkline": spark,
+        "rowSpark": downsample(spark, ROW_SPARK_POINTS),
+        "buyUrl": trades["buy"],
+        "sellUrl": trades["sell"],
+        "url": trades["url"],
+        "period": period,
+        "open": ohlc.get("open") or 0,
+        "high": ohlc.get("high") or 0,
+        "low": ohlc.get("low") or 0,
+        "volume": ohlc.get("volume") or 0,
+        "stats": stats,
+    }
+
+
+def cmd_chart(product_id: str, period: str | None = None, symbol: str = "", kind: str = "") -> None:
+    pid, symbol_out, kind_out, chosen = chart_identity(product_id, period, symbol, kind)
+    previous, cached_at = cached_detail(pid, symbol_out, kind_out, chosen)
+    if previous and cached_at > time.time() - DETAIL_CACHE_TTL:
+        print(json.dumps(previous))
+        return
+    result = build_chart_data(pid, symbol_out, kind_out, chosen)
+    if len(result.get("sparkline") or []) < 2 and previous and cached_at > time.time() - DETAIL_CACHE_STALE_SECONDS:
+        result = previous
+    else:
+        store_detail(pid, symbol_out, kind_out, chosen, result)
+    print(json.dumps(result))
 
 
 def cmd_rows(period: str | None = None, tab: str = "") -> None:

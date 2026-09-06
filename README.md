@@ -15,6 +15,8 @@ The panel includes:
 - A read-only Coinbase watchlist refresh while the panel is open
 - Cache-first rendering that keeps the last complete view visible while market
   and portfolio data update in the background, including when offline
+- Instant repeat asset details from an owner-only local cache; stale charts and
+  statistics render immediately while public market data refreshes in the background
 
 This project is not affiliated with or endorsed by Coinbase. Coinbase and its
 logo are trademarks of their respective owner.
@@ -159,6 +161,7 @@ node tests/model.test.js
 python3 -m unittest discover -s tests -v
 bin/coinbase status
 bin/coinbase snapshot --period day
+bin/coinbase chart BTC-USD --period week --symbol BTC --kind crypto
 bin/coinbase search eth
 bin/coinbase ticker ETH-USD
 bin/coinbase logout
