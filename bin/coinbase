@@ -85,6 +85,7 @@ WATCHLIST_TTL = 180
 STOCK_CAP_TTL = 6 * 3600
 ROW_SPARK_POINTS = 24
 ROW_SPARK_BATCH = 24
+ROW_SPARK_VERSION = 2
 CANDLE_CACHE_LIMIT = 600
 CANDLE_STALE_SECONDS = 7 * 86400
 DETAIL_CACHE_TTL = 60
@@ -92,6 +93,7 @@ DETAIL_CACHE_STALE_SECONDS = 7 * 86400
 DETAIL_CACHE_LIMIT = 96
 DETAIL_METADATA_TTL = 6 * 3600
 DETAIL_METADATA_LIMIT = 64
+DETAIL_CACHE_VERSION = 2
 BAR_DISPLAY_MODES = ("full", "quote", "price")
 MARKET_CATEGORIES = frozenset({"crypto", "stock", "commodity", "index", "preipo"})
 YAHOO_UA = "Mozilla/5.0"
@@ -124,6 +126,7 @@ FALLBACK_MAJORS = [
 MEGA_STOCKS = [
     ("AAPL", "Apple"),
     ("MSFT", "Microsoft"),
+    ("MU", "Micron"),
     ("NVDA", "NVIDIA"),
     ("GOOGL", "Alphabet"),
     ("AMZN", "Amazon"),
@@ -360,10 +363,12 @@ def load_detail_cache() -> dict[str, Any]:
     with detail_cache_lock():
         cache = read_json(DETAIL_CACHE_FILE, {})
     if not isinstance(cache, dict):
-        return {"version": 1, "entries": {}, "metadata": {}}
+        return {"version": DETAIL_CACHE_VERSION, "entries": {}, "metadata": {}}
     entries = cache.get("entries")
     metadata = cache.get("metadata")
-    cache["version"] = 1
+    if int(num(cache.get("version"))) != DETAIL_CACHE_VERSION:
+        entries = {}
+    cache["version"] = DETAIL_CACHE_VERSION
     cache["entries"] = entries if isinstance(entries, dict) else {}
     cache["metadata"] = metadata if isinstance(metadata, dict) else {}
     return cache
@@ -408,6 +413,8 @@ def store_detail(
             cache = {}
         entries = cache.get("entries")
         metadata = cache.get("metadata")
+        if int(num(cache.get("version"))) != DETAIL_CACHE_VERSION:
+            entries = {}
         entries = entries if isinstance(entries, dict) else {}
         metadata = metadata if isinstance(metadata, dict) else {}
         entries[detail_cache_key(product_id, symbol, kind, period)] = {
@@ -415,7 +422,7 @@ def store_detail(
             "data": data,
         }
         _trim_cache_map(entries, DETAIL_CACHE_LIMIT)
-        cache.update({"version": 1, "entries": entries, "metadata": metadata})
+        cache.update({"version": DETAIL_CACHE_VERSION, "entries": entries, "metadata": metadata})
         write_json(DETAIL_CACHE_FILE, cache)
 
 
@@ -442,11 +449,13 @@ def cached_coingecko_detail(symbol: str) -> dict[str, Any]:
             latest = {}
         entries = latest.get("entries")
         metadata = latest.get("metadata")
+        if int(num(latest.get("version"))) != DETAIL_CACHE_VERSION:
+            entries = {}
         entries = entries if isinstance(entries, dict) else {}
         metadata = metadata if isinstance(metadata, dict) else {}
         metadata[key] = {"fetchedAt": int(time.time()), "data": fresh}
         _trim_cache_map(metadata, DETAIL_METADATA_LIMIT)
-        latest.update({"version": 1, "entries": entries, "metadata": metadata})
+        latest.update({"version": DETAIL_CACHE_VERSION, "entries": entries, "metadata": metadata})
         write_json(DETAIL_CACHE_FILE, latest)
     return fresh
 
@@ -808,29 +817,39 @@ def fetch_yahoo_spark(symbols: list[str]) -> dict[str, dict[str, Any]]:
         uniq.append(key)
     if not uniq:
         return {}
-    url = (
-        "https://query1.finance.yahoo.com/v7/finance/spark?symbols="
-        + urllib.parse.quote(",".join(uniq))
-        + "&range=1d&interval=5m&includePrePost=true"
-    )
-    try:
-        payload = yahoo_get(url)
-    except RuntimeError:
-        return {}
-    rows = ((payload.get("spark") or {}).get("result")) if isinstance(payload, dict) else []
     out: dict[str, dict[str, Any]] = {}
-    if not isinstance(rows, list):
-        return out
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        resp = (item.get("response") or [None])[0] or {}
-        meta = resp.get("meta") or {}
-        closes = _yahoo_closes(resp.get("indicators"))
-        symbol = str(item.get("symbol") or meta.get("symbol") or "").upper()
-        quote = _quote_from_yahoo_meta(meta, closes, symbol)
-        if quote["symbol"] and quote["price"]:
-            out[quote["symbol"]] = quote
+    def collect(batch: list[str]) -> None:
+        url = (
+            "https://query1.finance.yahoo.com/v7/finance/spark?symbols="
+            + urllib.parse.quote(",".join(batch))
+            + "&range=1d&interval=5m&includePrePost=true"
+        )
+        try:
+            payload = yahoo_get(url)
+        except RuntimeError:
+            return
+        rows = ((payload.get("spark") or {}).get("result")) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            resp = (item.get("response") or [None])[0] or {}
+            meta = resp.get("meta") or {}
+            closes = _yahoo_closes(resp.get("indicators"))
+            symbol = str(item.get("symbol") or meta.get("symbol") or "").upper()
+            quote = _quote_from_yahoo_meta(meta, closes, symbol)
+            if quote["symbol"] and quote["price"]:
+                out[quote["symbol"]] = quote
+
+    # The spark endpoint truncates large symbol sets without reporting an
+    # error. Keep batches small, then retry any omissions in groups of five so
+    # a transient partial response cannot leave a stock sorted by stale data.
+    for offset in range(0, len(uniq), 20):
+        collect(uniq[offset : offset + 20])
+    missing = [symbol for symbol in uniq if symbol not in out]
+    for offset in range(0, len(missing), 5):
+        collect(missing[offset : offset + 5])
     return out
 
 
@@ -2086,6 +2105,39 @@ def _fetch_candle_window(product_id: str, granularity: str, start: int, end: int
     return _parse_candles(payload)
 
 
+def _fetch_candle_range(
+    product_id: str, granularity: str, start: int, end: int
+) -> list[tuple[int, float]]:
+    gsec = GRANULARITY_SECS.get(granularity, 3600)
+    window = max(gsec, MAX_CANDLES * gsec)
+    spans: list[tuple[int, int]] = []
+    cursor = start
+    while cursor < end:
+        window_end = min(end, cursor + window)
+        spans.append((cursor, window_end))
+        cursor = window_end
+    found: list[tuple[int, float]] = []
+    if len(spans) <= 1:
+        found = _fetch_candle_window(product_id, granularity, start, end)
+    else:
+        with ThreadPoolExecutor(max_workers=min(6, len(spans))) as pool:
+            futures = [
+                pool.submit(_fetch_candle_window, product_id, granularity, left, right)
+                for left, right in spans
+            ]
+            for future in as_completed(futures):
+                found.extend(future.result())
+    found.sort(key=lambda item: item[0])
+    deduped: list[tuple[int, float]] = []
+    seen_ts: set[int] = set()
+    for ts, price in found:
+        if ts in seen_ts:
+            continue
+        seen_ts.add(ts)
+        deduped.append((ts, price))
+    return deduped
+
+
 def fetch_candles(product_id: str, granularity: str, seconds: int) -> list[tuple[int, float]]:
     if not product_id:
         return []
@@ -2096,30 +2148,30 @@ def fetch_candles(product_id: str, granularity: str, seconds: int) -> list[tuple
     if cached and cached_at > time.time() - _candle_ttl(seconds):
         return cached
 
-    gsec = GRANULARITY_SECS.get(granularity, 3600)
-    window = max(gsec, MAX_CANDLES * gsec)
-    spans: list[tuple[int, int]] = []
-    t = start
-    while t < end:
-        wend = min(end, t + window)
-        spans.append((t, wend))
-        t = wend
-    found: list[tuple[int, float]] = []
-    if len(spans) <= 1:
-        found = _fetch_candle_window(product_id, granularity, start, end)
-    else:
-        with ThreadPoolExecutor(max_workers=min(6, len(spans))) as pool:
-            futs = [pool.submit(_fetch_candle_window, product_id, granularity, a, b) for a, b in spans]
-            for fut in as_completed(futs):
-                found.extend(fut.result())
-    found.sort(key=lambda item: item[0])
-    deduped: list[tuple[int, float]] = []
-    seen_ts = set()
-    for ts, price in found:
-        if ts in seen_ts:
-            continue
-        seen_ts.add(ts)
-        deduped.append((ts, price))
+    deduped = _fetch_candle_range(product_id, granularity, start, end)
+
+    # Several FCM index products currently publish 30-minute/hour/day candles
+    # but return an empty series at Coinbase's finer granularities. Fall back
+    # progressively, using enough history to include the prior market session.
+    requested_step = GRANULARITY_SECS.get(granularity, 3600)
+    fallbacks = (
+        ("THIRTY_MINUTE", 5 * 86400),
+        ("ONE_HOUR", 7 * 86400),
+        ("ONE_DAY", 30 * 86400),
+    )
+    if not deduped:
+        for fallback_granularity, fallback_seconds in fallbacks:
+            fallback_step = GRANULARITY_SECS[fallback_granularity]
+            if fallback_step <= requested_step:
+                continue
+            deduped = _fetch_candle_range(
+                product_id,
+                fallback_granularity,
+                max(0, end - max(seconds, fallback_seconds)),
+                end,
+            )
+            if deduped:
+                break
 
     if deduped:
         _store_cached_candles(key, deduped)
@@ -2190,7 +2242,15 @@ def sparkline_for_period(
     live_price: float,
     seconds: int,
 ) -> list[float]:
-    end = time.time()
+    wall_end = time.time()
+    valid_times = [int(ts) for ts, price in candles if int(ts) > 0 and num(price) > 0]
+    latest_candle = max(valid_times) if valid_times else 0
+    end = wall_end
+    if latest_candle and latest_candle < wall_end - max(1, int(seconds)) - 7200:
+        # Traditional markets pause overnight and on weekends. Anchor short
+        # periods to the most recent session instead of discarding all candles
+        # merely because their wall-clock timestamps are stale.
+        end = float(latest_candle + 1)
     start = end - max(1, int(seconds))
     series: list[tuple[float, float]] = []
     seen: set[int] = set()
@@ -2199,7 +2259,7 @@ def sparkline_for_period(
         px = num(price)
         if px <= 0 or ts_i in seen:
             continue
-        if ts_i < start - 7200 or ts_i > end + 120:
+        if ts_i < start - 7200 or ts_i > wall_end + 120:
             continue
         seen.add(ts_i)
         series.append((float(ts_i), px))
@@ -2498,7 +2558,15 @@ def append_missing_market_assets(
     def merge_metadata(current: dict[str, Any], extra: dict[str, Any]) -> None:
         if extra.get("marketCategory"):
             current["marketCategory"] = extra["marketCategory"]
-        for key in ("price", "volume24h", "marketCap", "rowSpark", "rowSparkPeriod", "yahoo"):
+        for key in (
+            "price",
+            "volume24h",
+            "marketCap",
+            "rowSpark",
+            "rowSparkPeriod",
+            "rowSparkVersion",
+            "yahoo",
+        ):
             if not current.get(key) and extra.get(key):
                 current[key] = extra[key]
         current["held"] = bool(current.get("held") or extra.get("held"))
@@ -2616,7 +2684,7 @@ def market_volume(asset: dict[str, Any]) -> float:
         return num(asset.get("volume24h"))
     if "volume" in asset:
         return num(asset.get("volume"))
-    return num(asset.get("marketCap"))
+    return 0.0
 
 
 def watchlist_kind_for_product(product: dict[str, Any]) -> str:
@@ -2874,6 +2942,7 @@ def market_row(symbol: str, name: str, kind: str, product_id: str = "", **extra:
         "url": extra.get("url") or asset_url(kind, symbol, product_id, name),
         "rowSpark": extra.get("rowSpark") or [],
         "rowSparkPeriod": extra.get("rowSparkPeriod") or "",
+        "rowSparkVersion": int(num(extra.get("rowSparkVersion"))),
         "rowSparkCache": extra.get("rowSparkCache") or {},
         "yahoo": extra.get("yahoo") or (symbol if kind in {"stock", "commodity"} else ""),
         "buyUrl": extra.get("buyUrl") or trade_urls(symbol, name, kind)["buy"],
@@ -3203,6 +3272,7 @@ def dedupe_stock_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not prev.get("rowSpark") and asset.get("rowSpark"):
             prev["rowSpark"] = asset.get("rowSpark")
             prev["rowSparkPeriod"] = asset.get("rowSparkPeriod")
+            prev["rowSparkVersion"] = asset.get("rowSparkVersion")
         previous_cache = remember_row_spark(prev)
         for period, values in remember_row_spark(asset).items():
             previous_cache.setdefault(period, values)
@@ -3386,6 +3456,7 @@ def enrich_yahoo_assets(assets: list[dict[str, Any]]) -> None:
             if quote["closes"] and str(asset.get("rowSparkPeriod") or "day") == "day":
                 asset["rowSpark"] = quote["closes"]
                 asset["rowSparkPeriod"] = "day"
+                asset["rowSparkVersion"] = ROW_SPARK_VERSION
             asset["yahoo"] = quote["symbol"]
             if quote["volume24h"]:
                 asset["volume24h"] = quote["volume24h"]
@@ -3452,6 +3523,7 @@ def restore_row_spark_cache(assets: list[dict[str, Any]], previous: list[dict[st
         for period, values in old_cache.items():
             merged.setdefault(period, values)
         current["rowSparkCache"] = merged
+        current["rowSparkVersion"] = int(num(old.get("rowSparkVersion")))
 
 
 def apply_period_row_spark(asset: dict[str, Any], period: str, candles: list[tuple[int, float]]) -> None:
@@ -3462,6 +3534,7 @@ def apply_period_row_spark(asset: dict[str, Any], period: str, candles: list[tup
         if _valid_row_spark(values):
             asset["rowSpark"] = values
             asset["rowSparkPeriod"] = period
+            asset["rowSparkVersion"] = ROW_SPARK_VERSION
         return
     spark = sparkline_for_period(candles, num(asset.get("price")), spec["seconds"])
     if len(spark) < 2:
@@ -3469,10 +3542,12 @@ def apply_period_row_spark(asset: dict[str, Any], period: str, candles: list[tup
         if _valid_row_spark(values):
             asset["rowSpark"] = values
             asset["rowSparkPeriod"] = period
+            asset["rowSparkVersion"] = ROW_SPARK_VERSION
         return
     row_spark = downsample(spark, ROW_SPARK_POINTS)
     asset["rowSpark"] = row_spark
     asset["rowSparkPeriod"] = period
+    asset["rowSparkVersion"] = ROW_SPARK_VERSION
     cache[period] = row_spark
     asset["rowSparkCache"] = cache
     start = num(row_spark[0])
@@ -3535,7 +3610,11 @@ def fill_crypto_row_sparks(assets: list[dict[str, Any]], period: str) -> None:
         for a in assets
         if a.get("kind") not in {"stock", "commodity", "fiat"}
         and a.get("productId")
-        and (str(a.get("rowSparkPeriod") or "") != period or len(a.get("rowSpark") or []) < 2)
+        and (
+            int(num(a.get("rowSparkVersion"))) != ROW_SPARK_VERSION
+            or str(a.get("rowSparkPeriod") or "") != period
+            or len(a.get("rowSpark") or []) < 2
+        )
     ]
     candidates.sort(key=lambda a: (not a.get("watchlist"), not a.get("held"), -market_volume(a)))
     fill_period_row_sparks(candidates[:16], period)
@@ -3590,6 +3669,7 @@ def write_market_snapshot(
         fill_crypto_row_sparks(assets, period)
     if lead and sparkline:
         lead["rowSpark"] = downsample(sparkline, ROW_SPARK_POINTS)
+        lead["rowSparkVersion"] = ROW_SPARK_VERSION
     snap = empty_snapshot(
         authenticated=False,
         error=error,
@@ -4148,7 +4228,9 @@ def cmd_rows(period: str | None = None, tab: str = "") -> None:
         missing = [
             row
             for row in targets
-            if str(row.get("rowSparkPeriod") or "") != chosen or len(row.get("rowSpark") or []) < 2
+            if int(num(row.get("rowSparkVersion"))) != ROW_SPARK_VERSION
+            or str(row.get("rowSparkPeriod") or "") != chosen
+            or len(row.get("rowSpark") or []) < 2
         ]
         fill_period_row_sparks(missing[:ROW_SPARK_BATCH], chosen)
         snap["assets"] = assets

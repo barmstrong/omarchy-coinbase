@@ -6,6 +6,7 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 
@@ -27,11 +28,164 @@ def configure_state(helper, state):
     helper.WATCHLIST_FILE = state / "watchlist.json"
     helper.LOGIN_STATUS_FILE = state / "login-status.json"
     helper.PREFS_FILE = state / "prefs.json"
+    helper.PRODUCTS_CACHE = state / "products-cache.json"
+    helper.CANDLES_CACHE = state / "candles-cache.json"
     helper.DETAIL_CACHE_FILE = state / "detail-cache.json"
+    helper.STOCK_CAPS_FILE = state / "stock-caps.json"
     helper.BROKER_URL_FILE = state / "broker.url"
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_yahoo_spark_batches_large_stock_lists(self):
+        helper = load_helper()
+        calls = []
+
+        def fake_yahoo_get(url, timeout=12):
+            calls.append((url, timeout))
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            symbols = query["symbols"][0].split(",")
+            return {
+                "spark": {
+                    "result": [
+                        {
+                            "symbol": symbol,
+                            "response": [
+                                {
+                                    "meta": {
+                                        "symbol": symbol,
+                                        "regularMarketPrice": 10,
+                                        "regularMarketVolume": 100,
+                                    },
+                                    "indicators": {"quote": [{"close": [9, 10]}]},
+                                }
+                            ],
+                        }
+                        for symbol in symbols
+                    ]
+                }
+            }
+
+        helper.yahoo_get = fake_yahoo_get
+        quotes = helper.fetch_yahoo_spark([f"S{i}" for i in range(45)])
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(quotes), 45)
+        self.assertEqual(quotes["S44"]["volume24h"], 1000)
+
+    def test_yahoo_spark_retries_symbols_omitted_from_a_batch(self):
+        helper = load_helper()
+        calls = []
+
+        def fake_yahoo_get(url, timeout=12):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            symbols = query["symbols"][0].split(",")
+            calls.append(symbols)
+            returned = symbols if len(calls) > 1 else [s for s in symbols if s != "NVDA"]
+            return {
+                "spark": {
+                    "result": [
+                        {
+                            "symbol": symbol,
+                            "response": [
+                                {
+                                    "meta": {
+                                        "symbol": symbol,
+                                        "regularMarketPrice": 10,
+                                        "regularMarketVolume": 100,
+                                    },
+                                    "indicators": {"quote": [{"close": [9, 10]}]},
+                                }
+                            ],
+                        }
+                        for symbol in returned
+                    ]
+                }
+            }
+
+        helper.yahoo_get = fake_yahoo_get
+        quotes = helper.fetch_yahoo_spark(["MU", "NVDA"])
+
+        self.assertEqual(calls, [["MU", "NVDA"], ["NVDA"]])
+        self.assertEqual(set(quotes), {"MU", "NVDA"})
+
+    def test_market_volume_never_falls_back_to_market_cap(self):
+        helper = load_helper()
+
+        self.assertEqual(helper.market_volume({"marketCap": 5_000_000}), 0)
+        self.assertEqual(helper.market_volume({"volume24h": 25, "marketCap": 5_000_000}), 25)
+
+    def test_sparse_fcm_candles_fall_back_to_coarser_history(self):
+        helper = load_helper()
+        calls = []
+        stored = []
+        helper._cached_candles = lambda _key: ([], 0)
+        helper._store_cached_candles = lambda key, rows: stored.append((key, rows))
+
+        def fake_range(product_id, granularity, start, end):
+            calls.append((product_id, granularity, start, end))
+            if granularity == "THIRTY_MINUTE":
+                return [(end - 3600, 100), (end - 1800, 105)]
+            return []
+
+        helper._fetch_candle_range = fake_range
+        candles = helper.fetch_candles(
+            "AIP-19DEC30-CDE", "FIVE_MINUTE", 86400
+        )
+
+        self.assertEqual([call[1] for call in calls], ["FIVE_MINUTE", "THIRTY_MINUTE"])
+        self.assertEqual(candles[-1][1], 105)
+        self.assertEqual(stored[0][0], "AIP-19DEC30-CDE|FIVE_MINUTE|86400")
+
+    def test_short_chart_anchors_to_last_traditional_market_session(self):
+        helper = load_helper()
+        now = int(time.time())
+        candles = [
+            (now - 2 * 86400 - 3600, 100),
+            (now - 2 * 86400 - 1800, 105),
+            (now - 2 * 86400, 110),
+        ]
+
+        spark = helper.sparkline_for_period(candles, 111, 3600)
+
+        self.assertGreaterEqual(len(spark), 2)
+        self.assertGreater(len(set(spark)), 1)
+        self.assertEqual(spark[-1], 111)
+
+    def test_micron_is_in_the_stock_market_set(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            configure_state(helper, Path(directory))
+            rows = helper.stock_majors()
+
+        self.assertIn("MU", [row["id"] for row in rows])
+
+    def test_new_detail_cache_version_discards_legacy_chart_entries(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            helper.write_json(
+                helper.DETAIL_CACHE_FILE,
+                {
+                    "version": 1,
+                    "entries": {"legacy": {"data": {"sparkline": [1, 1]}}},
+                    "metadata": {"BTC": {"data": {"name": "Bitcoin"}}},
+                },
+            )
+            helper.store_detail(
+                "AIP-19DEC30-CDE",
+                "AI",
+                "derivative",
+                "day",
+                {"sparkline": [100, 105]},
+            )
+            stored = json.loads(helper.DETAIL_CACHE_FILE.read_text(encoding="utf-8"))
+
+        self.assertEqual(stored["version"], helper.DETAIL_CACHE_VERSION)
+        self.assertNotIn("legacy", stored["entries"])
+        self.assertIn("derivative|AIP-19DEC30-CDE|AI|day", stored["entries"])
+        self.assertIn("BTC", stored["metadata"])
+
     def test_future_products_are_classified_by_underlying(self):
         helper = load_helper()
 

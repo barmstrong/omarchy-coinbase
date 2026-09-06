@@ -90,7 +90,6 @@ function marketVolume(row) {
   row = row || {}
   var raw = row.volume24h
   if (raw === undefined || raw === null) raw = row.volume
-  if (raw === undefined || raw === null) raw = row.marketCap
   var value = Number(raw || 0)
   return isFinite(value) && value > 0 ? value : 0
 }
@@ -195,6 +194,7 @@ function detailCacheKey(row, period) {
 
 function cachedDetail(cache, row, period) {
   if (!cache || typeof cache !== "object" || !row) return {}
+  if (Number(cache.version || 0) !== 2) return {}
   var entries = cache.entries
   if (!entries || typeof entries !== "object") return {}
   var entry = entries[detailCacheKey(row, period)]

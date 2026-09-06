@@ -368,7 +368,9 @@ Item {
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i]
       if (!row || !row.productId || String(row.kind || "") === "fiat") continue
-      if (String(row.rowSparkPeriod || "") !== root.period || (row.rowSpark || []).length < 2)
+      if (Number(row.rowSparkVersion || 0) !== 2
+          || String(row.rowSparkPeriod || "") !== root.period
+          || (row.rowSpark || []).length < 2)
         return true
     }
     return false
