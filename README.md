@@ -6,8 +6,8 @@ portfolio balance and period change.
 
 The panel includes:
 
-- Portfolio and Coinbase watchlist views plus volume-ranked all, crypto, stock,
-  commodity, index, and pre-IPO markets
+- Portfolio and Coinbase watchlist views plus 24-hour-volume-ranked all, spot
+  crypto, stock, commodity, index, and pre-IPO markets
 - Synchronized 1H, 1D, 1W, 1M, 1Y, and all-time charts and sparklines
 - Asset detail pages, search, market statistics, and links to Coinbase.com
 - Full keyboard navigation: arrows move through rows and tabs, Enter opens an

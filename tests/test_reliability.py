@@ -50,6 +50,142 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(helper.market_category_for_product(product("INDEX")), "index")
         self.assertEqual(helper.market_category_for_product(product("PREIPO")), "preipo")
 
+    def test_fcm_products_are_classified_by_asset_type_and_group(self):
+        helper = load_helper()
+
+        def product(asset_type, group="", trading_hours_type=""):
+            return {
+                "product_type": "FUTURE",
+                "display_name": "TEST PERP",
+                "future_product_details": {
+                    "futures_asset_type": asset_type,
+                    "group_description": group,
+                    "trading_hours_type": trading_hours_type,
+                },
+            }
+
+        self.assertEqual(
+            helper.market_category_for_product(
+                product("FUTURES_ASSET_TYPE_STOCKS", "AI Index Perp Style Futures")
+            ),
+            "index",
+        )
+        self.assertEqual(
+            helper.market_category_for_product(
+                product("FUTURES_ASSET_TYPE_STOCKS", "Mag7+Crypto Futures")
+            ),
+            "index",
+        )
+        self.assertEqual(
+            helper.market_category_for_product(
+                product(
+                    "FUTURES_ASSET_TYPE_STOCKS",
+                    "Tech100 Perp Style Futures",
+                    "TRADING_HOURS_TYPE_EQUITY_INDEX",
+                )
+            ),
+            "index",
+        )
+        self.assertEqual(
+            helper.market_category_for_product(product("FUTURES_ASSET_TYPE_STOCKS")),
+            "stock",
+        )
+        self.assertEqual(
+            helper.market_category_for_product(product("FUTURES_ASSET_TYPE_METALS")),
+            "commodity",
+        )
+        self.assertEqual(
+            helper.market_category_for_product(product("FUTURES_ASSET_TYPE_ENERGY")),
+            "commodity",
+        )
+        self.assertEqual(
+            helper.market_category_for_product(product("FUTURES_ASSET_TYPE_CRYPTO")),
+            "crypto",
+        )
+
+    def test_crypto_tab_only_matches_spot_crypto(self):
+        helper = load_helper()
+        spot = {"kind": "crypto", "marketCategory": "crypto"}
+        perp = {"kind": "derivative", "marketCategory": "crypto"}
+
+        self.assertTrue(helper.asset_matches_market_tab(spot, "crypto"))
+        self.assertFalse(helper.asset_matches_market_tab(perp, "crypto"))
+        self.assertTrue(helper.asset_matches_market_tab(perp, "all"))
+
+    def test_market_catalog_dedupes_by_coinbase_product_id(self):
+        helper = load_helper()
+        portfolio_row = {
+            "id": "TEK-19DEC30-CDE",
+            "kind": "derivative",
+            "productId": "TEK-19DEC30-CDE",
+            "held": True,
+            "marketCategory": "crypto",
+        }
+        duplicate_portfolio_row = dict(portfolio_row)
+        catalog_row = {
+            "id": "TECH",
+            "kind": "derivative",
+            "productId": "TEK-19DEC30-CDE",
+            "held": False,
+            "marketCategory": "index",
+        }
+        other_expiry = {
+            "id": "TECH DEC 31",
+            "kind": "derivative",
+            "productId": "TEK-19DEC31-CDE",
+            "held": False,
+        }
+
+        rows = helper.append_missing_market_assets(
+            [portfolio_row, duplicate_portfolio_row], [catalog_row, other_expiry]
+        )
+
+        self.assertEqual(rows, [portfolio_row, other_expiry])
+        self.assertEqual(rows[0]["marketCategory"], "index")
+        self.assertTrue(rows[0]["held"])
+
+    def test_derivative_catalog_merges_intx_and_fcm_products(self):
+        helper = load_helper()
+        calls = []
+        shared = {
+            "product_id": "COIN50-PERP-INTX",
+            "display_name": "Coinbase 50 Index PERP",
+            "price": "100",
+            "approximate_quote_24h_volume": "50",
+            "future_product_details": {
+                "perpetual_details": {"underlying_type": "INDEX"}
+            },
+        }
+        fcm = {
+            "product_id": "AIP-19DEC30-CDE",
+            "display_name": "AI PERP",
+            "price": "200",
+            "approximate_quote_24h_volume": "100",
+            "future_product_details": {
+                "futures_asset_type": "FUTURES_ASSET_TYPE_STOCKS",
+                "group_description": "AI Index Perp Style Futures",
+            },
+        }
+
+        def fake_fetch(product_type, extra):
+            calls.append((product_type, extra))
+            if extra.get("contract_expiry_type") == "PERPETUAL":
+                return [shared]
+            return [fcm, shared]
+
+        helper.fetch_typed_products = fake_fetch
+        rows = helper.derivative_majors()
+
+        self.assertEqual(
+            calls,
+            [
+                ("FUTURE", {"contract_expiry_type": "PERPETUAL"}),
+                ("FUTURE", {"expiring_contract_status": "STATUS_UNEXPIRED"}),
+            ],
+        )
+        self.assertEqual([row["productId"] for row in rows], ["AIP-19DEC30-CDE", "COIN50-PERP-INTX"])
+        self.assertTrue(all(row["marketCategory"] == "index" for row in rows))
+
     def test_public_product_catalog_follows_pagination(self):
         helper = load_helper()
         calls = []

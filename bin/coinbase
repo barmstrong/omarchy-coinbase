@@ -2479,6 +2479,54 @@ def _index_assets(assets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return index
 
 
+def market_asset_identity(asset: dict[str, Any]) -> tuple[str, str]:
+    product_id = str(asset.get("productId") or "").strip().upper()
+    if product_id:
+        return "product", product_id
+    return (
+        str(asset.get("kind") or "").strip().lower(),
+        str(asset.get("id") or "").strip().upper(),
+    )
+
+
+def append_missing_market_assets(
+    assets: list[dict[str, Any]], candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def merge_metadata(current: dict[str, Any], extra: dict[str, Any]) -> None:
+        if extra.get("marketCategory"):
+            current["marketCategory"] = extra["marketCategory"]
+        for key in ("price", "volume24h", "marketCap", "rowSpark", "rowSparkPeriod", "yahoo"):
+            if not current.get(key) and extra.get(key):
+                current[key] = extra[key]
+        current["held"] = bool(current.get("held") or extra.get("held"))
+        current["watchlist"] = bool(current.get("watchlist") or extra.get("watchlist"))
+        if current.get("watchlistOrder") is None and extra.get("watchlistOrder") is not None:
+            current["watchlistOrder"] = extra["watchlistOrder"]
+
+    for asset in assets:
+        identity = market_asset_identity(asset)
+        current = indexed.get(identity)
+        if current is not None:
+            merge_metadata(current, asset)
+            continue
+        unique.append(asset)
+        indexed[identity] = asset
+    assets[:] = unique
+
+    for row in candidates:
+        identity = market_asset_identity(row)
+        current = indexed.get(identity)
+        if current is not None:
+            merge_metadata(current, row)
+            continue
+        assets.append(row)
+        indexed[identity] = row
+    return assets
+
+
 def market_category_for_product(product: dict[str, Any], fallback_kind: str = "") -> str:
     future = product.get("future_product_details") or {}
     if not isinstance(future, dict):
@@ -2486,6 +2534,20 @@ def market_category_for_product(product: dict[str, Any], fallback_kind: str = ""
     perpetual = future.get("perpetual_details") or {}
     if not isinstance(perpetual, dict):
         perpetual = {}
+    descriptor = " ".join(
+        str(value or "")
+        for value in (
+            product.get("display_name"),
+            future.get("group_description"),
+            future.get("group_short_description"),
+            future.get("contract_display_name"),
+        )
+    ).upper()
+    trading_hours_type = str(future.get("trading_hours_type") or "").upper()
+    if trading_hours_type == "TRADING_HOURS_TYPE_EQUITY_INDEX":
+        return "index"
+    if "INDEX" in descriptor or "MAG7+CRYPTO" in descriptor:
+        return "index"
     underlying = str(
         perpetual.get("underlying_type")
         or future.get("futures_asset_type")
@@ -2495,13 +2557,20 @@ def market_category_for_product(product: dict[str, Any], fallback_kind: str = ""
     underlying = underlying.removeprefix("FUTURES_UNDERLYING_TYPE_")
     if "PREIPO" in underlying:
         return "preipo"
-    if "COMMOD" in underlying:
+    if "COMMOD" in underlying or underlying in {"FUTURES_ASSET_TYPE_METALS", "FUTURES_ASSET_TYPE_ENERGY"}:
         return "commodity"
     if "INDEX" in underlying:
         return "index"
-    if underlying in {"EQUITY", "EQUITY_ETF", "ADR", "FOREIGN_EQUITY", "OTC"}:
+    if underlying in {
+        "EQUITY",
+        "EQUITY_ETF",
+        "ADR",
+        "FOREIGN_EQUITY",
+        "OTC",
+        "FUTURES_ASSET_TYPE_STOCKS",
+    }:
         return "stock"
-    if underlying == "SPOT":
+    if underlying in {"SPOT", "FUTURES_ASSET_TYPE_CRYPTO"}:
         return "crypto"
 
     ptype = str(product.get("product_type") or product.get("productType") or "").upper()
@@ -2531,6 +2600,15 @@ def market_category_for_asset(asset: dict[str, Any]) -> str:
     if kind == "commodity":
         return "commodity"
     return "crypto"
+
+
+def asset_matches_market_tab(asset: dict[str, Any], tab: str) -> bool:
+    tab = str(tab or "all").lower()
+    if tab == "all":
+        return str(asset.get("kind") or "").lower() != "fiat"
+    if tab == "crypto":
+        return market_category_for_asset(asset) == "crypto" and str(asset.get("kind") or "crypto").lower() == "crypto"
+    return market_category_for_asset(asset) == tab
 
 
 def market_volume(asset: dict[str, Any]) -> float:
@@ -2908,8 +2986,20 @@ def crypto_majors(limit: int = 10) -> list[dict[str, Any]]:
     return [market_row(sym, name, "crypto", product_id_for(sym)) for sym, name in FALLBACK_MAJORS[:limit]]
 
 
-def derivative_majors(limit: int = 200) -> list[dict[str, Any]]:
-    rows = fetch_typed_products("FUTURE", {"contract_expiry_type": "PERPETUAL"})
+def derivative_majors(limit: int = 400) -> list[dict[str, Any]]:
+    catalogs = (
+        fetch_typed_products("FUTURE", {"contract_expiry_type": "PERPETUAL"}),
+        fetch_typed_products("FUTURE", {"expiring_contract_status": "STATUS_UNEXPIRED"}),
+    )
+    rows: list[dict[str, Any]] = []
+    seen_products: set[str] = set()
+    for catalog in catalogs:
+        for product in catalog:
+            pid = str(product.get("product_id") or "")
+            if not pid or pid in seen_products:
+                continue
+            seen_products.add(pid)
+            rows.append(product)
     ranked = []
     for p in rows:
         pid = str(p.get("product_id") or "")
@@ -3459,7 +3549,7 @@ def merge_missing_market_categories(
     if not usable_snapshot(previous) or not previous.get("assets"):
         return assets
     out = [dict(row) for row in assets if isinstance(row, dict)]
-    limits = {"crypto": 120, "stock": 60, "commodity": 20, "index": 20, "preipo": 20}
+    limits = {"crypto": 250, "stock": 100, "commodity": 100, "index": 50, "preipo": 20}
     counts = {category: sum(market_category_for_asset(row) == category for row in out) for category in limits}
     seen = {
         (str(row.get("kind") or ""), str(row.get("productId") or row.get("id") or "").upper())
@@ -3650,14 +3740,8 @@ def assemble_snapshot(period: str, *, publish_loading: bool = False) -> dict[str
         assets = merge_watchlist(assets, token)
         enrich_with_products(assets)
         assets = tidy_assets(assets)
-        held_keys = {(a.get("kind"), str(a.get("id") or "").upper()) for a in assets}
         public_rows = merge_missing_market_categories(market_assets(), previous)
-        for row in public_rows:
-            key = (row.get("kind"), str(row.get("id") or "").upper())
-            if key in held_keys:
-                continue
-            assets.append(row)
-            held_keys.add(key)
+        append_missing_market_assets(assets, public_rows)
         enrich_yahoo_assets(assets)
         resolve_stock_holdings(assets)
         assets = dedupe_stock_assets(assets)
@@ -4056,10 +4140,10 @@ def cmd_rows(period: str | None = None, tab: str = "") -> None:
             targets = [a for a in assets if a.get("watchlist")]
             targets.sort(key=lambda row: (num(row.get("watchlistOrder"), 1e9), str(row.get("id") or "")))
         elif tab in MARKET_CATEGORIES:
-            targets = [a for a in assets if market_category_for_asset(a) == tab]
+            targets = [a for a in assets if asset_matches_market_tab(a, tab)]
             targets.sort(key=lambda row: (-market_volume(row), str(row.get("id") or "")))
         else:
-            targets = [a for a in assets if str(a.get("kind") or "") != "fiat"]
+            targets = [a for a in assets if asset_matches_market_tab(a, "all")]
             targets.sort(key=lambda row: (-market_volume(row), str(row.get("id") or "")))
         missing = [
             row

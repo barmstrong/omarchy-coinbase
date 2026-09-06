@@ -73,6 +73,19 @@ function marketCategory(row) {
   return "crypto"
 }
 
+function matchesMarketTab(row, tab) {
+  row = row || {}
+  tab = String(tab || "all").toLowerCase()
+  if (tab === "all") return String(row.kind || "").toLowerCase() !== "fiat"
+  if (tab === "crypto")
+    return marketCategory(row) === "crypto" && String(row.kind || "crypto").toLowerCase() === "crypto"
+  return marketCategory(row) === tab
+}
+
+function shouldDefaultToWatchlist(opened, userSelectedTab) {
+  return opened !== true || userSelectedTab !== true
+}
+
 function marketVolume(row) {
   row = row || {}
   var raw = row.volume24h
@@ -204,6 +217,8 @@ if (typeof module !== "undefined") {
     formatSignedUsd: formatSignedUsd,
     pnlColor: pnlColor,
     marketCategory: marketCategory,
+    matchesMarketTab: matchesMarketTab,
+    shouldDefaultToWatchlist: shouldDefaultToWatchlist,
     marketVolume: marketVolume,
     compareMarketVolume: compareMarketVolume,
     sparklineGeometry: sparklineGeometry,

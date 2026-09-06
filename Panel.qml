@@ -28,6 +28,7 @@ Item {
   property string clientSecretDraft: ""
   property int listCursor: -1
   property string marketTab: "all"
+  property bool marketTabUserSelected: false
   property bool hoverSelectEnabled: false
   property bool tabSynced: false
   property var detailAsset: null
@@ -183,7 +184,8 @@ Item {
     root.snapshotReady = true
     root.capturePortfolio(snapshot)
     if (root.signedIn && !wasSigned) {
-      root.marketTab = "watchlist"
+      if (Model.shouldDefaultToWatchlist(root.opened, root.marketTabUserSelected))
+        root.marketTab = "watchlist"
       root.tabSynced = true
       return true
     }
@@ -191,7 +193,7 @@ Item {
       root.resetSignedOutView()
       return true
     }
-    if (root.opened && !root.tabSynced) {
+    if (root.opened && !root.tabSynced && !root.marketTabUserSelected) {
       root.syncTabToPin()
       root.tabSynced = true
     }
@@ -200,6 +202,7 @@ Item {
 
   function resetSignedOutView() {
     root.marketTab = "all"
+    root.marketTabUserSelected = false
     root.tabSynced = true
     root.watchlistRefreshPending = false
     root.rowsRefreshPending = true
@@ -400,9 +403,7 @@ Item {
       if (!searching) {
         if (tab === "watchlist") {
           if (!a.watchlist) continue
-        } else if (tab === "all") {
-          if (String(a.kind || "") === "fiat") continue
-        } else if (Model.marketCategory(a) !== tab) continue
+        } else if (!Model.matchesMarketTab(a, tab)) continue
       }
       if (q && root.assetSearchScore(a, q) <= 0) continue
       out.push(a)
@@ -447,6 +448,7 @@ Item {
       root.applySnapshot(pending)
     }
     opened = true
+    marketTabUserSelected = false
     watchlistRefreshPending = true
     listCursor = 0
     hoverSelectEnabled = false
@@ -516,6 +518,8 @@ Item {
       }
     }
     var next = (current + delta + root.marketTabs.length) % root.marketTabs.length
+    root.marketTabUserSelected = true
+    root.tabSynced = true
     root.marketTab = root.marketTabs[next].value
     root.resetHoverSelect()
     if (flick) flick.contentY = 0
@@ -1702,6 +1706,8 @@ Item {
                       verticalPadding: Style.space(3)
                       focusable: false
                       onClicked: {
+                        root.marketTabUserSelected = true
+                        root.tabSynced = true
                         root.marketTab = modelData.value
                         root.resetHoverSelect()
                         if (flick) flick.contentY = 0
