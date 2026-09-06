@@ -1199,7 +1199,7 @@ Item {
         onActivated: root.moveListEdge(true)
       }
 
-      Keys.onEscapePressed: {
+      Keys.onEscapePressed: function(event) {
         if (root.showingDetail) {
           root.closeDetail()
           event.accepted = true
@@ -1595,7 +1595,7 @@ Item {
                       root.resetHoverSelect()
                       searchDebounce.restart()
                     }
-                    Keys.onEscapePressed: {
+                    Keys.onEscapePressed: function(event) {
                       text = ""
                       root.searchQuery = ""
                       keyCatcher.forceActiveFocus()
