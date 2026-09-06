@@ -76,6 +76,7 @@ Item {
         { value: "preipo", label: "Pre-IPO" }
       ]
   readonly property bool showingDetail: detailAsset !== null
+  readonly property bool detailIsCrypto: root.showingDetail && Model.marketCategory(root.detailAsset || {}) === "crypto"
   readonly property string period: String(snapshot.period || "day")
   readonly property var assets: snapshot.assets || []
   readonly property bool searching: String(searchQuery).replace(/^\s+|\s+$/g, "").length > 0
@@ -155,6 +156,18 @@ Item {
     var url = String(Qt.resolvedUrl(rel))
     if (url.indexOf("file://") === 0) url = decodeURIComponent(url.substring(7))
     return url
+  }
+
+  function formatDetailPrice(value) {
+    var price = Number(value)
+    return price > 0 ? Model.formatUsd(price, price >= 100 ? 2 : 4) : "—"
+  }
+
+  function detailRangeText() {
+    var low = Number(detailChart.low)
+    var high = Number(detailChart.high)
+    if (!(low > 0) || !(high > 0)) return "—"
+    return root.formatDetailPrice(low) + " – " + root.formatDetailPrice(high)
   }
 
   function receiveSnapshot(raw) {
@@ -1050,11 +1063,12 @@ Item {
       spacing: Style.space(2)
 
       Row {
+        id: assetRowContent
         width: parent.width
         spacing: Style.space(8)
 
         Column {
-          width: parent.width - Style.space(220)
+          width: parent.width - rowSparkline.width - rowPrice.width - assetRowContent.spacing * 2
           spacing: Style.space(1)
           Row {
             spacing: Style.space(6)
@@ -1084,6 +1098,7 @@ Item {
         }
 
         Sparkline {
+          id: rowSparkline
           width: Style.space(72)
           height: Style.space(28)
           compact: true
@@ -1098,16 +1113,19 @@ Item {
         }
 
         Column {
-          width: Style.space(80)
+          id: rowPrice
+          width: Style.space(92)
           Text {
-            anchors.right: parent.right
+            width: parent.width
+            horizontalAlignment: Text.AlignRight
             text: Number(modelData.price) > 0 ? Model.formatUsd(modelData.price, Number(modelData.price) >= 100 ? 2 : 4) : "—"
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
           }
           Text {
-            anchors.right: parent.right
+            width: parent.width
+            horizontalAlignment: Text.AlignRight
             text: isFinite(root.rowPeriodPercent(modelData)) ? Model.formatPercent(root.rowPeriodPercent(modelData)) : "—"
             color: root.rowPeriodColor(modelData)
             font.family: root.fontFamily
@@ -1780,7 +1798,7 @@ Item {
                   id: todaySection
                   width: parent.width
                   spacing: Style.space(8)
-                  visible: Number(detailChart.open) > 0 || Number(detailChart.high) > 0 || Number(detailChart.low) > 0 || Number(detailChart.volume) > 0
+                  visible: root.showingDetail
 
                   Item {
                     width: parent.width
@@ -1814,12 +1832,17 @@ Item {
                     rowSpacing: Style.space(8)
 
                     Repeater {
-                      model: [
-                        { label: "OPEN", value: Number(detailChart.open) > 0 ? Model.formatUsd(detailChart.open, Number(detailChart.open) >= 100 ? 2 : 4) : "—" },
-                        { label: "24H VOLUME", value: Number(detailChart.volume) > 0 ? Model.formatCompactUsd(detailChart.volume) : "—", accent: true },
-                        { label: "24H HIGH", value: Number(detailChart.high) > 0 ? Model.formatUsd(detailChart.high, Number(detailChart.high) >= 100 ? 2 : 4) : "—" },
-                        { label: "24H LOW", value: Number(detailChart.low) > 0 ? Model.formatUsd(detailChart.low, Number(detailChart.low) >= 100 ? 2 : 4) : "—" }
-                      ]
+                      model: root.detailIsCrypto
+                        ? [
+                            { label: "24H RANGE", value: root.detailRangeText() },
+                            { label: "24H VOLUME", value: Number(detailChart.volume) > 0 ? Model.formatCompactUsd(detailChart.volume) : "—", accent: true }
+                          ]
+                        : [
+                            { label: "OPEN", value: root.formatDetailPrice(detailChart.open) },
+                            { label: "CLOSE", value: root.formatDetailPrice(detailChart.close) },
+                            { label: "24H RANGE", value: root.detailRangeText() },
+                            { label: "24H VOLUME", value: Number(detailChart.volume) > 0 ? Model.formatCompactUsd(detailChart.volume) : "—", accent: true }
+                          ]
                       DetailMetricCard {}
                     }
                   }

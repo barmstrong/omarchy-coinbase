@@ -93,7 +93,7 @@ DETAIL_CACHE_STALE_SECONDS = 7 * 86400
 DETAIL_CACHE_LIMIT = 96
 DETAIL_METADATA_TTL = 6 * 3600
 DETAIL_METADATA_LIMIT = 64
-DETAIL_CACHE_VERSION = 4
+DETAIL_CACHE_VERSION = 5
 BAR_DISPLAY_MODES = ("full", "quote", "price")
 MARKET_CATEGORIES = frozenset({"crypto", "stock", "commodity", "index", "preipo"})
 YAHOO_UA = "Mozilla/5.0"
@@ -1053,7 +1053,18 @@ def _add_stat(stats: list[dict[str, str]], label: str, value: str) -> None:
 def yahoo_chart_bundle(symbol: str, period: str) -> dict[str, Any]:
     symbol = str(symbol or "").strip().upper()
     spec = YAHOO_RANGES.get(period) or YAHOO_RANGES["day"]
-    empty: dict[str, Any] = {"candles": [], "meta": {}, "price": 0, "name": symbol, "changePercent": 0}
+    empty: dict[str, Any] = {
+        "candles": [],
+        "meta": {},
+        "price": 0,
+        "name": symbol,
+        "changePercent": 0,
+        "open": 0,
+        "close": 0,
+        "high": 0,
+        "low": 0,
+        "volume": 0,
+    }
     if not symbol:
         return empty
     url = (
@@ -1078,6 +1089,8 @@ def yahoo_chart_bundle(symbol: str, period: str) -> dict[str, Any]:
         parsed = fetch_yahoo_candles(symbol, period)
     quote = _quote_from_yahoo_meta(meta, closes, symbol)
     share_volume = num(meta.get("regularMarketVolume"))
+    market_state = str(meta.get("marketState") or "").strip().upper()
+    session_close = quote["price"] if market_state in {"CLOSED", "POST", "POSTPOST"} else 0
     return {
         "candles": parsed,
         "meta": meta,
@@ -1085,6 +1098,7 @@ def yahoo_chart_bundle(symbol: str, period: str) -> dict[str, Any]:
         "name": quote["name"],
         "changePercent": quote["changePercent"],
         "open": num(meta.get("regularMarketOpen") or meta.get("chartPreviousClose")),
+        "close": session_close,
         "high": num(meta.get("regularMarketDayHigh")),
         "low": num(meta.get("regularMarketDayLow")),
         "volume": share_volume * quote["price"] if share_volume and quote["price"] else 0,
@@ -1201,11 +1215,13 @@ def asset_stats(
     gecko = gecko or {}
     stats: list[dict[str, str]] = []
     open_px = num(yahoo.get("open") or product.get("open_24h"))
+    close_px = num(yahoo.get("close"))
     high = num(yahoo.get("high") or gecko.get("high24") or product.get("high_24h"))
     low = num(yahoo.get("low") or gecko.get("low24") or product.get("low_24h"))
     volume = num(yahoo.get("volume") or gecko.get("volume") or product.get("approximate_quote_24h_volume"))
     base = {
         "open": open_px,
+        "close": close_px,
         "high": high,
         "low": low,
         "volume": volume,
@@ -4177,6 +4193,7 @@ def build_chart_data(product_id: str, symbol_out: str, kind_out: str, period: st
         "url": trades["url"],
         "period": period,
         "open": ohlc.get("open") or 0,
+        "close": ohlc.get("close") or 0,
         "high": ohlc.get("high") or 0,
         "low": ohlc.get("low") or 0,
         "volume": ohlc.get("volume") or 0,

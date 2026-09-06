@@ -136,6 +136,7 @@ class ReliabilityTests(unittest.TestCase):
                             "symbol": "SPY",
                             "regularMarketPrice": 500,
                             "regularMarketVolume": 20_000_000,
+                            "marketState": "CLOSED",
                         },
                         "timestamp": [1, 2],
                         "indicators": {"quote": [{"close": [499, 500]}]},
@@ -148,6 +149,32 @@ class ReliabilityTests(unittest.TestCase):
 
         self.assertEqual(detail["shareVolume"], 20_000_000)
         self.assertEqual(detail["volume"], 10_000_000_000)
+        self.assertEqual(detail["close"], 500)
+
+    def test_stock_detail_close_is_na_until_regular_session_closes(self):
+        helper = load_helper()
+
+        def payload(state):
+            return {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {
+                                "symbol": "SPY",
+                                "regularMarketPrice": 500,
+                                "marketState": state,
+                            },
+                            "timestamp": [1, 2],
+                            "indicators": {"quote": [{"close": [499, 500]}]},
+                        }
+                    ]
+                }
+            }
+
+        helper.yahoo_get = lambda _url: payload("REGULAR")
+        self.assertEqual(helper.yahoo_chart_bundle("SPY", "day")["close"], 0)
+        helper.yahoo_get = lambda _url: payload("POST")
+        self.assertEqual(helper.yahoo_chart_bundle("SPY", "day")["close"], 500)
 
     def test_sparse_fcm_candles_fall_back_to_coarser_history(self):
         helper = load_helper()

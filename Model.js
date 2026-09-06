@@ -196,7 +196,7 @@ function detailCacheKey(row, period) {
 
 function cachedDetail(cache, row, period) {
   if (!cache || typeof cache !== "object" || !row) return {}
-  if (Number(cache.version || 0) !== 4) return {}
+  if (Number(cache.version || 0) !== 5) return {}
   var entries = cache.entries
   if (!entries || typeof entries !== "object") return {}
   var entry = entries[detailCacheKey(row, period)]
