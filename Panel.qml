@@ -832,6 +832,10 @@ Item {
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: {
+      // Row charts are fetched lazily for the active tab. Unlike a general
+      // background snapshot, this update must be visible while the panel is
+      // open or the requested sparklines remain deferred until the next open.
+      root.acceptSnapshotReload = true
       snapshotFile.reload()
       if (root.rowsRefreshPending)
         Qt.callLater(function() { root.refreshRows(true) })
