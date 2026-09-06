@@ -10,7 +10,8 @@ The panel includes:
 - Synchronized 1H, 1D, 1W, 1M, 1Y, and all-time charts and sparklines
 - Asset detail pages, search, market statistics, and links to Coinbase.com
 - Full keyboard navigation: arrows move through rows and tabs, Enter opens an
-  asset, Escape goes back or closes, and `/` focuses search
+  asset, Escape goes back or closes, `/` focuses search, and `P` pins the
+  current asset while signed out
 - Three bar display modes; right-click cycles full, balance-only, and icon-only
 - A read-only Coinbase watchlist refresh while the panel is open
 - Cache-first rendering that keeps the last complete view visible while market

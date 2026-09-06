@@ -457,6 +457,7 @@ Item {
   }
 
   function focusSearch() {
+    if (root.showingDetail) return
     searchField.forceActiveFocus()
     searchField.selectAll()
     if (listCursor < 0 && visibleAssets.length > 0) listCursor = 0
@@ -575,9 +576,15 @@ Item {
   function openDetail(row) {
     if (!row) return
     root.detailAsset = row
+    searchDebounce.stop()
+    if (searchProc.running) searchProc.running = false
     root.searchQuery = ""
+    root.searchResults = []
     if (searchField) searchField.text = ""
     root.loadDetailChart(row)
+    Qt.callLater(function() {
+      if (root.showingDetail && keyCatcher) keyCatcher.forceActiveFocus()
+    })
   }
 
   function loadDetailChart(row, periodOverride) {
@@ -674,8 +681,9 @@ Item {
   function signIn() {
     if (root.signingIn) return
     signingIn = true
-    loginStatus = "Opening Coinbase…"
+    loginStatus = ""
     Quickshell.execDetached([pluginFile("bin/coinbase"), "login"])
+    root.dismiss()
   }
 
   function saveAndSignIn() {
@@ -921,6 +929,7 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        if (root.showingDetail || !root.searching) return
         var rows = Model.parseSearch(text)
         var seen = {}
         var vis = root.visibleAssets || []
@@ -941,6 +950,7 @@ Item {
     id: searchDebounce
     interval: 280
     onTriggered: {
+      if (root.showingDetail) return
       var q = String(root.searchQuery || "").replace(/^\s+|\s+$/g, "")
       if (q.length < 2) {
         root.searchResults = []
@@ -1129,10 +1139,16 @@ Item {
       anchors.fill: parent
       focus: true
       Shortcut {
-        enabled: root.opened && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
         sequence: "/"
         context: Qt.WindowShortcut
         onActivated: root.focusSearch()
+      }
+      Shortcut {
+        enabled: root.opened && root.showingDetail && !root.signedIn && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
+        sequence: "P"
+        context: Qt.WindowShortcut
+        onActivated: root.pinToBar(root.detailAsset)
       }
       Shortcut {
         enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
@@ -1198,7 +1214,7 @@ Item {
             return
           }
         }
-        if ((event.key === Qt.Key_Slash || event.text === "/") && !typing) {
+        if ((event.key === Qt.Key_Slash || event.text === "/") && !typing && !root.showingDetail) {
           root.focusSearch()
           event.accepted = true
           return
@@ -1426,7 +1442,7 @@ Item {
           }
 
           Text {
-            visible: !root.signedIn && root.loginStatus !== ""
+            visible: !root.signedIn && !root.signingIn && root.loginStatus !== ""
             width: parent.width
             horizontalAlignment: Text.AlignRight
             wrapMode: Text.WordWrap
@@ -1563,12 +1579,18 @@ Item {
                   TextField {
                     id: searchField
                     width: parent.width
+                    enabled: !root.showingDetail
                     placeholderText: "Search"
                     foreground: root.foreground
                     font.family: root.fontFamily
                     rightPadding: Style.space(88)
                     text: root.searchQuery
                     onTextChanged: {
+                      if (root.showingDetail) {
+                        if (text !== "") text = ""
+                        root.searchQuery = ""
+                        return
+                      }
                       root.searchQuery = text
                       root.resetHoverSelect()
                       searchDebounce.restart()
