@@ -40,13 +40,15 @@ class LogoutTests(unittest.TestCase):
 
             full_snapshot_started = False
 
-            def fake_build_snapshot(period):
+            def fake_build_snapshot(period, *, publish_loading=False):
                 nonlocal full_snapshot_started
                 full_snapshot_started = True
+                self.assertTrue(publish_loading)
                 self.assertEqual(period, "week")
                 snapshot = json.loads(helper.SNAPSHOT_FILE.read_text(encoding="utf-8"))
-                self.assertFalse(snapshot["authenticated"])
-                self.assertEqual([row["id"] for row in snapshot["assets"]], ["BTC"])
+                self.assertTrue(snapshot["authenticated"])
+                self.assertTrue(snapshot["loading"])
+                self.assertEqual(snapshot["assets"], [])
                 self.assertEqual(snapshot["period"], "week")
                 status = json.loads(helper.LOGIN_STATUS_FILE.read_text(encoding="utf-8"))
                 self.assertEqual(status["status"], "snapshot")
@@ -77,6 +79,52 @@ class LogoutTests(unittest.TestCase):
             self.assertEqual(snapshot["total"], 250)
             status = json.loads(helper.LOGIN_STATUS_FILE.read_text(encoding="utf-8"))
             self.assertEqual(status["status"], "done")
+
+    def test_login_publishes_balance_before_slow_enrichment(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            helper.STATE_DIR = state
+            helper.SNAPSHOT_FILE = state / "snapshot.json"
+            helper.MARKET_SNAPSHOT_FILE = state / "market-snapshot.json"
+            helper.WATCHLIST_FILE = state / "watchlist.json"
+            helper.LOGIN_STATUS_FILE = state / "login-status.json"
+            helper.PREFS_FILE = state / "prefs.json"
+            helper.BROKER_URL_FILE = state / "broker.url"
+            helper.BROKER_URL_FILE.write_text("https://broker.example\n", encoding="utf-8")
+            helper.valid_access_token = lambda: "token"
+            helper.token_is_current = lambda _token: True
+            helper.fetch_user = lambda _token: {"name": "Test"}
+            holding = {"id": "BTC", "kind": "crypto", "value": 250, "held": True}
+            helper.fetch_breakdown = lambda _token: ([holding], 250)
+
+            def observe_loading(assets, _token):
+                loading = json.loads(helper.SNAPSHOT_FILE.read_text(encoding="utf-8"))
+                self.assertTrue(loading["authenticated"])
+                self.assertTrue(loading["loading"])
+                self.assertEqual(loading["total"], 250)
+                self.assertEqual(loading["user"], {})
+                return assets
+
+            helper.merge_watchlist = observe_loading
+            helper.enrich_with_products = lambda _assets: None
+            helper.tidy_assets = lambda assets: assets
+            helper.market_assets = lambda: []
+            helper.merge_missing_market_categories = lambda rows, _previous: rows
+            helper.enrich_yahoo_assets = lambda _assets: None
+            helper.resolve_stock_holdings = lambda _assets: None
+            helper.dedupe_stock_assets = lambda assets: assets
+            helper.restore_row_spark_cache = lambda _assets, _previous: None
+            helper.activate_cached_row_sparks = lambda _assets, _period: None
+            helper.apply_period_pnl = lambda _assets, _period: ([200, 250], 50, 25)
+            helper.fill_crypto_row_sparks = lambda _assets, _period: None
+            helper.refresh_products_cache = lambda: None
+
+            result = helper.assemble_snapshot("day", publish_loading=True)
+
+            self.assertFalse(result.get("loading", False))
+            self.assertEqual(result["total"], 250)
+            self.assertEqual(result["user"]["name"], "Test")
 
     def test_logout_clears_private_snapshot_before_network_work(self):
         helper = load_helper()

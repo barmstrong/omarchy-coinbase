@@ -58,7 +58,7 @@ Item {
   ]
   readonly property var marketTabs: root.signedIn
     ? [
-        { value: "watchlist", label: "Watchlist" },
+        { value: "watchlist", label: "Advanced" },
         { value: "crypto", label: "Crypto" },
         { value: "stock", label: "Stocks" },
         { value: "derivative", label: "Perps" }
@@ -1806,7 +1806,7 @@ Item {
 
                   Text {
                     visible: root.snapshotReady && !root.authLoading && root.visibleAssets.length === 0
-                    text: root.marketTab === "watchlist" ? "Nothing on your Coinbase watchlist." : "Nothing in this tab yet."
+                    text: root.marketTab === "watchlist" ? "Nothing on your Advanced Trade watchlist." : "Nothing in this tab yet."
                     color: root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall

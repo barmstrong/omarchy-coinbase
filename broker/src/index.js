@@ -110,16 +110,18 @@ async function start(env, url) {
   const id = b64url(crypto.getRandomValues(new Uint8Array(32)));
   const { verifier, challenge } = await pkce();
   const redirectUri = `${url.origin}/oauth/callback`;
-  await env.SESSIONS.put(
-    `oauth-state:${state}`,
-    JSON.stringify({ status: "pending", verifier, sessionId: id, redirectUri, createdAt: Date.now() }),
-    { expirationTtl: SESSION_TTL },
-  );
-  await env.SESSIONS.put(
-    `oauth-session:${id}`,
-    JSON.stringify({ status: "pending", createdAt: Date.now() }),
-    { expirationTtl: SESSION_TTL },
-  );
+  await Promise.all([
+    env.SESSIONS.put(
+      `oauth-state:${state}`,
+      JSON.stringify({ status: "pending", verifier, sessionId: id, redirectUri, createdAt: Date.now() }),
+      { expirationTtl: SESSION_TTL },
+    ),
+    env.SESSIONS.put(
+      `oauth-session:${id}`,
+      JSON.stringify({ status: "pending", createdAt: Date.now() }),
+      { expirationTtl: SESSION_TTL },
+    ),
+  ]);
   const authorize = new URL(AUTH_URL);
   authorize.searchParams.set("response_type", "code");
   authorize.searchParams.set("client_id", env.COINBASE_CLIENT_ID);

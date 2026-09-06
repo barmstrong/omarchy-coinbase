@@ -12,10 +12,13 @@ BarWidget {
   property var snapshot: ({})
   property bool refreshing: false
   property string lastSnapshotRaw: ""
+  property string loginPhase: ""
 
   readonly property int refreshSeconds: Math.max(15, parseInt(setting("refreshSeconds", 60), 10) || 60)
   readonly property bool signedIn: snapshot.authenticated === true
-  readonly property bool authLoading: root.signedIn && snapshot.loading === true
+  readonly property bool authLoading: root.loginPhase === "exchanging"
+    || root.loginPhase === "snapshot"
+    || (root.signedIn && snapshot.loading === true)
   readonly property var barPnl: snapshot.bar || ({})
   readonly property string tickerText: String(barPnl.symbol || "BTC").toUpperCase()
   readonly property real quotePrice: Number(signedIn ? snapshot.total : barPnl.price)
@@ -30,14 +33,14 @@ BarWidget {
     if (mode === "quote" || mode === "price") return mode
     return "full"
   }
-  readonly property bool showTicker: !signedIn && barDisplay !== "price"
-  readonly property bool showPrice: hasQuote && (!signedIn || barDisplay !== "price")
+  readonly property bool showTicker: !signedIn && !authLoading && barDisplay !== "price"
+  readonly property bool showPrice: hasQuote && (!authLoading || signedIn) && (!signedIn || barDisplay !== "price")
   readonly property bool showPnl: !authLoading && hasQuote && barDisplay === "full" && isFinite(pnlPercent)
-  readonly property string chipText: signedIn
-    ? (authLoading
-        ? (hasQuote && barDisplay !== "price" ? totalText : "CB")
-        : (hasQuote ? (barDisplay === "full" ? (totalText + "  " + pnlText) : (barDisplay === "quote" ? totalText : "CB")) : "CB"))
-    : (hasQuote ? (barDisplay === "price" ? totalText : (barDisplay === "quote" ? (tickerText + "  " + totalText) : (tickerText + "  " + totalText + "  " + pnlText))) : tickerText)
+  readonly property string chipText: authLoading
+    ? (signedIn && hasQuote && barDisplay !== "price" ? totalText : "CB")
+    : (signedIn
+      ? (hasQuote ? (barDisplay === "full" ? (totalText + "  " + pnlText) : (barDisplay === "quote" ? totalText : "CB")) : "CB")
+      : (hasQuote ? (barDisplay === "price" ? totalText : (barDisplay === "quote" ? (tickerText + "  " + totalText) : (tickerText + "  " + totalText + "  " + pnlText))) : tickerText))
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -89,6 +92,22 @@ BarWidget {
     printErrors: false
     onFileChanged: reload()
     onLoaded: root.applySnapshot(text())
+  }
+
+  FileView {
+    id: loginStatusFile
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/coinbase/login-status.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var data = {}
+      try { data = JSON.parse(text() || "{}") } catch (e) { data = {} }
+      var status = String(data.status || "")
+      var changedAt = Date.parse(String(data.at || ""))
+      var recent = isFinite(changedAt) && Date.now() - changedAt < 5 * 60 * 1000
+      root.loginPhase = recent && (status === "exchanging" || status === "snapshot") ? status : ""
+    }
   }
 
   Process {
@@ -169,11 +188,28 @@ BarWidget {
       spacing: Style.space(8)
 
       CoinbaseIcon {
-        visible: root.signedIn
+        visible: root.signedIn || root.authLoading
         anchors.verticalCenter: parent.verticalCenter
         iconSize: Style.bar.iconCanvas
         color: button.foreground
         opacity: 1
+      }
+
+      Text {
+        visible: root.authLoading
+        anchors.verticalCenter: parent.verticalCenter
+        text: "󰦖"
+        color: button.foreground
+        font.family: button.fontFamily
+        font.pixelSize: button.fontSize
+
+        RotationAnimator on rotation {
+          running: root.authLoading
+          from: 0
+          to: 360
+          duration: 800
+          loops: Animation.Infinite
+        }
       }
 
       Text {

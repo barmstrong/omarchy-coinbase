@@ -155,6 +155,51 @@ class ReliabilityTests(unittest.TestCase):
 
             self.assertEqual(json.loads(output.getvalue())["assets"][0]["id"], "BTC")
 
+    def test_loading_portfolio_stops_spinning_on_auth_failure(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            helper.write_snapshot(helper.portfolio_loading_snapshot("day", total=250))
+
+            def fail_auth():
+                raise RuntimeError("refresh unavailable")
+
+            helper.valid_access_token = fail_auth
+            result = helper.assemble_snapshot("day")
+
+            self.assertTrue(result["authenticated"])
+            self.assertNotIn("loading", result)
+            self.assertEqual(result["total"], 250)
+            self.assertEqual(result["error"], "refresh unavailable")
+
+    def test_advanced_watchlist_uses_supported_product_flags_in_api_order(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            products = {
+                "SPOT": [{"product_id": "BTC-USD"}, {"product_id": "ETH-USD"}],
+                "EQUITY": [{"product_id": "COIN-USD"}],
+                "FUTURE": [{"product_id": "BTC-PERP"}],
+            }
+            helper.fetch_auth_products = lambda _token, product_type, _extra: products[product_type]
+            helper.slim_watch_entry = lambda product: {
+                "id": product["product_id"],
+                "kind": "test",
+                "productId": product["product_id"],
+            }
+
+            result = helper.fetch_advanced_watchlist("token", force=True)
+
+            self.assertEqual(
+                [row["id"] for row in result],
+                ["BTC-USD", "ETH-USD", "COIN-USD", "BTC-PERP"],
+            )
+            cached = json.loads(helper.WATCHLIST_FILE.read_text(encoding="utf-8"))
+            self.assertEqual(cached["advanced"], result)
+            self.assertNotIn("coinbase", cached)
+
     def test_market_publish_updates_offline_cache_before_live_snapshot(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

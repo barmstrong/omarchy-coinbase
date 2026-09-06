@@ -552,8 +552,8 @@ def load_watchlist_state() -> dict[str, Any]:
 
 def save_watchlist_state(**updates: Any) -> None:
     data = load_watchlist_state()
-    data.pop("products", None)
-    data.pop("hiddenProducts", None)
+    for legacy_key in ("products", "hiddenProducts", "coinbase", "coinbaseAt"):
+        data.pop(legacy_key, None)
     data.update(updates)
     write_json(WATCHLIST_FILE, data)
 
@@ -1510,12 +1510,22 @@ def _finish_login(payload: dict[str, Any]) -> None:
     period = str(load_prefs().get("period") or "day")
     if period not in PERIODS:
         period = "day"
-    # Keep showing the last complete public snapshot while the portfolio is
-    # assembled. The UI switches modes once, when the complete authenticated
-    # snapshot is atomically published.
+    previous = read_json(SNAPSHOT_FILE, {})
+    previous_portfolio = previous if usable_snapshot(previous, authenticated=True) else {}
+    # Acknowledge the completed authorization before any Coinbase portfolio
+    # requests. The bar can show its spinner immediately, retaining a prior
+    # portfolio total only when it is already safe and available locally.
+    write_snapshot(
+        portfolio_loading_snapshot(
+            period,
+            user=previous_portfolio.get("user"),
+            assets=previous_portfolio.get("assets"),
+            total=num(previous_portfolio.get("total")),
+        )
+    )
     write_login_status("snapshot")
     print("STATUS snapshot", flush=True)
-    build_snapshot(period)
+    build_snapshot(period, publish_loading=True)
     write_login_status("done")
     print("ok", flush=True)
 
@@ -2559,104 +2569,51 @@ def slim_watch_entry(product: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def parse_watchlist_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    raw = payload.get("products") or payload.get("watchlist") or payload.get("items") or []
-    if isinstance(payload.get("product_ids"), list) and not raw:
-        raw = payload.get("product_ids") or []
-    if isinstance(raw, dict):
-        raw = raw.get("products") or raw.get("items") or []
-    entries: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in raw:
-        if isinstance(item, str):
-            pid = item.strip()
-            if not pid:
-                continue
-            product = {"product_id": pid, "product_type": "SPOT" if "-" in pid else "EQUITY"}
-            entry = slim_watch_entry(product)
-        elif isinstance(item, dict):
-            if item.get("watched") is False:
-                continue
-            if item.get("product_id") or item.get("equity_product_details"):
-                entry = slim_watch_entry(item)
-            else:
-                pid = str(item.get("productId") or item.get("product_id") or item.get("id") or "").strip()
-                symbol = str(item.get("symbol") or item.get("ticker") or item.get("id") or pid.split("-")[0]).upper()
-                kind = str(item.get("kind") or ("stock" if item.get("ticker") else "crypto"))
-                entry = {
-                    "id": symbol,
-                    "name": str(item.get("name") or symbol),
-                    "kind": kind,
-                    "productId": pid or product_id_for(symbol),
-                }
-        else:
-            continue
-        if not entry:
-            continue
-        key = f"{entry.get('kind')}:{entry.get('id')}"
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append(entry)
-    return entries
-
-
-def fetch_coinbase_watchlist(token: str, *, force: bool = False) -> list[dict[str, Any]]:
+def fetch_advanced_watchlist(token: str, *, force: bool = False) -> list[dict[str, Any]]:
     state = load_watchlist_state()
-    cached = state.get("coinbase")
-    cached_at = num(state.get("coinbaseAt"))
+    cached = state.get("advanced")
+    cached_at = num(state.get("advancedAt"))
+    if not isinstance(cached, list):
+        cached = state.get("coinbase")
+        cached_at = num(state.get("coinbaseAt"))
     if not force and isinstance(cached, list) and cached and time.time() - cached_at < WATCHLIST_TTL:
         return [row for row in cached if isinstance(row, dict)]
 
     entries: list[dict[str, Any]] = []
-    try:
-        payload = http_json(
-            "GET",
-            API + "/api/v3/brokerage/watchlist",
-            headers={"Authorization": f"Bearer {token}"},
-            allow_statuses=(401, 403, 404, 422),
-        )
-        status = int(payload.get("_http_status") or 200)
-        if status == 200:
-            entries = parse_watchlist_payload(payload)
-    except RuntimeError:
-        entries = []
-
-    api_ok = bool(entries)
-    if not entries:
-        jobs = (
-            ("SPOT", None),
-            ("EQUITY", None),
-            ("FUTURE", {"contract_expiry_type": "PERPETUAL"}),
-        )
-        fetched: dict[str, list[dict[str, Any]]] = {}
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futs = {pool.submit(fetch_auth_products, token, ptype, extra): ptype for ptype, extra in jobs}
-            for fut in as_completed(futs):
-                ptype = futs[fut]
-                try:
-                    result = fut.result()
-                except Exception:  # noqa: BLE001
-                    result = None
-                if result is None:
-                    fetched[ptype] = []
-                else:
-                    fetched[ptype] = result
-                    api_ok = True
-        seen: set[str] = set()
-        for ptype, _extra in jobs:
-            for product in fetched.get(ptype) or []:
-                entry = slim_watch_entry(product)
-                if not entry:
-                    continue
-                key = f"{entry.get('kind')}:{entry.get('id')}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                entries.append(entry)
+    api_ok = False
+    jobs = (
+        ("SPOT", None),
+        ("EQUITY", None),
+        ("FUTURE", {"contract_expiry_type": "PERPETUAL"}),
+    )
+    fetched: dict[str, list[dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = {pool.submit(fetch_auth_products, token, ptype, extra): ptype for ptype, extra in jobs}
+        for fut in as_completed(futs):
+            ptype = futs[fut]
+            try:
+                result = fut.result()
+            except Exception:  # noqa: BLE001
+                result = None
+            if result is None:
+                fetched[ptype] = []
+            else:
+                fetched[ptype] = result
+                api_ok = True
+    seen: set[str] = set()
+    for ptype, _extra in jobs:
+        for product in fetched.get(ptype) or []:
+            entry = slim_watch_entry(product)
+            if not entry:
+                continue
+            key = f"{entry.get('kind')}:{entry.get('id')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(entry)
 
     if api_ok:
-        save_watchlist_state(coinbase=entries, coinbaseAt=int(time.time()))
+        save_watchlist_state(advanced=entries, advancedAt=int(time.time()))
         return entries
     if isinstance(cached, list) and cached:
         return [row for row in cached if isinstance(row, dict)]
@@ -2730,7 +2687,7 @@ def merge_watchlist_entries(
 
 
 def merge_watchlist(assets: list[dict[str, Any]], token: str = "") -> list[dict[str, Any]]:
-    entries = fetch_coinbase_watchlist(token) if token else []
+    entries = fetch_advanced_watchlist(token) if token else []
     return merge_watchlist_entries(assets, entries)
 
 
@@ -3509,13 +3466,13 @@ def tidy_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
-def build_snapshot(period: str) -> dict[str, Any]:
+def build_snapshot(period: str, *, publish_loading: bool = False) -> dict[str, Any]:
     period = period if period in PERIODS else "day"
     with snapshot_lock():
-        return assemble_snapshot(period)
+        return assemble_snapshot(period, publish_loading=publish_loading)
 
 
-def assemble_snapshot(period: str) -> dict[str, Any]:
+def assemble_snapshot(period: str, *, publish_loading: bool = False) -> dict[str, Any]:
     previous = read_json(SNAPSHOT_FILE, {})
     update_prefs(period=period)
 
@@ -3526,6 +3483,12 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
         if message not in {"needsSetup", "not signed in"} and usable_snapshot(previous, authenticated=True):
             # Refresh-token and network failures must never replace a complete
             # portfolio with a signed-out or empty view.
+            if previous.get("loading"):
+                previous = dict(previous)
+                previous.pop("loading", None)
+                previous["error"] = message
+                previous["fetchedAt"] = now_iso()
+                write_snapshot(previous)
             return previous
         public_error = "" if message in {"needsSetup", "not signed in"} else message
         try:
@@ -3543,14 +3506,19 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
             return snap
 
     try:
-        user = fetch_user(token)
-        try:
-            assets, total = fetch_breakdown(token)
-        except RuntimeError:
-            assets = fetch_v2_accounts(token)
-            total = sum(num(a.get("value")) for a in assets)
-        if not token_is_current(token):
-            return market_snapshot(period)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            user_future = pool.submit(fetch_user, token)
+            breakdown_future = pool.submit(fetch_breakdown, token)
+            try:
+                assets, total = breakdown_future.result()
+            except RuntimeError:
+                assets = fetch_v2_accounts(token)
+                total = sum(num(a.get("value")) for a in assets)
+            if not token_is_current(token):
+                return market_snapshot(period)
+            if publish_loading:
+                write_snapshot(portfolio_loading_snapshot(period, assets=assets, total=total))
+            user = user_future.result()
         assets = merge_watchlist(assets, token)
         enrich_with_products(assets)
         assets = tidy_assets(assets)
@@ -3618,6 +3586,7 @@ def assemble_snapshot(period: str) -> dict[str, Any]:
         # Keep last-good numbers if we already had a snapshot.
         previous = read_json(SNAPSHOT_FILE, {})
         if isinstance(previous, dict) and previous.get("authenticated"):
+            previous.pop("loading", None)
             previous["error"] = str(exc)
             previous["fetchedAt"] = now_iso()
             write_snapshot(previous)
@@ -3981,7 +3950,7 @@ def cmd_watchlist_refresh() -> None:
             print(json.dumps(snap))
             return
         assets = [dict(a) for a in (snap.get("assets") or []) if isinstance(a, dict)]
-        entries = fetch_coinbase_watchlist(token, force=True)
+        entries = fetch_advanced_watchlist(token, force=True)
         snap["assets"] = merge_watchlist_entries(assets, entries)
         write_snapshot(snap)
     print(json.dumps(snap))
