@@ -1136,6 +1136,44 @@ Item {
     }
   }
 
+  component DetailMetricCard: Rectangle {
+    id: metricCard
+    required property var modelData
+
+    width: parent ? (parent.width - Style.space(8)) / 2 : 0
+    height: Style.space(62)
+    radius: Style.cornerRadius
+    color: Util.alpha(root.foreground, 0.035)
+    border.width: Math.max(1, Style.normalBorderWidth)
+    border.color: Util.alpha(root.foreground, 0.09)
+
+    Column {
+      anchors.fill: parent
+      anchors.margins: Style.space(10)
+      spacing: Style.space(3)
+
+      Text {
+        width: parent.width
+        text: String(metricCard.modelData.label || "")
+        color: root.muted
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 1
+        elide: Text.ElideRight
+      }
+
+      Text {
+        width: parent.width
+        text: String(metricCard.modelData.value || "—")
+        color: metricCard.modelData.accent ? Color.accent : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
+        elide: Text.ElideRight
+      }
+    }
+  }
+
   PanelWindow {
     id: window
     visible: root.opened
@@ -1736,76 +1774,97 @@ Item {
               Column {
                 id: detailBlock
                 width: detailFlick.width
-                spacing: Style.space(14)
+                spacing: Style.space(16)
 
-                Row {
+                Column {
+                  id: todaySection
                   width: parent.width
-                  spacing: Style.space(16)
+                  spacing: Style.space(8)
                   visible: Number(detailChart.open) > 0 || Number(detailChart.high) > 0 || Number(detailChart.low) > 0 || Number(detailChart.volume) > 0
 
-                  Repeater {
-                    model: [
-                      { label: "OPEN", value: Number(detailChart.open) > 0 ? Model.formatUsd(detailChart.open, Number(detailChart.open) >= 100 ? 2 : 4) : "—" },
-                      { label: "HIGH", value: Number(detailChart.high) > 0 ? Model.formatUsd(detailChart.high, Number(detailChart.high) >= 100 ? 2 : 4) : "—" },
-                      { label: "LOW", value: Number(detailChart.low) > 0 ? Model.formatUsd(detailChart.low, Number(detailChart.low) >= 100 ? 2 : 4) : "—" },
-                      {
-                        label: "24H VOL",
-                        value: Number(detailChart.volume) > 0
-                          ? (["stock", "commodity"].indexOf(String(detailChart.kind || "")) !== -1
-                              ? Model.formatCompactNumber(detailChart.volume)
-                              : Model.formatCompactUsd(detailChart.volume))
-                          : "—"
-                      }
-                    ]
-                    Column {
-                      required property var modelData
-                      width: (detailBlock.width - Style.space(48)) / 4
-                      spacing: Style.space(4)
-                      Text {
-                        text: modelData.label
-                        color: root.muted
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.letterSpacing: 1
-                      }
-                      Text {
-                        text: modelData.value
-                        color: root.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.title
-                      }
+                  Item {
+                    width: parent.width
+                    height: todayLabel.implicitHeight
+
+                    Text {
+                      id: todayLabel
+                      anchors.left: parent.left
+                      text: "TODAY"
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      font.letterSpacing: 1.2
+                    }
+
+                    Rectangle {
+                      anchors.left: todayLabel.right
+                      anchors.leftMargin: Style.space(8)
+                      anchors.right: parent.right
+                      anchors.verticalCenter: todayLabel.verticalCenter
+                      height: Math.max(1, Style.normalBorderWidth)
+                      color: Util.alpha(root.foreground, 0.1)
+                    }
+                  }
+
+                  Grid {
+                    width: parent.width
+                    columns: 2
+                    columnSpacing: Style.space(8)
+                    rowSpacing: Style.space(8)
+
+                    Repeater {
+                      model: [
+                        { label: "OPEN", value: Number(detailChart.open) > 0 ? Model.formatUsd(detailChart.open, Number(detailChart.open) >= 100 ? 2 : 4) : "—" },
+                        { label: "24H VOLUME", value: Number(detailChart.volume) > 0 ? Model.formatCompactUsd(detailChart.volume) : "—", accent: true },
+                        { label: "24H HIGH", value: Number(detailChart.high) > 0 ? Model.formatUsd(detailChart.high, Number(detailChart.high) >= 100 ? 2 : 4) : "—" },
+                        { label: "24H LOW", value: Number(detailChart.low) > 0 ? Model.formatUsd(detailChart.low, Number(detailChart.low) >= 100 ? 2 : 4) : "—" }
+                      ]
+                      DetailMetricCard {}
                     }
                   }
                 }
 
-                Grid {
+                Column {
+                  id: marketDetailsSection
                   width: parent.width
-                  columns: 3
-                  columnSpacing: Style.space(16)
-                  rowSpacing: Style.space(12)
                   visible: Array.isArray(detailChart.stats) && detailChart.stats.length > 0
+                  spacing: Style.space(8)
 
-                  Repeater {
-                    model: detailChart.stats || []
-                    Column {
-                      required property var modelData
-                      width: (detailBlock.width - Style.space(32)) / 3
-                      spacing: Style.space(4)
-                      Text {
-                        text: String(modelData.label || "")
-                        color: root.muted
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.letterSpacing: 1
-                      }
-                      Text {
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        text: String(modelData.value || "—")
-                        color: root.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.title
-                      }
+                  Item {
+                    width: parent.width
+                    height: marketDetailsLabel.implicitHeight
+
+                    Text {
+                      id: marketDetailsLabel
+                      anchors.left: parent.left
+                      text: "MARKET DETAILS"
+                      color: root.muted
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      font.letterSpacing: 1.2
+                    }
+
+                    Rectangle {
+                      anchors.left: marketDetailsLabel.right
+                      anchors.leftMargin: Style.space(8)
+                      anchors.right: parent.right
+                      anchors.verticalCenter: marketDetailsLabel.verticalCenter
+                      height: Math.max(1, Style.normalBorderWidth)
+                      color: Util.alpha(root.foreground, 0.1)
+                    }
+                  }
+
+                  Grid {
+                    width: parent.width
+                    columns: 2
+                    columnSpacing: Style.space(8)
+                    rowSpacing: Style.space(8)
+
+                    Repeater {
+                      model: detailChart.stats || []
+                      DetailMetricCard {}
                     }
                   }
                 }

@@ -93,7 +93,7 @@ DETAIL_CACHE_STALE_SECONDS = 7 * 86400
 DETAIL_CACHE_LIMIT = 96
 DETAIL_METADATA_TTL = 6 * 3600
 DETAIL_METADATA_LIMIT = 64
-DETAIL_CACHE_VERSION = 3
+DETAIL_CACHE_VERSION = 4
 BAR_DISPLAY_MODES = ("full", "quote", "price")
 MARKET_CATEGORIES = frozenset({"crypto", "stock", "commodity", "index", "preipo"})
 YAHOO_UA = "Mozilla/5.0"
@@ -1077,6 +1077,7 @@ def yahoo_chart_bundle(symbol: str, period: str) -> dict[str, Any]:
     elif closes:
         parsed = fetch_yahoo_candles(symbol, period)
     quote = _quote_from_yahoo_meta(meta, closes, symbol)
+    share_volume = num(meta.get("regularMarketVolume"))
     return {
         "candles": parsed,
         "meta": meta,
@@ -1086,7 +1087,8 @@ def yahoo_chart_bundle(symbol: str, period: str) -> dict[str, Any]:
         "open": num(meta.get("regularMarketOpen") or meta.get("chartPreviousClose")),
         "high": num(meta.get("regularMarketDayHigh")),
         "low": num(meta.get("regularMarketDayLow")),
-        "volume": num(meta.get("regularMarketVolume")),
+        "volume": share_volume * quote["price"] if share_volume and quote["price"] else 0,
+        "shareVolume": share_volume,
         "fiftyTwoWeekHigh": num(meta.get("fiftyTwoWeekHigh")),
         "fiftyTwoWeekLow": num(meta.get("fiftyTwoWeekLow")),
         "marketCap": num(meta.get("marketCap")) or num(((read_json(STOCK_CAPS_FILE, {}) or {}).get("caps") or {}).get(symbol)),
@@ -1211,8 +1213,6 @@ def asset_stats(
     _add_stat(stats, "MARKET CAP", format_stat_usd(gecko.get("marketCap") or yahoo.get("marketCap") or product.get("market_cap")))
     if gecko.get("rank"):
         _add_stat(stats, "RANK", f"#{int(gecko['rank'])}")
-    _add_stat(stats, "24H HIGH", format_stat_usd(high))
-    _add_stat(stats, "24H LOW", format_stat_usd(low))
     _add_stat(stats, "CIRCULATING", format_stat_qty(gecko.get("circulating")))
     _add_stat(stats, "MAX SUPPLY", format_stat_qty(gecko.get("maxSupply")))
     _add_stat(stats, "ATH", format_stat_usd(gecko.get("ath")))
@@ -1220,10 +1220,6 @@ def asset_stats(
         _add_stat(stats, "ATH DATE", str(gecko.get("athDate")))
     _add_stat(stats, "52W HIGH", format_stat_usd(yahoo.get("fiftyTwoWeekHigh")))
     _add_stat(stats, "52W LOW", format_stat_usd(yahoo.get("fiftyTwoWeekLow")))
-    _add_stat(stats, "OPEN", format_stat_usd(open_px))
-    if kind in {"stock", "commodity"}:
-        # Keep stock-focused fields first by rebuilding if we have 52w data.
-        pass
     return stats, base
 
 

@@ -37,6 +37,8 @@ function formatCompactUsd(value) {
   if (!isFinite(n)) return "—"
   var abs = Math.abs(n)
   var sign = n < 0 ? "-" : ""
+  if (abs >= 1e12) return sign + "$" + (abs / 1e12).toFixed(2) + "T"
+  if (abs >= 1e9) return sign + "$" + (abs / 1e9).toFixed(2) + "B"
   if (abs >= 1e6) return sign + "$" + (abs / 1e6).toFixed(abs >= 1e7 ? 1 : 2) + "M"
   if (abs >= 1000) return sign + "$" + (abs / 1000).toFixed(abs >= 10000 ? 1 : 2) + "k"
   return formatUsd(n, 2)
@@ -194,7 +196,7 @@ function detailCacheKey(row, period) {
 
 function cachedDetail(cache, row, period) {
   if (!cache || typeof cache !== "object" || !row) return {}
-  if (Number(cache.version || 0) !== 3) return {}
+  if (Number(cache.version || 0) !== 4) return {}
   var entries = cache.entries
   if (!entries || typeof entries !== "object") return {}
   var entry = entries[detailCacheKey(row, period)]

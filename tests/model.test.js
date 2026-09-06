@@ -19,6 +19,7 @@ assert.equal(Model.shouldDefaultToWatchlist(true, false), true)
 assert.equal(Model.shouldDefaultToWatchlist(false, true), true)
 assert.equal(Model.marketVolume({ volume24h: 0, marketCap: 1000000 }), 0)
 assert.equal(Model.marketVolume({ marketCap: 1000000 }), 0)
+assert.equal(Model.formatCompactUsd(35505366427.55), "$35.51B")
 assert.deepEqual(
   [
     { id: "LOW", volume24h: 10 },
@@ -35,7 +36,7 @@ const detail = {
   sparkline: [90, 100]
 }
 const detailCache = {
-  version: 3,
+  version: 4,
   entries: {
     "crypto|BTC-USD|BTC|week": { fetchedAt: 1, data: detail }
   }
@@ -43,7 +44,7 @@ const detailCache = {
 assert.equal(Model.detailCacheKey({ id: "btc", productId: "btc-usd", kind: "crypto" }, "week"), "crypto|BTC-USD|BTC|week")
 assert.deepEqual(Model.cachedDetail(detailCache, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "week"), detail)
 assert.deepEqual(Model.cachedDetail(detailCache, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "day"), {})
-assert.deepEqual(Model.cachedDetail({ version: 2, entries: detailCache.entries }, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "week"), {})
+assert.deepEqual(Model.cachedDetail({ version: 3, entries: detailCache.entries }, { id: "BTC", productId: "BTC-USD", kind: "crypto" }, "week"), {})
 
 const cached = {
   authenticated: false,

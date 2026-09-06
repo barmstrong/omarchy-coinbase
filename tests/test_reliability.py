@@ -123,7 +123,31 @@ class ReliabilityTests(unittest.TestCase):
         )
 
         self.assertEqual(ohlc["volume"], 132_000_000)
-        self.assertNotIn("24H VOLUME", [row["label"] for row in stats])
+        labels = [row["label"] for row in stats]
+        self.assertFalse({"OPEN", "24H HIGH", "24H LOW", "24H VOLUME"} & set(labels))
+
+    def test_stock_detail_volume_is_quote_dollars(self):
+        helper = load_helper()
+        helper.yahoo_get = lambda _url: {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": "SPY",
+                            "regularMarketPrice": 500,
+                            "regularMarketVolume": 20_000_000,
+                        },
+                        "timestamp": [1, 2],
+                        "indicators": {"quote": [{"close": [499, 500]}]},
+                    }
+                ]
+            }
+        }
+
+        detail = helper.yahoo_chart_bundle("SPY", "day")
+
+        self.assertEqual(detail["shareVolume"], 20_000_000)
+        self.assertEqual(detail["volume"], 10_000_000_000)
 
     def test_sparse_fcm_candles_fall_back_to_coarser_history(self):
         helper = load_helper()
