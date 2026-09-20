@@ -154,7 +154,7 @@ Item {
     anchors.top: parent.top
     width: root.axisWidth
     horizontalAlignment: Text.AlignRight
-    text: root.geo.points && root.geo.points.length ? Model.formatUsd(root.geo.max, Number(root.geo.max) >= 100 ? 0 : 2) : ""
+    text: root.geo.points && root.geo.points.length ? Model.formatCompactUsd(root.geo.max) : ""
     color: root.muted
     font.family: root.fontFamily
     font.pixelSize: Style.font.caption
@@ -166,7 +166,7 @@ Item {
     anchors.bottom: parent.bottom
     width: root.axisWidth
     horizontalAlignment: Text.AlignRight
-    text: root.geo.points && root.geo.points.length ? Model.formatUsd(root.geo.min, Number(root.geo.min) >= 100 ? 0 : 2) : ""
+    text: root.geo.points && root.geo.points.length ? Model.formatCompactUsd(root.geo.min) : ""
     color: root.muted
     font.family: root.fontFamily
     font.pixelSize: Style.font.caption

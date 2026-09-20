@@ -20,6 +20,8 @@ assert.equal(Model.shouldDefaultToWatchlist(false, true), true)
 assert.equal(Model.marketVolume({ volume24h: 0, marketCap: 1000000 }), 0)
 assert.equal(Model.marketVolume({ marketCap: 1000000 }), 0)
 assert.equal(Model.formatCompactUsd(35505366427.55), "$35.51B")
+assert.equal(Model.formatCompactUsd(2163414), "$2.16M")
+assert.equal(Model.formatCompactUsd(2083257), "$2.08M")
 assert.deepEqual(
   [
     { id: "LOW", volume24h: 10 },
