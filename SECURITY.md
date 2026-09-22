@@ -11,8 +11,10 @@ If a token may have been exposed, revoke the application's access from your
 Coinbase account immediately and remove
 `~/.local/state/omarchy/coinbase/tokens.json` before signing in again.
 
-The plugin is intended to remain read-only. Any behavior that can trade,
-transfer funds, request a write-capable OAuth scope, send Coinbase credentials
+The plugin does not mutate account data. The helper permits the optional
+`wallet:watchlist:read` and `wallet:watchlist:update` grant for future watchlist
+testing, but does not call the experimental endpoint or expose mutation UI.
+Any behavior that can trade, transfer funds, request other write-capable OAuth scopes, send Coinbase credentials
 to a non-Coinbase API, or disclose one user's OAuth result to another user is a
 security vulnerability.
 

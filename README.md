@@ -73,11 +73,17 @@ rm -r -- ~/.local/state/omarchy/coinbase
 Plugins execute inside `omarchy-shell` without a sandbox. Review third-party
 plugin source before enabling it.
 
-Coinbase authorization requests only these scopes:
+The default authorization scopes in this source tree are:
 
 - `wallet:user:read`
 - `wallet:accounts:read`
 - `offline_access` (for refresh tokens)
+
+The helper also accepts the optional `wallet:watchlist:read` and
+`wallet:watchlist:update` scopes from a broker configured to request them.
+These permissions do not enable watchlist mutations in this plugin; the
+experimental Simple Retail endpoint is not used. A hosted broker's requested
+scopes may differ from the defaults above; inspect the Coinbase consent screen.
 
 The plugin has no code path that places trades or moves funds. Buy, sell,
 deposit, withdrawal, send, and receive controls only open an HTTPS page on
@@ -107,8 +113,9 @@ storage. The Worker source is included for review and can be self-hosted.
 Cloudflare rate limits protect every OAuth endpoint: anonymous entry points are
 limited per source IP, while polling and token operations also have per-session
 or per-credential limits. The Worker fails closed if a required binding is
-absent. Both the helper and broker refuse to retain a token response containing
-scopes outside the three requested above.
+absent. The helper refuses token responses containing scopes outside the three
+defaults and two optional watchlist scopes above. The broker validates against
+its configured requested scopes. Trading and transfer scopes are not accepted.
 
 The plugin contacts these services:
 
@@ -166,6 +173,7 @@ omarchy plugin validate .
 node broker/test.mjs
 node tests/model.test.js
 python3 -m unittest discover -s tests -v
+bash tests/refresh/run.sh # Requires a running desktop session
 bin/coinbase status
 bin/coinbase snapshot --period day
 bin/coinbase chart BTC-USD --period week --symbol BTC --kind crypto
@@ -179,3 +187,13 @@ it remains open. Until Coinbase exposes a dedicated OAuth watchlist endpoint,
 the plugin uses the Advanced Trade product `watched` flag. That response does
 not include the user's custom watchlist order, so the panel preserves the order
 returned by the product API.
+
+The open panel refreshes silently every 30 seconds when cached data is present.
+“Updating…” appears only while a chart-period change or missing content is loading.
+Network work can continue quietly for up to two
+minutes before the helper is terminated. Background jobs skip an already-busy
+snapshot writer and retry on the next timer tick. Refresh failures preserve the
+last good balances and data timestamp, show a stale-data notice, and back off
+for 30 seconds (manual refresh bypasses that backoff). Partial watchlist
+failures retain cached entries for the failed categories. Candle caches are
+merged and written once per helper command, rather than once per chart.

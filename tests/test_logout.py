@@ -233,7 +233,7 @@ class LogoutTests(unittest.TestCase):
 
     def test_rejects_token_with_unrequested_scope(self):
         helper = load_helper()
-        with self.assertRaisesRegex(RuntimeError, "outside this read-only app"):
+        with self.assertRaisesRegex(RuntimeError, "outside this app's accepted scopes"):
             helper.validate_token_grant(
                 {
                     "access_token": "access",

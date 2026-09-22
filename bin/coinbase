@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from contextlib import contextmanager
 import urllib.error
 import urllib.parse
@@ -60,6 +61,7 @@ SCOPES = ",".join(
     ]
 )
 READ_ONLY_SCOPES = frozenset(SCOPES.split(","))
+ACCEPTED_SCOPES = READ_ONLY_SCOPES | {"wallet:watchlist:read", "wallet:watchlist:update"}
 PERIODS = {
     "hour": {"granularity": "FIVE_MINUTE", "seconds": 3600},
     "day": {"granularity": "FIVE_MINUTE", "seconds": 86400},
@@ -196,6 +198,8 @@ _CANDLE_THREAD_LOCK = threading.Lock()
 _DETAIL_THREAD_LOCK = threading.Lock()
 _PRODUCT_THREAD_LOCK = threading.Lock()
 _PREFS_THREAD_LOCK = threading.Lock()
+_BACKGROUND_JOB = False
+_CANDLE_BATCH = None
 MAX_HTTP_BYTES = 16 * 1024 * 1024
 
 
@@ -239,11 +243,18 @@ def ensure_state() -> None:
         pass
 
 
+class RefreshBusy(RuntimeError):
+    pass
+
+
 @contextmanager
 def snapshot_lock():
     ensure_state()
     with (STATE_DIR / "snapshot.lock").open("w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | (fcntl.LOCK_NB if _BACKGROUND_JOB else 0))
+        except BlockingIOError as exc:
+            raise RefreshBusy("another refresh is already running") from exc
         try:
             yield
         finally:
@@ -664,7 +675,7 @@ def pkce_pair() -> tuple[str, str]:
 
 
 def validate_token_grant(payload: dict[str, Any]) -> None:
-    """Refuse to persist a token carrying permissions this read-only app did not request."""
+    """Accept the broker's optional watchlist grant, never trading/transfer scopes."""
     token_type = str(payload.get("token_type") or "bearer").strip().lower()
     if token_type != "bearer":
         raise RuntimeError("token response used an unsupported token type")
@@ -672,9 +683,9 @@ def validate_token_grant(payload: dict[str, Any]) -> None:
     if not raw_scope:
         return
     granted = {scope for scope in re.split(r"[\s,]+", raw_scope) if scope}
-    unexpected = sorted(granted - READ_ONLY_SCOPES)
+    unexpected = sorted(granted - ACCEPTED_SCOPES)
     if unexpected:
-        raise RuntimeError("Coinbase returned permissions outside this read-only app's requested scopes")
+        raise RuntimeError("Coinbase returned permissions outside this app's accepted scopes")
 
 
 def http_json(
@@ -2064,8 +2075,12 @@ def _parse_candles(payload: Any) -> list[tuple[int, float]]:
 
 
 def _cached_candles(key: str) -> tuple[list[tuple[int, float]], float]:
-    with candle_cache_lock():
-        cache = read_json(CANDLES_CACHE, {})
+    if _CANDLE_BATCH is not None:
+        with _CANDLE_THREAD_LOCK:
+            cache = {key: _CANDLE_BATCH["cache"].get(key)}
+    else:
+        with candle_cache_lock():
+            cache = read_json(CANDLES_CACHE, {})
     if not isinstance(cache, dict):
         return [], 0
     entry = cache.get(key)
@@ -2084,11 +2099,24 @@ def _cached_candles(key: str) -> tuple[list[tuple[int, float]], float]:
 def _store_cached_candles(key: str, candles: list[tuple[int, float]]) -> None:
     if not candles:
         return
+    entry = {"fetchedAt": int(time.time()), "candles": candles}
+    if _CANDLE_BATCH is not None:
+        with _CANDLE_THREAD_LOCK:
+            _CANDLE_BATCH["cache"][key] = entry
+            _CANDLE_BATCH["dirty"][key] = entry
+        return
+    _flush_candles({key: entry})
+
+
+def _flush_candles(dirty: dict[str, Any]) -> None:
     with candle_cache_lock():
         cache = read_json(CANDLES_CACHE, {})
         if not isinstance(cache, dict):
             cache = {}
-        cache[key] = {"fetchedAt": int(time.time()), "candles": candles}
+        for key, entry in dirty.items():
+            existing = cache.get(key)
+            if not isinstance(existing, dict) or num(existing.get("fetchedAt")) <= num(entry.get("fetchedAt")):
+                cache[key] = entry
         if len(cache) > CANDLE_CACHE_LIMIT:
             oldest = sorted(
                 cache.items(),
@@ -2097,6 +2125,22 @@ def _store_cached_candles(key: str, candles: list[tuple[int, float]]) -> None:
             for stale_key, _ in oldest[: len(cache) - CANDLE_CACHE_LIMIT]:
                 cache.pop(stale_key, None)
         write_json(CANDLES_CACHE, cache)
+
+
+@contextmanager
+def candle_batch():
+    """Read once per command; merge only changed entries under the file lock."""
+    global _CANDLE_BATCH
+    with candle_cache_lock():
+        cache = read_json(CANDLES_CACHE, {})
+    _CANDLE_BATCH = {"cache": cache if isinstance(cache, dict) else {}, "dirty": {}}
+    try:
+        yield
+    finally:
+        dirty = _CANDLE_BATCH["dirty"]
+        _CANDLE_BATCH = None
+        if dirty:
+            _flush_candles(dirty)
 
 
 def _fetch_candle_window(product_id: str, granularity: str, start: int, end: int) -> list[tuple[int, float]]:
@@ -2723,8 +2767,6 @@ def fetch_auth_products(
     found: list[dict[str, Any]] = []
     cursor = ""
     offset = 0
-    empty_pages = 0
-    pages = 0
     for _ in range(max_pages):
         params: dict[str, Any] = {"product_type": product_type, "limit": limit}
         if extra:
@@ -2736,13 +2778,12 @@ def fetch_auth_products(
         try:
             payload = api_get("/api/v3/brokerage/products", token, params)
         except RuntimeError:
-            return found if pages else None
-        pages += 1
+            return None
         if not isinstance(payload, dict):
-            return found if pages > 1 else None
-        products = payload.get("products") or []
+            return None
+        products = payload.get("products")
         if not isinstance(products, list):
-            return found if pages > 1 else None
+            return None
         products = [product for product in products if isinstance(product, dict)]
         if not products:
             break
@@ -2752,19 +2793,15 @@ def fetch_auth_products(
         found.extend(page_watched)
         pag = payload.get("pagination") or {}
         if not isinstance(pag, dict):
-            break
-        if not page_watched:
-            empty_pages += 1
-            if empty_pages >= 1 and offset >= limit:
-                break
-        else:
-            empty_pages = 0
+            return None
         if not pag.get("has_next"):
             break
         cursor = str(pag.get("next_cursor") or "")
         offset += len(products)
-        if not cursor:
-            break
+    else:
+        # A capped or failed paginated result is not authoritative: let the
+        # caller retain this category's last complete watchlist.
+        return None
     return found
 
 
@@ -2807,7 +2844,7 @@ def fetch_advanced_watchlist(token: str, *, force: bool = False) -> list[dict[st
     if not isinstance(cached, list):
         cached = state.get("coinbase")
         cached_at = num(state.get("coinbaseAt"))
-    if not force and isinstance(cached, list) and cached and time.time() - cached_at < WATCHLIST_TTL:
+    if not force and isinstance(cached, list) and time.time() - cached_at < WATCHLIST_TTL:
         return [row for row in cached if isinstance(row, dict)]
 
     entries: list[dict[str, Any]] = []
@@ -2817,7 +2854,7 @@ def fetch_advanced_watchlist(token: str, *, force: bool = False) -> list[dict[st
         ("EQUITY", None),
         ("FUTURE", {"contract_expiry_type": "PERPETUAL"}),
     )
-    fetched: dict[str, list[dict[str, Any]]] = {}
+    fetched: dict[str, list[dict[str, Any]] | None] = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
         futs = {pool.submit(fetch_auth_products, token, ptype, extra): ptype for ptype, extra in jobs}
         for fut in as_completed(futs):
@@ -2827,14 +2864,21 @@ def fetch_advanced_watchlist(token: str, *, force: bool = False) -> list[dict[st
             except Exception:  # noqa: BLE001
                 result = None
             if result is None:
-                fetched[ptype] = []
+                fetched[ptype] = None
             else:
                 fetched[ptype] = result
                 api_ok = True
     seen: set[str] = set()
     for ptype, _extra in jobs:
-        for product in fetched.get(ptype) or []:
-            entry = slim_watch_entry(product)
+        products = fetched.get(ptype)
+        # A failed category is not an empty watchlist. Keep its last good rows.
+        if products is None:
+            categories = {"stock": "EQUITY", "commodity": "EQUITY", "derivative": "FUTURE"}
+            candidates = [row for row in (cached or []) if isinstance(row, dict)
+                          and categories.get(row.get("kind"), "SPOT") == ptype]
+        else:
+            candidates = [slim_watch_entry(product) for product in products]
+        for entry in candidates:
             if not entry:
                 continue
             key = f"{entry.get('kind')}:{entry.get('id')}"
@@ -2844,7 +2888,8 @@ def fetch_advanced_watchlist(token: str, *, force: bool = False) -> list[dict[st
             entries.append(entry)
 
     if api_ok:
-        save_watchlist_state(advanced=entries, advancedAt=int(time.time()))
+        complete = all(fetched.get(ptype) is not None for ptype, _extra in jobs)
+        save_watchlist_state(advanced=entries, advancedAt=int(time.time()) if complete else 0)
         return entries
     if isinstance(cached, list) and cached:
         return [row for row in cached if isinstance(row, dict)]
@@ -3752,9 +3797,9 @@ def market_snapshot(period: str, *, error: str = "") -> dict[str, Any]:
         if isinstance(assets, list) and assets and catalog_at and time.time() - catalog_at < CATALOG_TTL:
             return refresh_live_snapshot(period, previous=previous, error=error)
         return build_market_snapshot(period, error=error, previous=previous)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         if previous:
-            return previous
+            return failed_snapshot(previous, str(exc))
         raise
 
 
@@ -3776,6 +3821,25 @@ def build_snapshot(period: str, *, publish_loading: bool = False) -> dict[str, A
         return assemble_snapshot(period, publish_loading=publish_loading)
 
 
+def snapshot_age(snapshot: dict[str, Any]) -> float:
+    try:
+        stamp = datetime.fromisoformat(str(snapshot.get("fetchedAt") or "").replace("Z", "+00:00"))
+        return max(0, time.time() - stamp.timestamp())
+    except (ValueError, TypeError, OverflowError):
+        return float("inf")
+
+
+def failed_snapshot(previous: dict[str, Any], message: str) -> dict[str, Any]:
+    snap = dict(previous)
+    snap.pop("loading", None)
+    snap["error"] = message
+    snap["lastAttemptAt"] = now_iso()
+    snap["retryAfter"] = int(time.time()) + 30
+    # fetchedAt describes the data, not the last attempt or cache-file write.
+    write_snapshot(snap)
+    return snap
+
+
 def assemble_snapshot(period: str, *, publish_loading: bool = False) -> dict[str, Any]:
     previous = read_json(SNAPSHOT_FILE, {})
     update_prefs(period=period)
@@ -3787,13 +3851,7 @@ def assemble_snapshot(period: str, *, publish_loading: bool = False) -> dict[str
         if message not in {"needsSetup", "not signed in"} and usable_snapshot(previous, authenticated=True):
             # Refresh-token and network failures must never replace a complete
             # portfolio with a signed-out or empty view.
-            if previous.get("loading"):
-                previous = dict(previous)
-                previous.pop("loading", None)
-                previous["error"] = message
-                previous["fetchedAt"] = now_iso()
-                write_snapshot(previous)
-            return previous
+            return failed_snapshot(previous, message)
         public_error = "" if message in {"needsSetup", "not signed in"} else message
         try:
             return market_snapshot(period, error=public_error)
@@ -3884,11 +3942,7 @@ def assemble_snapshot(period: str, *, publish_loading: bool = False) -> dict[str
         # Keep last-good numbers if we already had a snapshot.
         previous = read_json(SNAPSHOT_FILE, {})
         if isinstance(previous, dict) and previous.get("authenticated"):
-            previous.pop("loading", None)
-            previous["error"] = str(exc)
-            previous["fetchedAt"] = now_iso()
-            write_snapshot(previous)
-            return previous
+            return failed_snapshot(previous, str(exc))
         write_snapshot(snap)
         return snap
 
@@ -3951,17 +4005,14 @@ def cmd_snapshot(period: str | None, fast: bool = False, max_age: int = 0) -> No
     if max_age:
         cached = read_json(SNAPSHOT_FILE, {})
         token_present = bool(load_tokens().get("access_token"))
-        try:
-            age = time.time() - SNAPSHOT_FILE.stat().st_mtime
-        except OSError:
-            age = float("inf")
+        age = snapshot_age(cached)
         if (
             usable_snapshot(cached)
             and cached.get("assets")
             and not cached.get("needsRefresh")
             and str(cached.get("period") or "day") == chosen
             and bool(cached.get("authenticated")) == token_present
-            and age <= max_age
+            and (age <= max_age or time.time() < num(cached.get("retryAfter")) <= time.time() + 30)
         ):
             print(json.dumps(cached))
             return
@@ -4291,7 +4342,6 @@ def retarget_portfolio_snapshot(period: str, previous: dict[str, Any]) -> bool:
         pnl_percent=pnl_percent,
         period=period,
     )
-    previous["fetchedAt"] = now_iso()
     write_snapshot(previous)
     return True
 
@@ -4532,6 +4582,21 @@ def main() -> None:
     sub.add_parser("oauth-check")
 
     args = parser.parse_args()
+    global _BACKGROUND_JOB
+    _BACKGROUND_JOB = args.cmd in {"rows", "watchlist-refresh"} or (args.cmd == "snapshot" and not args.fast)
+    try:
+        if args.cmd in {"snapshot", "rows", "chart", "ticker", "login", "logout"}:
+            with candle_batch():
+                dispatch(args)
+        else:
+            dispatch(args)
+    except RefreshBusy:
+        # The active writer publishes through the shared snapshot file. Do not
+        # queue another slow network job behind it; normal timers retry later.
+        print(json.dumps(read_json(SNAPSHOT_FILE, {})))
+
+
+def dispatch(args: argparse.Namespace) -> None:
     if args.cmd == "setup":
         cmd_setup(args.client_id, args.client_secret, args.stdin)
     elif args.cmd == "login":

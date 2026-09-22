@@ -19,7 +19,18 @@ Item {
   property string pendingSnapshotRaw: ""
   property bool acceptSnapshotReload: false
   property bool applySnapshotOnExit: false
-  property bool refreshing: false
+  property bool periodChangeRequested: false
+  property bool detailPeriodChangeRequested: false
+  readonly property bool showUpdating: opened && Model.shouldShowUpdating({
+    hasData: snapshotReady && (assets.length > 0 || showingDetail),
+    hasChart: sparkline.length >= 2,
+    snapshotRunning: snapshotProc.running,
+    chartRunning: chartProc.running,
+    periodChange: periodChangeRequested,
+    detailPeriodChange: detailPeriodChangeRequested,
+    detailMissing: showingDetail && (!Array.isArray(detailChart.stats) || detailChart.stats.length === 0)
+  })
+  property double statusNow: Date.now()
   property bool signingIn: false
   property string loginStatus: ""
   property string searchQuery: ""
@@ -96,6 +107,13 @@ Item {
     return snapshot.sparkline || []
   }
   property bool chartHover: false
+  onChartHoverChanged: {
+    if (!chartHover && pendingSnapshotRaw !== "") {
+      var pending = pendingSnapshotRaw
+      pendingSnapshotRaw = ""
+      root.applySnapshot(pending)
+    }
+  }
   property real chartHoverPrice: NaN
   property int chartHoverIndex: -1
   readonly property string chartHoverTime: {
@@ -179,7 +197,7 @@ Item {
     }
     var next = Model.parseSnapshot(serialized, null)
     if (!next) return false
-    if (root.opened && root.snapshotReady && !root.acceptSnapshotReload) {
+    if (root.opened && root.chartHover && root.snapshotReady && !root.acceptSnapshotReload) {
       root.pendingSnapshotRaw = serialized
       return true
     }
@@ -194,7 +212,12 @@ Item {
     if (!next) return false
     root.lastSnapshotRaw = serialized
     var wasSigned = root.signedIn
+    var selectedKey = Model.assetKey(root.visibleAssets[root.listCursor])
+    var previousCursor = root.listCursor
     snapshot = next
+    root.statusNow = Date.now()
+    root.listCursor = Model.selectionIndex(root.visibleAssets, selectedKey, previousCursor)
+    root.hoverSelectEnabled = false
     root.snapshotReady = true
     root.capturePortfolio(snapshot)
     if (root.signedIn && !wasSigned) {
@@ -458,6 +481,8 @@ Item {
   }
 
   function open(payloadJson) {
+    root.periodChangeRequested = false
+    root.detailPeriodChangeRequested = false
     if (root.pendingSnapshotRaw !== "") {
       var pending = root.pendingSnapshotRaw
       root.pendingSnapshotRaw = ""
@@ -586,7 +611,6 @@ Item {
     }
     tickerProc.command = cmd
     tickerProc.running = true
-    if (!root.signedIn) refreshing = true
   }
 
   function pinToBar(row) {
@@ -634,12 +658,13 @@ Item {
     })
   }
 
-  function loadDetailChart(row, periodOverride) {
+  function loadDetailChart(row, periodOverride, userPeriodChange) {
     if (!row) return
     root.chartSeq += 1
     root.chartProcSeq = root.chartSeq
     root.chartWantId = String(root.tickerId(row) || "").toUpperCase()
     if (chartProc.running) chartProc.running = false
+    root.detailPeriodChangeRequested = userPeriodChange === true
     root.detailLoading = true
     var p = periodOverride || period
     root.detailChart = Model.cachedDetail(root.detailCache, row, p)
@@ -668,6 +693,8 @@ Item {
 
   function close() {
     opened = false
+    root.periodChangeRequested = false
+    root.detailPeriodChangeRequested = false
     watchlistRefreshPending = false
     signingIn = false
     closeDetail()
@@ -689,8 +716,8 @@ Item {
       if (force === true) root.applySnapshotOnExit = true
       return
     }
-    refreshing = true
     root.applySnapshotOnExit = force === true
+    root.periodChangeRequested = false
     snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", period]
     if (!force) snapshotProc.command.push("--max-age", "20")
     snapshotProc.running = true
@@ -710,6 +737,7 @@ Item {
   function setPeriod(next) {
     if (!next || next === period) return
     if (snapshotProc.running) snapshotProc.running = false
+    root.periodChangeRequested = true
     var nextSnapshot = Object.assign({}, root.snapshot)
     nextSnapshot.period = next
     root.snapshot = nextSnapshot
@@ -717,12 +745,11 @@ Item {
     root.chartHoverPrice = NaN
     root.chartHoverIndex = -1
     root.rowsRefreshPending = true
-    refreshing = true
     root.applySnapshotOnExit = true
     snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", next, "--fast"]
     snapshotProc.running = true
     if (root.showingDetail && root.detailAsset)
-      root.loadDetailChart(root.detailAsset, next)
+      root.loadDetailChart(root.detailAsset, next, true)
   }
 
   function signIn() {
@@ -856,13 +883,15 @@ Item {
     }
   }
 
-  Process {
+  RefreshProcess {
     id: snapshotProc
+    onRunningChanged: {
+      if (!running) root.periodChangeRequested = false
+    }
     command: [root.pluginFile("bin/coinbase"), "snapshot"]
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: {
-      root.refreshing = false
       root.acceptSnapshotReload = root.applySnapshotOnExit
       root.applySnapshotOnExit = false
       snapshotFile.reload()
@@ -872,7 +901,7 @@ Item {
     }
   }
 
-  Process {
+  RefreshProcess {
     id: rowProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -919,7 +948,7 @@ Item {
     }
   }
 
-  Process {
+  RefreshProcess {
     id: watchlistProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -934,8 +963,17 @@ Item {
     }
   }
 
-  Process {
+  RefreshProcess {
     id: chartProc
+    onExited: {
+      if (root.chartProcSeq === root.chartSeq) root.detailLoading = false
+    }
+    onRunningChanged: {
+      if (!running) {
+        root.detailLoading = false
+        root.detailPeriodChangeRequested = false
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -955,12 +993,9 @@ Item {
       }
     }
     stderr: StdioCollector { waitForEnd: true }
-    onExited: {
-      if (root.chartProcSeq === root.chartSeq) root.detailLoading = false
-    }
   }
 
-  Process {
+  RefreshProcess {
     id: tickerProc
     stdinEnabled: true
     onStarted: {
@@ -968,7 +1003,6 @@ Item {
       root.pendingTickerPayload = null
     }
     onExited: function(code) {
-      root.refreshing = false
       root.acceptSnapshotReload = true
       snapshotFile.reload()
       if (code === 0) {
@@ -981,7 +1015,7 @@ Item {
     }
   }
 
-  Process {
+  RefreshProcess {
     id: searchProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -1000,6 +1034,24 @@ Item {
         }
         root.searchResults = out
       }
+    }
+  }
+
+  Timer {
+    interval: 10000
+    running: root.opened
+    repeat: true
+    onTriggered: root.statusNow = Date.now()
+  }
+
+  Timer {
+    interval: 30000
+    running: root.opened
+    repeat: true
+    onTriggered: {
+      root.refresh()
+      if (root.showingDetail && !chartProc.running)
+        root.loadDetailChart(root.detailAsset)
     }
   }
 
@@ -1618,7 +1670,7 @@ Item {
                       anchors.verticalCenter: parent.verticalCenter
                     }
                     Text {
-                      visible: (root.authLoading || root.refreshing || root.detailLoading) && !root.chartHover
+                      visible: (root.showUpdating || (root.authLoading && root.sparkline.length < 2)) && !root.chartHover
                       text: root.authLoading ? "Loading details…" : "Updating…"
                       color: root.muted
                       font.family: root.fontFamily
@@ -1627,6 +1679,16 @@ Item {
                       anchors.verticalCenter: parent.verticalCenter
                     }
                   }
+                }
+
+                Text {
+                  width: parent.width
+                  visible: !root.showingDetail && text !== ""
+                  text: Model.freshnessText(root.snapshot, root.statusNow)
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
                 }
 
                 Row {
@@ -1970,7 +2032,7 @@ Item {
 
                   Text {
                     visible: (!root.snapshotReady || root.authLoading) && root.visibleAssets.length === 0
-                    text: root.authLoading ? "Loading your Coinbase portfolio…" : "Updating…"
+                    text: root.authLoading ? "Loading your Coinbase portfolio…" : "Waiting for data. Retrying automatically…"
                     color: root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall

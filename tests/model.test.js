@@ -1,5 +1,30 @@
 const assert = require("node:assert/strict")
 const Model = require("../Model.js")
+const panelSource = require("node:fs").readFileSync(require("node:path").join(__dirname, "../Panel.qml"), "utf8")
+assert.doesNotMatch(panelSource, /updateHint|updateBusy/)
+assert.match(panelSource, /Model\.shouldShowUpdating/)
+assert.match(panelSource, /Waiting for data\. Retrying automatically…/)
+
+const loaded = {hasData: true, hasChart: true, snapshotRunning: true, chartRunning: false, periodChange: false, detailPeriodChange: false, detailMissing: false}
+assert.equal(Model.shouldShowUpdating(loaded), false, "opening with cached data stays quiet")
+assert.equal(Model.shouldShowUpdating({...loaded, periodChange: true}), true, "period click gets immediate feedback")
+assert.equal(Model.shouldShowUpdating({...loaded, hasData: false}), true, "missing data gets feedback")
+assert.equal(Model.shouldShowUpdating({...loaded, hasChart: false}), true, "missing chart gets feedback")
+assert.equal(Model.shouldShowUpdating({...loaded, chartRunning: true}), false, "background detail refresh stays quiet")
+assert.equal(Model.shouldShowUpdating({...loaded, chartRunning: true, detailMissing: true}), true)
+assert.equal(Model.shouldShowUpdating({...loaded, chartRunning: true, detailPeriodChange: true}), true)
+assert.equal(Model.shouldShowUpdating({...loaded, snapshotRunning: false, periodChange: true}), false, "completed or failed process clears feedback")
+assert.equal(Model.shouldShowUpdating({...loaded, snapshotRunning: false, chartRunning: false, detailPeriodChange: true}), false)
+
+const selected = {kind: "crypto", productId: "BTC-USD"}
+assert.equal(Model.selectionIndex([{kind: "crypto", productId: "ETH-USD"}, selected], Model.assetKey(selected), 0), 1)
+assert.equal(Model.selectionIndex([], Model.assetKey(selected), 0), -1)
+assert.equal(Model.selectionIndex([selected], "removed", 3), 0)
+assert.equal(Model.selectionIndex([selected], "", -1), -1)
+const now = Date.parse("2026-09-21T12:05:00Z")
+assert.equal(Model.freshnessText({fetchedAt: "2026-09-21T12:00:00Z", error: "offline"}, now), "Last updated 5m ago · retrying automatically")
+assert.equal(Model.freshnessText({fetchedAt: "2026-09-21T12:04:59Z"}, now), "")
+assert.equal(Model.freshnessText({fetchedAt: "invalid", error: "offline"}, now), "Refresh failed · retrying automatically")
 
 assert.equal(Model.shouldHandleLoginStatus("logged-out", false, false), false)
 assert.equal(Model.shouldHandleLoginStatus("logged-out", false, true), true)

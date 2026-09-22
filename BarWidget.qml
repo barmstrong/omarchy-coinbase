@@ -110,7 +110,7 @@ BarWidget {
     }
   }
 
-  Process {
+  RefreshProcess {
     id: snapshotProc
     command: [root.pluginFile("bin/coinbase"), "snapshot"]
     stdout: StdioCollector { waitForEnd: true }
@@ -152,12 +152,6 @@ BarWidget {
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refresh()
-  }
-
-  Timer {
-    interval: 25000
-    running: snapshotProc.running
-    onTriggered: snapshotProc.running = false
   }
 
   Timer {

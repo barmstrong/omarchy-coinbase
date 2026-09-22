@@ -210,8 +210,41 @@ function cachedDetail(cache, row, period) {
   return data
 }
 
+function shouldShowUpdating(state) {
+  // Cached content stays quiet on open and on timer-driven refreshes.
+  // An explicit period change or a missing part of the view needs feedback.
+  return (state.snapshotRunning && (state.periodChange || !state.hasData || !state.hasChart))
+    || (state.chartRunning && (state.detailPeriodChange || !state.hasChart || state.detailMissing))
+}
+
+function assetKey(row) {
+  return row ? String(row.kind || "crypto") + ":" + String(row.productId || row.id || "").toUpperCase() : ""
+}
+
+function selectionIndex(rows, key, previousIndex) {
+  if (previousIndex < 0) return -1
+  for (var i = 0; i < rows.length; i++) {
+    if (assetKey(rows[i]) === key) return i
+  }
+  return Math.min(previousIndex, rows.length - 1)
+}
+
+function freshnessText(snapshot, now) {
+  var stamp = Date.parse(snapshot.fetchedAt || "")
+  var failed = !!snapshot.error
+  if (!isFinite(stamp)) return failed ? "Refresh failed · retrying automatically" : ""
+  var seconds = Math.max(0, (now - stamp) / 1000)
+  if (!failed && seconds < 120) return ""
+  var age = seconds < 60 ? "just now" : (seconds < 3600 ? Math.floor(seconds / 60) + "m ago" : Math.floor(seconds / 3600) + "h ago")
+  return "Last updated " + age + (failed ? " · retrying automatically" : " · data may be stale")
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
+    shouldShowUpdating: shouldShowUpdating,
+    assetKey: assetKey,
+    selectionIndex: selectionIndex,
+    freshnessText: freshnessText,
     formatUsd: formatUsd,
     formatCompactNumber: formatCompactNumber,
     formatCompactUsd: formatCompactUsd,
