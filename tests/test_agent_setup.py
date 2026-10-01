@@ -239,7 +239,8 @@ class AgentSetupTests(unittest.TestCase):
              patch('builtins.print'):
             self.h.configure(self.home, self.state, self.data)
         self.assertIn('--default=true', prompt.call_args_list[0].args[0])
-        self.assertIn('--selected=', prompt.call_args_list[1].args[0])
+        self.assertIn('--affirmative=Yes (default)', prompt.call_args_list[0].args[0])
+        self.assertIn('--selected=*', prompt.call_args_list[1].args[0])
         for call in prompt.call_args_list:
             self.assertIn('--timeout=0s', call.args[0])
         self.assertEqual(self.h.selection(self.state)['directories'], [str(self.home / '.codex/skills')])

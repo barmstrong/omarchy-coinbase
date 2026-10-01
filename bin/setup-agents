@@ -84,18 +84,26 @@ def configure(home, state, data):
     print('Install the official CLI on PATH (Node.js may be installed if needed).\n'
           'Authentication is separate; the widget works without it.\n'
           'No keeps only the widget and removes any plugin-managed CLI/skills.\n', flush=True)
-    # Explicit timeouts prevent inherited gum settings from treating elapsed
-    # time as consent. No agent starts selected, including on reconfiguration.
-    answer = subprocess.run(['gum', 'confirm', 'Install Coinbase CLI?', '--default=true', '--timeout=0s'], check=False)
+    print('Press Enter for Yes (default), or use the arrow keys to choose No.\n', flush=True)
+    # Text identifies the default even with NO_COLOR. Use the theme's accent
+    # for stronger selection contrast when terminal colors are available.
+    # Explicit timeouts prevent elapsed time from being treated as consent.
+    answer = subprocess.run(['gum', 'confirm', 'Install Coinbase CLI?', '--default=true',
+                             '--affirmative=Yes (default)', '--timeout=0s',
+                             '--selected.background=' + os.environ.get('GUM_CONFIRM_PROMPT_FOREGROUND', '#7fbbb3'),
+                             '--selected.foreground=' + os.environ.get('GUM_CONFIRM_PROMPT_BACKGROUND', '#2d353b')], check=False)
     if answer.returncode == 1:
         return remove(home, state, data)
     if answer.returncode != 0:
         return {'canceled': True}
     targets = agent_targets(home)
-    print('\nChoose agents to receive the Coinbase skill using the keys shown below; Enter confirms.\n'
-          'Leave all unchecked for CLI only. Future agents/profiles require another selection.\n', flush=True)
+    print('\nAll listed agents are selected. Deselect any you do not want.\n'
+          'Enter confirms; clear all for CLI only.\n'
+          'Future agents/profiles require another selection.\n', flush=True)
     labels = {name + ' (' + str(path) + ')': name for name, path in sorted(targets.items())}
-    picked = subprocess.run(['gum', 'choose', '--no-limit', '--selected=', '--timeout=0s',
+    picked = subprocess.run(['gum', 'choose', '--no-limit', '--selected=*', '--timeout=0s',
+                             '--selected-prefix=[x] ', '--unselected-prefix=[ ] ',
+                             '--height=' + str(min(len(labels), 16)),
                              '--header=Share the Coinbase skill with:', *labels],
                             check=False, text=True, stdout=subprocess.PIPE)
     if picked.returncode != 0:

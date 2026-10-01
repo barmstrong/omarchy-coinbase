@@ -23,8 +23,9 @@ flow, or disclosing one user's OAuth result to another user, is a security
 vulnerability.
 
 First enable offers optional CLI setup; the Yes default requires an explicit
-confirmation. Agent integration is disabled by default and requires selection
-of each intended agent. No package downloads or new skill directories/links
+confirmation. Agent integration remains inactive until the user confirms the
+agent checklist, which initially has all listed agents checked and allows
+deselection or cancellation. No package downloads or new skill directories/links
 occur before consent. Only the saved exact directories are reconciled; shared
 discovery locations and future profiles are not added automatically. Legacy
 plugin-owned links from the previous automatic setup are removed on migration

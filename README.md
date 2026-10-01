@@ -69,9 +69,9 @@ First enable opens a one-time setup prompt:
 
 1. **Install Coinbase CLI?** defaults to **Yes**, but requires confirmation.
    Choose **No** to use only the widget. No downloads happen before confirmation.
-2. Select which agents receive the Coinbase skill. **Nothing is preselected**;
-   use the displayed toggle key to check an agent and Enter to confirm. Leave everything
-   unchecked to install only the CLI.
+2. Confirm which agents receive the Coinbase skill. **All listed agents start
+   checked**; deselect any you do not want and press Enter to confirm. Clear
+   all selections to install only the CLI. No links are created until confirmation.
 
 Closing or canceling setup grants no new permissions. The prompt does not
 repeatedly reopen; rerun `setup-agents configure` when ready. Existing CLI

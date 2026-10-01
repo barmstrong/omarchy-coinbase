@@ -19,7 +19,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 setup = importlib.util.module_from_spec(spec)
 loader.exec_module(setup)
 
-for case, inputs in [('cli-only', [b'\r', b'\r']), ('codex-only', [b'\r', b'\x1b[Bx\r']), ('decline', [b'\x1b[C\r']), ('cancel', [b'\x03'])]:
+for case, inputs in [('all-agents', [b'\r', b'\r']), ('cli-only', [b'\r', b'\x01\r']), ('codex-only', [b'\r', b'\x01\x1b[Bx\r']), ('decline', [b'\x1b[C\r']), ('cancel', [b'\x03'])]:
     with tempfile.TemporaryDirectory(prefix='coinbase-optin-') as directory:
         home = Path(directory)
         state = home / 'state'
@@ -31,6 +31,7 @@ for case, inputs in [('cli-only', [b'\r', b'\r']), ('codex-only', [b'\r', b'\x1b
                 for key in ['XDG_CONFIG_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'HERMES_HOME', 'GROK_HOME']:
                     os.environ.pop(key, None)
                 os.environ['TERM'] = 'xterm-256color'
+                os.environ['NO_COLOR'] = '1'
                 termios.tcsetwinsize(0, (35, 120))
                 setup.ensure_cli = lambda *_: {'version': 'test-only'}
                 result = setup.configure(home, state, home / 'data')
@@ -54,8 +55,18 @@ for case, inputs in [('cli-only', [b'\r', b'\r']), ('codex-only', [b'\r', b'\x1b
                         os.write(terminal, b'\x1b[1;1R')
                 trigger = b'Install Coinbase CLI?' if stage == 0 else b'Share the Coinbase skill with:'
                 if stage < len(inputs) and trigger in output:
+                    if stage == 0:
+                        assert b'Yes (default)' in output
+                    else:
+                        assert b'[x]' in output, 'preselected agents must be visibly checked without color'
                     time.sleep(0.25)
-                    for key in ([b'\x1b[B', b'x', b'\r'] if case == 'codex-only' and stage == 1 else [inputs[stage]]):
+                    if stage == 1 and case == 'codex-only':
+                        keys = [b'\x01', b'\x1b[B', b'x', b'\r']
+                    elif stage == 1 and case == 'cli-only':
+                        keys = [b'\x01', b'\r']
+                    else:
+                        keys = [inputs[stage]]
+                    for key in keys:
                         os.write(terminal, key)
                         time.sleep(0.15)
                     stage += 1
@@ -63,7 +74,9 @@ for case, inputs in [('cli-only', [b'\r', b'\r']), ('codex-only', [b'\r', b'\x1b
                     break
             assert (home / 'result.json').exists(), (case, output.decode(errors='replace')[-1800:])
             chosen = setup.selection(state)
-            if case == 'cli-only':
+            if case == 'all-agents':
+                assert chosen['cli'] and len(chosen['directories']) == 11, chosen
+            elif case == 'cli-only':
                 assert chosen['cli'] and chosen['directories'] == [], chosen
             elif case == 'codex-only':
                 assert chosen['directories'] == [str(home / '.codex/skills')], (chosen, output.decode(errors='replace')[-2000:])
