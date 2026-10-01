@@ -1001,7 +1001,7 @@ Item {
       root.loginStatus = "Opening Coinbase…"
     } else if (status === "waiting") {
       root.signingIn = true
-      root.loginStatus = String(data.message || "Approve access in Coinbase. If offered a portfolio choice, select All portfolios and wallets.")
+      root.loginStatus = String(data.message || "")
       if (root.dismissAfterLoginLaunch && !data.message) {
         root.dismissAfterLoginLaunch = false
         root.dismiss()
