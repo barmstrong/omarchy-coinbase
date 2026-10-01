@@ -270,7 +270,7 @@ function watchlistItemKey(item) {
 }
 
 function watchlistMoveRequest(rows, index, delta) {
-  if (delta !== -1 && delta !== 1) return null
+  if (!Number.isInteger(index) || !Number.isInteger(delta) || delta === 0) return null
   if (index < 0 || index >= rows.length || index + delta < 0 || index + delta >= rows.length) return null
   var item = rows[index].watchlistItem
   var anchor = rows[index + delta].watchlistItem

@@ -52,6 +52,13 @@ Item {
   property var watchlistBeforeAction: null
   property var watchlistOrderOverride: null
   property string watchlistReorderMessage: ""
+  property var watchlistDragRows: null
+  property int watchlistDragIndex: -1
+  property int watchlistDropIndex: -1
+  property real watchlistDragY: 0
+  property real watchlistPressY: 0
+  property bool watchlistDragging: false
+  onCanReorderWatchlistChanged: if (!canReorderWatchlist) cancelWatchlistDrag()
   readonly property bool watchlistReorderView: opened && signedIn && !showingDetail && !searching && marketTab === "watchlist"
   readonly property bool canReorderWatchlist: watchlistReorderView && watchlistStatus.ready === true
     && watchlistStatus.canUpdate === true && !watchlistStatus.error
@@ -105,7 +112,7 @@ Item {
   readonly property string period: String(snapshot.period || "day")
   readonly property var assets: snapshot.assets || []
   readonly property bool searching: String(searchQuery).replace(/^\s+|\s+$/g, "").length > 0
-  readonly property var visibleAssets: filteredAssets(searchQuery, assets)
+  readonly property var visibleAssets: watchlistDragRows || filteredAssets(searchQuery, assets)
   readonly property real pnl: Number(root.showingDetail ? snapshot.pnl : root.portfolioField("pnl", snapshot.pnl))
   readonly property color pnlColor: Model.pnlColor(root.showingDetail ? Number((detailChart && detailChart.pnl) || (detailAsset && detailAsset.pnl) || 0) : pnl, Color.accent, Color.urgent, foreground)
   readonly property var sparkline: {
@@ -530,9 +537,9 @@ Item {
     if (flick) flick.contentY = 0
     snapshotFile.reload()
     syncTabToPin()
-    // An explicit open of a stale view gets one immediate attempt, even if
-    // the last failure's background cooldown has not elapsed yet.
-    refresh(Model.snapshotNeedsRefresh(root.snapshot, Date.now()))
+    // Opening the panel requests current data, even when the bar's cached
+    // snapshot is recent. A running refresh is shared instead of duplicated.
+    refresh(true)
     Qt.callLater(function() {
       if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
     })
@@ -757,7 +764,7 @@ Item {
     root.applySnapshotOnExit = force === true
     root.periodChangeRequested = false
     snapshotProc.command = [pluginFile("bin/coinbase"), "snapshot", "--period", period]
-    if (!force) snapshotProc.command.push("--max-age", "20")
+    if (!force) snapshotProc.command.push("--max-age", "10")
     snapshotProc.running = true
   }
 
@@ -777,12 +784,60 @@ Item {
     root.startWatchlistAction("state", root.detailAsset)
   }
 
-  function moveWatchlistItem(index, delta) {
+  function cancelWatchlistDrag() {
+    root.watchlistDragging = false
+    root.watchlistDragIndex = -1
+    root.watchlistDropIndex = -1
+    root.watchlistDragRows = null
+  }
+
+  function updateWatchlistDrag(y) {
+    if (root.watchlistDragIndex < 0) return
+    root.watchlistDragY = y
+    if (Math.abs(y - root.watchlistPressY) >= Qt.styleHints.startDragDistance)
+      root.watchlistDragging = true
+    var row = marketAssetRepeater.itemAt(0)
+    if (!row) return
+    var slot = Math.floor((y + flick.contentY - row.y + marketsBlock.spacing / 2)
+      / (row.height + marketsBlock.spacing))
+    root.watchlistDropIndex = Math.max(0, Math.min(root.visibleAssets.length - 1, slot))
+  }
+
+  function finishWatchlistDrag(inside) {
+    var from = root.watchlistDragIndex
+    var to = root.watchlistDropIndex
+    var rows = root.watchlistDragRows
+    var body = inside && root.watchlistDragging ? Model.watchlistMoveRequest(rows || [], from, to - from) : null
+    // Defer model changes until the handle has finished processing release.
+    Qt.callLater(function() {
+      if (root.watchlistDragRows !== rows || root.watchlistDragIndex !== from) return
+      root.cancelWatchlistDrag()
+      if (body) root.moveWatchlistItem(from, to - from, body)
+    })
+  }
+
+  Timer {
+    interval: 16
+    repeat: true
+    running: root.watchlistDragging
+    onTriggered: {
+      var edge = Style.space(32)
+      var direction = root.watchlistDragY < edge ? -1 : (root.watchlistDragY > flick.height - edge ? 1 : 0)
+      if (!direction) return
+      flick.contentY = Math.max(0, Math.min(Math.max(0, flick.contentHeight - flick.height), flick.contentY + direction * Style.space(8)))
+      root.updateWatchlistDrag(root.watchlistDragY)
+    }
+  }
+
+  function moveWatchlistItem(index, delta, request) {
     if (!root.canReorderWatchlist) return
-    var body = Model.watchlistMoveRequest(root.visibleAssets, index, delta)
+    var body = request || Model.watchlistMoveRequest(root.visibleAssets, index, delta)
     var reordered = Model.reorderedWatchlist(root.watchlistStatus.items, body)
     if (!body || !reordered) return
-    var selected = Model.assetKey(root.visibleAssets[index])
+    var selected = ""
+    for (var i = 0; i < root.visibleAssets.length; i++)
+      if (Model.watchlistItemKey(root.visibleAssets[i].watchlistItem) === Model.watchlistItemKey(body.item))
+        selected = Model.assetKey(root.visibleAssets[i])
     root.watchlistAction = "reorder"
     root.watchlistPayload = body
     root.watchlistResponseReceived = false
@@ -1204,9 +1259,9 @@ Item {
   }
 
   Timer {
-    // Retry promptly after wake/network recovery. The helper still enforces
-    // its failure cooldown, and refresh() won't overlap a running request.
-    interval: Model.snapshotNeedsRefresh(root.snapshot, root.statusNow) ? 5000 : 30000
+    // Keep an open dashboard current; the bar retains its slower cadence.
+    // Failed refreshes still honor the helper's cooldown, without overlaps.
+    interval: Model.snapshotNeedsRefresh(root.snapshot, root.statusNow) ? 5000 : 15000
     running: root.opened
     repeat: true
     onTriggered: {
@@ -1299,7 +1354,7 @@ Item {
     Column {
       id: assetCol
       z: 1
-      width: parent.width - Style.space(8) - (reorderControls.visible ? reorderControls.width + Style.space(8) : 0)
+      width: parent.width - Style.space(8) - (reorderHandle.visible ? reorderHandle.width + Style.space(8) : 0)
       anchors.verticalCenter: parent.verticalCenter
       anchors.left: parent.left
       anchors.leftMargin: Style.space(4)
@@ -1400,46 +1455,77 @@ Item {
       onClicked: root.chooseAsset(modelData)
     }
 
-    Row {
-      id: reorderControls
+    Rectangle {
+      id: reorderHandle
       visible: root.watchlistReorderView
       z: 3
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(2)
-      Repeater {
-        model: [-1, 1]
-        Rectangle {
-          id: moveControl
-          required property int modelData
-          readonly property bool canMove: root.canReorderWatchlist
-            && Model.watchlistMoveRequest(root.visibleAssets, assetRow.index, modelData) !== null
-          width: Style.space(28)
-          height: Style.space(36)
-          radius: Style.cornerRadius
-          color: moveMouse.containsMouse && canMove ? Util.alpha(root.foreground, 0.1) : "transparent"
-          Text {
-            anchors.centerIn: parent
-            text: moveControl.modelData < 0 ? "↑" : "↓"
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            color: moveControl.canMove ? root.foreground : root.muted
-            opacity: moveControl.canMove ? 1 : 0.4
+      width: Style.space(28)
+      height: Style.space(36)
+      radius: Style.cornerRadius
+      readonly property bool available: root.canReorderWatchlist && root.visibleAssets.length > 1
+        && Model.watchlistItemKey(assetRow.modelData.watchlistItem) !== ""
+      color: handleMouse.containsMouse && available ? Util.alpha(root.foreground, 0.1) : "transparent"
+      Grid {
+        anchors.centerIn: parent
+        columns: 2
+        spacing: Style.space(3)
+        opacity: reorderHandle.available ? 1 : 0.4
+        Repeater {
+          model: 6
+          Rectangle {
+            width: Style.space(3)
+            height: width
+            radius: width / 2
+            color: handleMouse.containsMouse ? root.foreground : root.muted
           }
-          MouseArea {
-            id: moveMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: moveControl.canMove ? Qt.PointingHandCursor : Qt.ArrowCursor
-            // Consume even unavailable edge/pending clicks; don't open details.
-            onClicked: if (moveControl.canMove) root.moveWatchlistItem(assetRow.index, moveControl.modelData)
-          }
-          Accessible.role: Accessible.Button
-          Accessible.name: "Move " + String(assetRow.modelData.name || assetRow.modelData.id) + (modelData < 0 ? " up" : " down")
-          Accessible.onPressAction: if (canMove) root.moveWatchlistItem(assetRow.index, modelData)
         }
       }
+      MouseArea {
+        id: handleMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: !reorderHandle.available ? Qt.ArrowCursor
+          : (pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
+        onPressed: function(mouse) {
+          if (!reorderHandle.available) return
+          flick.cancelFlick()
+          root.watchlistDragRows = root.visibleAssets
+          root.watchlistDragIndex = assetRow.index
+          root.watchlistDropIndex = assetRow.index
+          root.watchlistPressY = mapToItem(flick, mouse.x, mouse.y).y
+          root.watchlistDragY = root.watchlistPressY
+          root.listCursor = assetRow.index
+          root.hoverSelectEnabled = false
+        }
+        onPositionChanged: function(mouse) {
+          if (pressed) root.updateWatchlistDrag(mapToItem(flick, mouse.x, mouse.y).y)
+        }
+        onReleased: function(mouse) {
+          var point = mapToItem(flick, mouse.x, mouse.y)
+          root.finishWatchlistDrag(point.x >= 0 && point.x <= flick.width && point.y >= 0 && point.y <= flick.height)
+        }
+        onCanceled: root.cancelWatchlistDrag()
+      }
+      Accessible.role: Accessible.Button
+      Accessible.name: "Reorder " + String(assetRow.modelData.name || assetRow.modelData.id)
+      Accessible.description: "Drag to reorder, or select the row and press Alt+Up or Alt+Down."
     }
+
+    Rectangle {
+      visible: root.watchlistDragging && root.watchlistDropIndex === assetRow.index
+        && root.watchlistDropIndex !== root.watchlistDragIndex
+      z: 4
+      width: parent.width
+      height: Math.max(2, Style.normalBorderWidth)
+      y: root.watchlistDropIndex < root.watchlistDragIndex ? -Style.space(4) : parent.height + Style.space(4) - height
+      radius: height / 2
+      color: Color.accent
+    }
+    border.width: root.watchlistDragging && root.watchlistDragIndex === index ? Math.max(1, Style.normalBorderWidth) : 0
+    border.color: Color.accent
   }
 
   component DetailMetricCard: Rectangle {
@@ -1515,13 +1601,13 @@ Item {
         onActivated: root.pinToBar(root.detailAsset)
       }
       Shortcut {
-        enabled: root.canReorderWatchlist && !searchField.activeFocus
+        enabled: root.canReorderWatchlist && root.watchlistDragIndex < 0 && !searchField.activeFocus
         sequence: "Alt+Up"
         context: Qt.WindowShortcut
         onActivated: root.moveWatchlistItem(root.listCursor, -1)
       }
       Shortcut {
-        enabled: root.canReorderWatchlist && !searchField.activeFocus
+        enabled: root.canReorderWatchlist && root.watchlistDragIndex < 0 && !searchField.activeFocus
         sequence: "Alt+Down"
         context: Qt.WindowShortcut
         onActivated: root.moveWatchlistItem(root.listCursor, 1)
@@ -1576,7 +1662,10 @@ Item {
       }
 
       Keys.onEscapePressed: function(event) {
-        if (root.showingDetail) {
+        if (root.watchlistDragIndex >= 0) {
+          root.cancelWatchlistDrag()
+          event.accepted = true
+        } else if (root.showingDetail) {
           root.closeDetail()
           event.accepted = true
         } else root.dismiss()
@@ -2145,7 +2234,7 @@ Item {
               contentHeight: detailBlock.implicitHeight
               clip: true
               boundsBehavior: Flickable.StopAtBounds
-              interactive: contentHeight > height
+              interactive: contentHeight > height && root.watchlistDragIndex < 0
               flickableDirection: Flickable.VerticalFlick
 
               Column {
@@ -2277,6 +2366,32 @@ Item {
               flickableDirection: Flickable.VerticalFlick
               onContentYChanged: {
                 if (root.opened && moving) rowScrollDebounce.restart()
+              }
+
+              Rectangle {
+                // A small preview follows the pointer without intercepting the drag.
+                visible: root.watchlistDragging
+                z: 10
+                x: Style.space(8)
+                y: root.watchlistDragY + flick.contentY - height / 2
+                width: Math.min(flick.width - Style.space(56), dragLabel.implicitWidth + Style.space(24))
+                height: Style.space(36)
+                radius: Style.cornerRadius
+                color: Color.background
+                border.width: Math.max(1, Style.normalBorderWidth)
+                border.color: Color.accent
+                Text {
+                  id: dragLabel
+                  anchors.fill: parent
+                  anchors.margins: Style.space(8)
+                  verticalAlignment: Text.AlignVCenter
+                  text: root.watchlistDragIndex >= 0
+                    ? String(root.visibleAssets[root.watchlistDragIndex].name || root.visibleAssets[root.watchlistDragIndex].id) : ""
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
               }
 
               HoverHandler {

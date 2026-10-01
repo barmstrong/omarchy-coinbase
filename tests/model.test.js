@@ -17,6 +17,16 @@ assert.equal(Model.watchlistMoveRequest(watchRows, 0, -1), null, "first visible 
 assert.equal(Model.watchlistMoveRequest(watchRows, 1, 1), null, "last visible row cannot move down")
 assert.equal(Model.watchlistMoveRequest(watchRows, -1, 1), null)
 assert.equal(Model.watchlistMoveRequest(watchRows, 0, 2), null)
+const dragRefs = Array.from({length: 6}, (_, i) => ({assetUuid: "drag-" + i}))
+const dragRows = dragRefs.map(watchlistItem => ({watchlistItem}))
+assert.deepEqual(Model.reorderedWatchlist(dragRefs, Model.watchlistMoveRequest(dragRows, 0, 5)),
+  [...dragRefs.slice(1), dragRefs[0]], "drag from first to last in one request")
+assert.deepEqual(Model.reorderedWatchlist(dragRefs, Model.watchlistMoveRequest(dragRows, 5, -5)),
+  [dragRefs[5], ...dragRefs.slice(0, 5)], "drag from last to first")
+assert.deepEqual(Model.reorderedWatchlist(dragRefs, Model.watchlistMoveRequest(dragRows, 1, 3)),
+  [dragRefs[0], dragRefs[2], dragRefs[3], dragRefs[4], dragRefs[1], dragRefs[5]])
+for (const [index, delta] of [[0, 0], [1.5, 1], [0, NaN], [0, 1.5], [0, 6], [5, -6]])
+  assert.equal(Model.watchlistMoveRequest(dragRows, index, delta), null)
 const moveUp = Model.watchlistMoveRequest(watchRows, 1, -1)
 assert.deepEqual(moveUp, {item: refB, beforeItem: refA})
 assert.deepEqual(Model.watchlistMoveRequest(watchRows, 0, 1), {item: refA, afterItem: refB})
@@ -161,8 +171,31 @@ assert.equal(Model.snapshotNeedsRefresh({fetchedAt: new Date(now - 190 * 3600000
 assert.equal(Model.snapshotNeedsRefresh({fetchedAt: new Date(now - 120000).toISOString()}, now), true)
 assert.equal(Model.snapshotNeedsRefresh({fetchedAt: new Date(now - 119999).toISOString()}, now), false)
 assert.equal(Model.snapshotNeedsRefresh({}, now), true)
-assert.match(panelSource, /refresh\(Model.snapshotNeedsRefresh\(root.snapshot, Date.now\(\)\)\)/, "opening stale data bypasses the previous failure cooldown once")
-assert.match(panelSource, /interval: Model.snapshotNeedsRefresh\(root.snapshot, root.statusNow\) \? 5000 : 30000/, "stale open views retry promptly without changing the healthy cadence")
+// Opening even a fresh dashboard bypasses the cache; background polling
+// coalesces recent work and reopening during a refresh doesn't launch another.
+const snapshotProcess = {running: false, command: []}
+const polling = {Model, snapshotProc: snapshotProcess, period: "day", opened: false,
+  snapshot: {fetchedAt: new Date().toISOString()}, pendingSnapshotRaw: "", applySnapshotOnExit: false,
+  snapshotFile: {reload: () => {}}, flick: {contentY: 0}, keyCatcher: {forceActiveFocus: () => {}},
+  Qt: {callLater: fn => fn()}, pluginFile: x => x, syncTabToPin: () => {}}
+polling.root = polling
+for (const name of ["open", "refresh"]) {
+  const start = panelSource.indexOf("  function " + name + "(")
+  vm.runInNewContext(panelSource.slice(start, panelSource.indexOf("\n  }", start) + 4), polling)
+}
+polling.open("{}")
+assert.equal(polling.opened, true)
+assert.deepEqual(Array.from(snapshotProcess.command), ["bin/coinbase", "snapshot", "--period", "day"])
+assert.equal(polling.applySnapshotOnExit, true, "an explicit open accepts the refreshed snapshot")
+snapshotProcess.running = false
+polling.refresh()
+assert.deepEqual(Array.from(snapshotProcess.command), ["bin/coinbase", "snapshot", "--period", "day", "--max-age", "10"])
+assert.equal(polling.applySnapshotOnExit, false, "background refresh preserves chart exploration")
+const inFlightCommand = snapshotProcess.command
+polling.open("{}")
+assert.equal(snapshotProcess.command, inFlightCommand, "reopening shares the request in flight")
+assert.equal(polling.applySnapshotOnExit, true)
+assert.match(panelSource, /interval: Model.snapshotNeedsRefresh\(root.snapshot, root.statusNow\) \? 5000 : 15000/)
 
 // Run the actual receive path: a stationary chart hover must not pin a
 // days-old snapshot once the background refresh succeeds.
