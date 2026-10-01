@@ -159,6 +159,7 @@ async function start(env, url) {
   authorize.searchParams.set("client_id", env.COINBASE_CLIENT_ID);
   authorize.searchParams.set("redirect_uri", redirectUri);
   authorize.searchParams.set("scope", SCOPES);
+  authorize.searchParams.set("account", "all");
   authorize.searchParams.set("state", state);
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "S256");

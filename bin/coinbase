@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coinbase helper for the Omarchy coinbase plugin.
 
-Talks to Coinbase over OAuth (read-only scopes) and writes a snapshot the
+Talks to Coinbase over OAuth (limited account/watchlist scopes) and writes a snapshot the
 QML watches. Tokens and client secrets stay in ~/.local/state and never
 enter QML or git.
 """
@@ -15,7 +15,7 @@ import json
 import os
 import re
 import secrets
-import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -1422,110 +1422,15 @@ def token_is_current(token: str) -> bool:
     return bool(current) and secrets.compare_digest(current, str(token or ""))
 
 
-def _desktop_exec(desktop: str) -> str:
-    if not desktop or Path(desktop).name != desktop or not desktop.endswith(".desktop"):
-        return ""
-    for prefix in (
-        Path.home() / ".local/share/applications",
-        Path.home() / ".nix-profile/share/applications",
-        Path("/usr/share/applications"),
-    ):
-        path = prefix / desktop
-        if not path.is_file():
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            if line.startswith("Exec="):
-                try:
-                    fields = shlex.split(line[5:].strip())
-                except ValueError:
-                    continue
-                if fields:
-                    return fields[0]
-    return ""
-
-
-def default_browser_exec() -> str:
-    env = os.environ.copy()
-    env.pop("BROWSER", None)
-    desktop = ""
-    try:
-        desktop = subprocess.check_output(
-            ["xdg-settings", "get", "default-web-browser"],
-            env=env,
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        desktop = ""
-    if not desktop:
-        try:
-            desktop = subprocess.check_output(
-                ["xdg-mime", "query", "default", "x-scheme-handler/https"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            desktop = ""
-    return _desktop_exec(desktop) or "chromium"
-
-
-def _lua_string(value: str) -> str:
-    if "]]" not in value:
-        return f"[[{value}]]"
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _hypr_json(args: list[str]) -> Any:
-    try:
-        raw = subprocess.check_output(["hyprctl", "-j", *args], text=True, stderr=subprocess.DEVNULL)
-        return json.loads(raw)
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return None
-
-
-def _browser_addresses() -> set[str]:
-    clients = _hypr_json(["clients"]) or []
-    out: set[str] = set()
-    if not isinstance(clients, list):
-        return out
-    for client in clients:
-        cls = str(client.get("class") or "").lower()
-        if "chrom" in cls or "brave" in cls or "firefox" in cls or "edge" in cls:
-            addr = str(client.get("address") or "")
-            if addr.startswith("0x") and len(addr) > 2 and all(ch in "0123456789abcdefABCDEF" for ch in addr[2:]):
-                out.add(addr)
-    return out
-
-
-def _active_workspace() -> str:
-    data = _hypr_json(["activeworkspace"]) or {}
-    if isinstance(data, dict) and isinstance(data.get("id"), int):
-        return str(data["id"])
-    return ""
-
-
-def _hypr_dispatch(expr: str) -> None:
-    subprocess.run(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-
-
-def _move_new_browser_here(before: set[str]) -> None:
-    workspace = _active_workspace()
-    if not workspace:
-        return
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        new = [addr for addr in _browser_addresses() if addr not in before]
-        if new:
-            addr = new[-1]
-            _hypr_dispatch(f"movetoworkspace {workspace},address:{addr}")
-            _hypr_dispatch(f"focuswindow address:{addr}")
-            _hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
-            return
-        time.sleep(0.12)
+def all_accounts_authorize_url(url: str) -> str:
+    """Request all-account access while preserving the broker's PKCE and state."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "login.coinbase.com" or parsed.path != "/oauth2/auth":
+        raise RuntimeError("unexpected Coinbase authorization URL")
+    params = [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+              if key != "account"]
+    params.append(("account", "all"))
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(params)))
 
 
 def open_browser(url: str) -> None:
@@ -1541,24 +1446,11 @@ def open_browser(url: str) -> None:
         or parsed.password
     ):
         raise RuntimeError("refusing to open a non-Coinbase or malformed URL")
-    browser = default_browser_exec()
-    argv = [browser, "--new-window", url]
-    before = _browser_addresses() if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") else set()
-    try:
-        subprocess.Popen(
-            argv,
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=os.environ.copy(),
-        )
-    except OSError:
-        import webbrowser
-
-        webbrowser.open(url)
-        return
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
-        _move_new_browser_here(before)
+    # Let the desktop honor the complete browser entry and reuse its session.
+    # Forcing a raw executable with --new-window bypasses desktop/profile flags.
+    opener = ["gio", "open"] if shutil.which("gio") else ["xdg-open"]
+    subprocess.run([*opener, url], check=True, timeout=15,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _finish_login(payload: dict[str, Any]) -> None:
@@ -1598,7 +1490,7 @@ def login_via_broker() -> None:
     if not authorize or not session_id:
         write_login_status("error", "broker did not return an authorize URL")
         die("broker did not return an authorize URL")
-    open_browser(str(authorize))
+    open_browser(all_accounts_authorize_url(str(authorize)))
     write_login_status("waiting")
     print("STATUS waiting", flush=True)
     deadline = time.time() + 180
@@ -1631,6 +1523,23 @@ def login_via_broker() -> None:
 
 
 def cmd_login() -> None:
+    ensure_state()
+    with (STATE_DIR / "login.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Another process already owns the browser/callback/polling flow.
+            # Do not queue a second authorization when the first finishes.
+            print("STATUS waiting", flush=True)
+            return
+        try:
+            _perform_login()
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            write_login_status("error", "Could not complete sign-in. Please try again.")
+            raise
+
+
+def _perform_login() -> None:
     write_login_status("opening")
     if using_broker():
         login_via_broker()
@@ -1711,7 +1620,7 @@ def cmd_login() -> None:
 
     server.timeout = 1
     print("STATUS opening", flush=True)
-    open_browser(url)
+    open_browser(all_accounts_authorize_url(url))
     write_login_status("waiting")
     print("STATUS waiting", flush=True)
     deadline = time.time() + 180

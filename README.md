@@ -62,6 +62,13 @@ without `--enable` defers that prompt until the plugin is enabled.
 
 Click the bar widget, then **Sign in with Coinbase**. The repository includes a
 hosted OAuth broker URL, so installers do not need a Coinbase client secret.
+The authorization request includes Coinbase's documented
+[`account=all` option](https://docs.cdp.coinbase.com/coinbase-app/oauth2-integration/scopes#account-access)
+to request all portfolios/wallets. Coinbase controls the consent screen and
+the final access choice; if it still shows **Specific portfolios**, select
+**All portfolios and wallets** there. The widget requests the same limited
+scopes listed below. Sign-in uses the desktop's normal browser opener and
+permits only one authorization attempt at a time.
 
 ## CLI and agent integration
 

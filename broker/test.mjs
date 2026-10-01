@@ -95,6 +95,7 @@ assert.match(state, /^[A-Za-z0-9_-]{43}$/);
 assert.notEqual(state, started.session_id);
 assert.equal(started.session_id.split(".")[0], state);
 assert.equal(authorize.origin, "https://login.coinbase.com");
+assert.equal(authorize.searchParams.get("account"), "all");
 assert.equal(
   authorize.searchParams.get("scope"),
   "wallet:user:read,wallet:accounts:read,wallet:watchlist:read,wallet:watchlist:update,offline_access",
