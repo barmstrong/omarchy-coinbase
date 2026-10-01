@@ -97,7 +97,7 @@ assert.equal(started.session_id.split(".")[0], state);
 assert.equal(authorize.origin, "https://login.coinbase.com");
 assert.equal(
   authorize.searchParams.get("scope"),
-  "wallet:user:read,wallet:accounts:read,offline_access",
+  "wallet:user:read,wallet:accounts:read,wallet:watchlist:read,wallet:watchlist:update,offline_access",
 );
 
 assert.equal((await request(`/oauth/session/${started.session_id}`)).status, 404);
@@ -276,7 +276,7 @@ globalThis.fetch = async () =>
   });
 try {
   response = await request(`/oauth/callback?state=${broadGrantState}&code=test-code`);
-  assert.match(await response.text(), /outside this read-only app/);
+  assert.match(await response.text(), /outside this app/);
   const broadGrantSession = await sessions.object(broadGrantState).storage.get("session");
   assert.equal(broadGrantSession.status, "error");
   assert.equal(broadGrantSession.access_token, undefined);

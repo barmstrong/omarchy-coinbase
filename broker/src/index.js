@@ -4,12 +4,14 @@ const REVOKE_URL = "https://login.coinbase.com/oauth2/revoke";
 const SCOPES = [
   "wallet:user:read",
   "wallet:accounts:read",
+  "wallet:watchlist:read",
+  "wallet:watchlist:update",
   "offline_access",
 ].join(",");
 const SESSION_TTL = 600;
 const HANDOFF_TTL = 60;
 const HANDOFF_WAIT_MS = 30000;
-const READ_ONLY_SCOPES = new Set(SCOPES.split(","));
+const ACCEPTED_SCOPES = new Set(SCOPES.split(","));
 
 export default {
   async fetch(request, env) {
@@ -193,8 +195,8 @@ async function tokenRequest(env, body) {
   const granted = String(data.scope || "")
     .split(/[\s,]+/)
     .filter(Boolean);
-  if (granted.some((scope) => !READ_ONLY_SCOPES.has(scope)))
-    throw new Error("Coinbase returned permissions outside this read-only app's requested scopes");
+  if (granted.some((scope) => !ACCEPTED_SCOPES.has(scope)))
+    throw new Error("Coinbase returned permissions outside this app's requested scopes");
   return data;
 }
 

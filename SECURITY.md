@@ -11,10 +11,14 @@ If a token may have been exposed, revoke the application's access from your
 Coinbase account immediately and remove
 `~/.local/state/omarchy/coinbase/tokens.json` before signing in again.
 
-The plugin does not mutate account data. The helper permits the optional
-`wallet:watchlist:read` and `wallet:watchlist:update` grant for future watchlist
-testing, but does not call the experimental endpoint or expose mutation UI.
-Any behavior that can trade, transfer funds, request other write-capable OAuth scopes, send Coinbase credentials
+The plugin may add, remove, or reorder a single Simple Retail watchlist item after an
+explicit user action, using `wallet:watchlist:update`. Read and update grants
+are checked independently. Only the three fixed watchlist POST routes are used;
+removal and reordering preserve the exact typed identities returned by GET.
+Reordering moves one item relative to another without replacing the list or
+removing unsupported items. Uncertain writes are not retried automatically.
+Any behavior that can trade, transfer funds, request other write-capable OAuth
+scopes, send Coinbase credentials
 to a non-Coinbase API, or disclose one user's OAuth result to another user is a
 security vulnerability.
 

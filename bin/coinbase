@@ -57,11 +57,20 @@ SCOPES = ",".join(
     [
         "wallet:user:read",
         "wallet:accounts:read",
+        "wallet:watchlist:read",
+        "wallet:watchlist:update",
         "offline_access",
     ]
 )
-READ_ONLY_SCOPES = frozenset(SCOPES.split(","))
-ACCEPTED_SCOPES = READ_ONLY_SCOPES | {"wallet:watchlist:read", "wallet:watchlist:update"}
+ACCEPTED_SCOPES = frozenset(SCOPES.split(","))
+WATCHLIST_PATH = "/v2/watchlist/items"
+WATCHLIST_FIELDS = frozenset({
+    "assetUuid", "tokenCbrn", "predictionEventId", "predictionCbrn", "predictionSeriesId",
+    "predictionSeriesCbrn", "futureProductId", "futureCbrn", "perpetualProductId",
+    "deribitPerpetualInstrumentId", "perpetualCbrn", "equityProductId", "equityCbrn",
+    "ipoProductId", "ipoCbrn", "equityOptionProductId", "equityOptionCbrn",
+    "deribitCryptoOptionInstrumentId", "cryptoOptionCbrn", "tokenSaleCbrn",
+})
 PERIODS = {
     "hour": {"granularity": "FIVE_MINUTE", "seconds": 3600},
     "day": {"granularity": "FIVE_MINUTE", "seconds": 86400},
@@ -563,6 +572,10 @@ def load_app() -> dict[str, str]:
 def load_tokens() -> dict[str, Any]:
     data = read_json(TOKEN_FILE, {})
     return data if isinstance(data, dict) else {}
+
+
+def granted_scopes() -> set[str]:
+    return set(re.split(r"[\s,]+", str(load_tokens().get("scope") or "")))
 
 
 def load_watchlist_state() -> dict[str, Any]:
@@ -2721,6 +2734,8 @@ def market_category_for_asset(asset: dict[str, Any]) -> str:
 
 
 def asset_matches_market_tab(asset: dict[str, Any], tab: str) -> bool:
+    if market_category_for_asset(asset) == "preipo":
+        return False
     tab = str(tab or "all").lower()
     if tab == "all":
         return str(asset.get("kind") or "").lower() != "fiat"
@@ -2896,6 +2911,291 @@ def fetch_advanced_watchlist(token: str, *, force: bool = False) -> list[dict[st
     return []
 
 
+def crypto_asset_catalog() -> list[dict[str, str]]:
+    with product_cache_lock():
+        cache = read_json(PRODUCTS_CACHE, {})
+    cached = cache.get("cryptoAssetIndex", [])
+    if cached and num(cache.get("cryptoAssetIndexAt")) > time.time() - 86400:
+        return cached
+    try:
+        payload = public_get("/v2/currencies/crypto")
+        rows = payload.get("data")
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError("Crypto asset metadata unavailable")
+        catalog = [{"assetUuid": row["asset_id"], "id": row["code"], "name": row.get("name") or row["code"]}
+                   for row in rows if isinstance(row, dict) and row.get("asset_id") and row.get("code")]
+    except RuntimeError:
+        if cached:
+            return cached
+        raise
+    with product_cache_lock():
+        latest = read_json(PRODUCTS_CACHE, {})
+        latest.update(cryptoAssetIndex=catalog, cryptoAssetIndexAt=int(time.time()))
+        write_json(PRODUCTS_CACHE, latest)
+    return catalog
+
+
+def simple_watchlist_key(item: dict[str, Any]) -> str:
+    if isinstance(item, dict) and len(item) == 1:
+        field, value = next(iter(item.items()))
+        if field in WATCHLIST_FIELDS and isinstance(value, str) and value.strip():
+            return field + ":" + value
+    return ""
+
+
+def watchlist_items(payload: Any) -> list[dict[str, str]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("items", []), list):
+        raise RuntimeError("Unexpected Simple Retail watchlist response")
+    items = payload.get("items", [])
+    if any(not simple_watchlist_key(item) for item in items):
+        raise RuntimeError("Unexpected Simple Retail watchlist item")
+    return items
+
+
+def parse_simple_watchlist(payload: Any) -> list[dict[str, Any]]:
+    # The documented empty response is {}. Skip display entries whose metadata
+    # cannot be resolved, but retain their raw typed identities in the cache.
+    items = watchlist_items(payload)
+    crypto = {row["assetUuid"]: row for row in crypto_asset_catalog()} if any("assetUuid" in item or "tokenCbrn" in item for item in items) else {}
+    equities = {}
+    if any("equityCbrn" in item or "equityProductId" in item for item in items):
+        for row in load_equity_index():
+            for identifier in [row["productId"], *row.get("productAliases", [])]:
+                equities[identifier] = row
+    entries = []
+    seen = set()
+    for order, item in enumerate(items):
+        key = simple_watchlist_key(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        entry = None
+        if "assetUuid" in item or "tokenCbrn" in item:
+            asset_uuid = item.get("assetUuid") or retail_token_asset_uuid(item["tokenCbrn"])
+            info = crypto.get(asset_uuid)
+            if info:
+                entry = {"id": info["id"], "name": info["name"], "kind": "crypto", "productId": product_id_for(info["id"])}
+        elif "equityCbrn" in item or "equityProductId" in item:
+            pid = equity_hash(item["equityCbrn"]) if "equityCbrn" in item else item["equityProductId"]
+            info = equities.get(pid)
+            if not info and "equityCbrn" in item:
+                info = next((value for value in equities.values() if value.get("equityCbrn") == item["equityCbrn"]), None)
+            if not info:
+                info = resolve_watchlist_equity(pid)
+            if info:
+                ticker = info["ticker"]
+                entry = {"id": ticker, "name": info["name"], "kind": "commodity" if ticker in {t for t, _ in COMMODITY_ETFS} else "stock", "productId": info["productId"]}
+        if not entry:
+            continue
+        entry.update(watchlistItem=dict(item), watchlistKey=key, watchlistOrder=order)
+        entries.append(entry)
+    return entries
+
+
+def retail_token_asset_uuid(cbrn: str) -> str:
+    # Coinbase's retail asset pages explicitly group these Base tokens under
+    # XRP and Zcash respectively.
+    # The currencies API currently omits its contract_address, so retain this
+    # verified alias until it exposes that metadata. Match the entire network
+    # identity, not just an address or symbol. Preserve the original CBRN for
+    # removal instead of reconstructing it from the asset UUID.
+    # Source: https://www.coinbase.com/price/xrp (Network & Addresses)
+    # Source: https://www.coinbase.com/price/zcash (Network & Addresses)
+    aliases = {
+        "v1:token:base:mainnet:0xcb585250f852c6c6bf90434ab21a00f02833a4af:":
+            "e17a44c8-6ea1-564f-a02c-2a9ca1d8eec4",
+        "v1:token:base:mainnet:0xb2000000000000000000008501b13360000cb2ec:":
+            "1d3c2625-a8d9-5458-84d0-437d75540421",
+    }
+    return aliases.get(cbrn.lower(), "")
+
+
+def resolve_watchlist_equity(product_id: str) -> dict[str, Any] | None:
+    # Watchlist CBRNs use a product identity that may be absent from the
+    # ticker-deduplicated catalog (e.g. USD vs USDC). Resolve the exact ID;
+    # never infer a stock from price or list position.
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", product_id):
+        return None
+    with product_cache_lock():
+        cached = read_json(PRODUCTS_CACHE, {}).get("watchlistEquityDetails", {}).get(product_id, {})
+    ttl = 86400 if cached.get("entry") else 300
+    if num(cached.get("at")) > time.time() - ttl:
+        return cached.get("entry")
+    product = fetch_product(product_id)
+    details = product.get("equity_product_details") or {}
+    ticker = str(details.get("ticker") or "").upper()
+    entry = None
+    if product.get("product_id") == product_id and product.get("product_type") == "EQUITY" and ticker:
+        entry = {"ticker": ticker, "name": details.get("short_name") or product.get("display_name") or ticker,
+                 "productId": product_id}
+    # Preserve previously verified metadata through temporary outages.
+    entry = entry or cached.get("entry")
+    with product_cache_lock():
+        latest = read_json(PRODUCTS_CACHE, {})
+        latest.setdefault("watchlistEquityDetails", {})[product_id] = {"entry": entry, "at": int(time.time())}
+        write_json(PRODUCTS_CACHE, latest)
+    return entry
+
+
+def fetch_simple_watchlist(token: str, *, force: bool = False) -> list[dict[str, Any]]:
+    state = load_watchlist_state()
+    cached = state.get("simpleEntries")
+    if "wallet:watchlist:read" not in granted_scopes():
+        save_watchlist_state(simpleError="Sign out and back in to grant watchlist access.")
+        return []
+    if not force and isinstance(cached, list) and time.time() - num(state.get("simpleAt")) < WATCHLIST_TTL:
+        return cached
+    try:
+        payload = api_get(WATCHLIST_PATH, token)
+        entries = parse_simple_watchlist(payload)
+        if not token_is_current(token):
+            return []
+        save_watchlist_state(simpleEntries=entries, simpleItems=watchlist_items(payload), simpleAt=int(time.time()),
+                             simpleError="", simpleUnsupported=max(0, len(watchlist_items(payload)) - len(entries)))
+        return entries
+    except RuntimeError:
+        if token_is_current(token):
+            save_watchlist_state(simpleError="Could not refresh the Simple Retail watchlist. Retrying automatically.")
+        return cached if isinstance(cached, list) else []
+
+
+def watchlist_status() -> dict[str, Any]:
+    state = load_watchlist_state()
+    scopes = granted_scopes()
+    return {"source": "simple", "ready": isinstance(state.get("simpleItems"), list) and "wallet:watchlist:read" in scopes,
+            "canUpdate": "wallet:watchlist:update" in scopes,
+            "error": state.get("simpleError", ""), "unsupported": int(num(state.get("simpleUnsupported"))),
+            "items": state.get("simpleItems", []) if "wallet:watchlist:read" in scopes else []}
+
+
+def watchlist_reference(row: dict[str, Any]) -> dict[str, str]:
+    stored = row.get("watchlistItem")
+    if simple_watchlist_key(stored):
+        return dict(stored)
+    if row.get("kind") == "crypto":
+        matches = [item for item in crypto_asset_catalog() if item["id"].upper() == str(row.get("id") or "").upper()]
+        if len(matches) == 1:
+            return {"assetUuid": matches[0]["assetUuid"]}
+    elif row.get("kind") in {"stock", "commodity"}:
+        matches = [item for item in load_equity_index() if item["ticker"].upper() == str(row.get("id") or "").upper()]
+        if len(matches) == 1 and matches[0].get("productId"):
+            return {"equityProductId": matches[0]["productId"]}
+    raise RuntimeError("This asset does not yet have a verified Coinbase watchlist identifier.")
+
+
+def validate_watchlist_reference(item: dict[str, str]) -> None:
+    if not simple_watchlist_key(item):
+        raise RuntimeError("A watchlist request must contain exactly one supported identifier.")
+    field, value = next(iter(item.items()))
+    if len(value) > 2048 or value != value.strip():
+        raise RuntimeError("Invalid watchlist identifier.")
+    if field == "assetUuid" and not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+        raise RuntimeError("Invalid asset UUID.")
+    if field in {"deribitPerpetualInstrumentId", "deribitCryptoOptionInstrumentId"} and not re.fullmatch(r"[0-9]+", value):
+        raise RuntimeError("Invalid Deribit instrument ID.")
+
+
+def mutate_simple_watchlist(token: str, action: str, item: dict[str, str], *, position: dict[str, Any] | None = None) -> None:
+    if "wallet:watchlist:update" not in granted_scopes():
+        raise RuntimeError("Sign out and back in to grant watchlist editing access.")
+    if action not in {"add", "remove", "reorder"}:
+        raise RuntimeError("Invalid watchlist action.")
+    validate_watchlist_reference(item)
+    body = {"item": item}
+    if action == "reorder":
+        if not isinstance(position, dict) or len(position) != 1 or not set(position) <= {"beforeItem", "afterItem"}:
+            raise RuntimeError("Reordering requires exactly one beforeItem or afterItem.")
+        anchor = next(iter(position.values()))
+        validate_watchlist_reference(anchor)
+        if simple_watchlist_key(item) == simple_watchlist_key(anchor):
+            raise RuntimeError("An item cannot be moved relative to itself.")
+        body.update(position)
+    elif position:
+        raise RuntimeError("Positions are only supported for reordering.")
+    # No arbitrary paths, methods or body fields may be supplied by the UI.
+    path = WATCHLIST_PATH + ("/" + action if action in {"remove", "reorder"} else "")
+    http_json("POST", API + path, headers={"Authorization": "Bearer " + token}, body=body)
+
+
+def watchlist_action_state(row: dict[str, Any]) -> dict[str, Any]:
+    item = watchlist_reference(row)
+    key = simple_watchlist_key(item)
+    state = watchlist_status()
+    stored = next((ref for ref in state["items"] if simple_watchlist_key(ref) == key), None)
+    # Native IDs may be canonicalized to CBRNs. Use the normalized read row,
+    # never invent a CBRN or remove by an approximate ticker match.
+    if stored is None:
+        for entry in load_watchlist_state().get("simpleEntries", []):
+            same_product = entry.get("productId") and entry.get("productId") == row.get("productId")
+            # Equity tickers here come from Coinbase's authoritative metadata,
+            # so USD/USDC listings of that same stock share membership.
+            same_equity = row.get("kind") in {"stock", "commodity"} and entry.get("kind") in {"stock", "commodity"} and entry.get("id") == row.get("id")
+            if (entry.get("kind") == row.get("kind") and same_product) or same_equity:
+                stored = entry.get("watchlistItem")
+                break
+    return {"item": stored or item, "watched": stored is not None, "ready": state["ready"] and not state["error"], "canUpdate": state["canUpdate"], "message": state["error"]}
+
+
+def cmd_watchlist_action(action: str) -> None:
+    result: dict[str, Any] = {"ok": False}
+    try:
+        payload = json.loads(sys.stdin.readline(16385))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Invalid watchlist request.")
+        token = valid_access_token()
+        if action == "state":
+            print(json.dumps({"ok": True, **watchlist_action_state(payload)}))
+            return
+        # Explicit user actions wait for the snapshot writer rather than
+        # silently losing a click to routine background refresh contention.
+        with snapshot_lock():
+            if not token_is_current(token):
+                raise RuntimeError("Signed out. Sign in again to edit your watchlist.")
+            if action == "state":
+                result = {"ok": True, **watchlist_action_state(payload)}
+            else:
+                if action == "reorder":
+                    if set(payload) - {"item", "beforeItem", "afterItem"}:
+                        raise RuntimeError("Invalid reorder request.")
+                    mutate_simple_watchlist(token, action, payload.get("item"),
+                                           position={key: payload[key] for key in ("beforeItem", "afterItem") if key in payload})
+                else:
+                    mutate_simple_watchlist(token, action, payload.get("item"))
+                # The confirmed star state is the success feedback. Reserve
+                # inline messages for failures or an unconfirmed refresh.
+                result = {"ok": True, "message": ""}
+                if token_is_current(token):
+                    # Invalidate before read-after-write. A missing read scope
+                    # or failed GET must not turn an acknowledged write into a
+                    # fake failure or trigger a second write.
+                    save_watchlist_state(simpleAt=0)
+                    if "wallet:watchlist:read" in granted_scopes():
+                        entries = fetch_simple_watchlist(token, force=True)
+                        if token_is_current(token):
+                            snap = read_json(SNAPSHOT_FILE, {})
+                            if snap.get("authenticated"):
+                                snap["assets"] = merge_watchlist_entries(snap.get("assets") or [], entries)
+                                snap["watchlistStatus"] = watchlist_status()
+                                write_snapshot(snap)
+                            if watchlist_status()["error"]:
+                                result["message"] = "Refresh pending; do not repeat the action."
+                            elif action == "reorder":
+                                result["items"] = watchlist_status()["items"]
+    except RefreshBusy:
+        result = {"ok": False, "message": "Watchlist is refreshing. Please try again in a moment."}
+    except RuntimeError as exc:
+        message = str(exc)
+        # API errors have no stable envelope. Never surface raw server bodies.
+        if message.startswith("HTTP 401"):
+            message = "Coinbase sign-in expired. Please sign out and back in."
+        elif message.startswith(("HTTP ", "request failed")):
+            message = "Coinbase could not confirm the request. Refresh your watchlist before trying again."
+        result = {"ok": False, "message": message}
+    except (ValueError, TypeError, AttributeError):
+        result = {"ok": False, "message": "Invalid watchlist request."}
+    print(json.dumps(result))
+
+
 def asset_from_watch_entry(entry: dict[str, Any], order: int) -> dict[str, Any]:
     kind = str(entry.get("kind") or "crypto")
     symbol = str(entry.get("id") or "").upper()
@@ -2909,7 +3209,7 @@ def asset_from_watch_entry(entry: dict[str, Any], order: int) -> dict[str, Any]:
             symbol,
             name,
             kind,
-            pid or product_id_for(symbol),
+            pid or ("" if entry.get("watchlistUnavailable") else product_id_for(symbol)),
             price=num(entry.get("price")),
             dayPnl=num(entry.get("dayPnl")),
             dayPnlPercent=num(entry.get("dayPnlPercent")),
@@ -2922,6 +3222,11 @@ def asset_from_watch_entry(entry: dict[str, Any], order: int) -> dict[str, Any]:
     row["watchlist"] = True
     row["watchlistOrder"] = order
     row["held"] = False
+    row["watchlistItem"] = entry.get("watchlistItem")
+    row["watchlistKey"] = entry.get("watchlistKey", "")
+    row["watchlistUnavailable"] = bool(entry.get("watchlistUnavailable"))
+    if row["watchlistUnavailable"]:
+        row.update(market=False, url="", buyUrl="", sellUrl="")
     return row
 
 
@@ -2935,12 +3240,15 @@ def mark_watchlist_asset(asset: dict[str, Any], order: int) -> None:
 def merge_watchlist_entries(
     assets: list[dict[str, Any]], entries: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
+    assets = [asset for asset in assets if not asset.get("watchlistUnavailable")]
     extras: list[dict[str, Any]] = []
     index = _index_assets(assets)
 
     for asset in assets:
         asset["watchlist"] = False
         asset.pop("watchlistOrder", None)
+        asset.pop("watchlistItem", None)
+        asset.pop("watchlistKey", None)
 
     def attach(entry: dict[str, Any], order: int) -> None:
         pid = str(entry.get("productId") or "").upper()
@@ -2954,6 +3262,8 @@ def merge_watchlist_entries(
         )
         if existing:
             mark_watchlist_asset(existing, order)
+            existing["watchlistItem"] = entry.get("watchlistItem")
+            existing["watchlistKey"] = entry.get("watchlistKey", "")
             return
         extra = asset_from_watch_entry(entry, order)
         extras.append(extra)
@@ -2967,7 +3277,7 @@ def merge_watchlist_entries(
 
 
 def merge_watchlist(assets: list[dict[str, Any]], token: str = "") -> list[dict[str, Any]]:
-    entries = fetch_advanced_watchlist(token) if token else []
+    entries = fetch_simple_watchlist(token) if token else []
     return merge_watchlist_entries(assets, entries)
 
 
@@ -3118,6 +3428,9 @@ def derivative_majors(limit: int = 400) -> list[dict[str, Any]]:
             pid = str(product.get("product_id") or "")
             if not pid or pid in seen_products:
                 continue
+            # Manual exclusion, not a claim of account/region eligibility.
+            if market_category_for_product(product, "derivative") == "preipo":
+                continue
             seen_products.add(pid)
             rows.append(product)
     ranked = []
@@ -3172,20 +3485,21 @@ def equity_hash(value: str) -> str:
     return parts[-1].strip(":") if parts else ""
 
 
-def load_equity_index() -> list[dict[str, str]]:
+def load_equity_index() -> list[dict[str, Any]]:
     with product_cache_lock():
         cache = read_json(PRODUCTS_CACHE, {})
     cached = cache.get("equityIndex") if isinstance(cache, dict) else None
     fetched = num(cache.get("equityIndexFetchedAt") if isinstance(cache, dict) else 0)
-    if isinstance(cached, list) and cached and fetched > time.time() - 6 * 3600:
+    if isinstance(cached, list) and cached and cache.get("equityIndexVersion") == 2 and fetched > time.time() - 6 * 3600:
         return cached
 
-    catalog: list[dict[str, str]] = []
+    catalog: list[dict[str, Any]] = []
     seen: set[str] = set()
-    wanted = {t for t, _ in MEGA_STOCKS} | {t for t, _ in COMMODITY_ETFS}
+    by_ticker: dict[str, dict[str, Any]] = {}
     cursor = ""
-    for _ in range(12):
-        params: dict[str, Any] = {"product_type": "EQUITY"}
+    complete = False
+    for _ in range(64):
+        params: dict[str, Any] = {"product_type": "EQUITY", "limit": 1000}
         if cursor:
             params["cursor"] = cursor
         try:
@@ -3195,7 +3509,12 @@ def load_equity_index() -> list[dict[str, str]]:
         for p in payload.get("products") or []:
             det = p.get("equity_product_details") or {}
             ticker = str(det.get("ticker") or p.get("base_display_symbol") or p.get("base_currency_id") or "").upper()
-            if not ticker or ticker in seen or "-" in ticker:
+            if not ticker or "-" in ticker:
+                continue
+            identifiers = [str(p.get("product_id") or ""), str(p.get("alias") or ""), *(p.get("alias_to") or [])]
+            if ticker in seen:
+                row = by_ticker[ticker]
+                row["productAliases"] = sorted(set(row["productAliases"] + [value for value in identifiers if value]))
                 continue
             seen.add(ticker)
             catalog.append(
@@ -3203,25 +3522,29 @@ def load_equity_index() -> list[dict[str, str]]:
                     "ticker": ticker,
                     "name": str(det.get("short_name") or p.get("display_name") or ticker),
                     "productId": str(p.get("product_id") or ""),
+                    "equityCbrn": str(p.get("base_cbrn") or ""),
+                    "productAliases": [value for value in identifiers if value],
                 }
             )
-        if wanted.issubset(seen):
-            break
+            by_ticker[ticker] = catalog[-1]
         pag = payload.get("pagination") or {}
         if not pag.get("has_next"):
+            complete = True
             break
         cursor = str(pag.get("next_cursor") or "")
         if not cursor:
             break
 
-    if catalog:
+    if catalog and complete:
         with product_cache_lock():
             latest = read_json(PRODUCTS_CACHE, {})
             latest = latest if isinstance(latest, dict) else {}
             latest["equityIndex"] = catalog
             latest["equityIndexFetchedAt"] = int(time.time())
+            latest["equityIndexVersion"] = 2
             write_json(PRODUCTS_CACHE, latest)
-    return catalog
+    # A failed/capped page must not replace a complete metadata catalog.
+    return catalog if complete else (cached or catalog)
 
 
 def _equity_by_ticker() -> dict[str, dict[str, str]]:
@@ -3679,7 +4002,7 @@ def merge_missing_market_categories(
     if not usable_snapshot(previous) or not previous.get("assets"):
         return assets
     out = [dict(row) for row in assets if isinstance(row, dict)]
-    limits = {"crypto": 250, "stock": 100, "commodity": 100, "index": 50, "preipo": 20}
+    limits = {"crypto": 250, "stock": 100, "commodity": 100, "index": 50}
     counts = {category: sum(market_category_for_asset(row) == category for row in out) for category in limits}
     seen = {
         (str(row.get("kind") or ""), str(row.get("productId") or row.get("id") or "").upper())
@@ -3929,6 +4252,7 @@ def assemble_snapshot(period: str, *, publish_loading: bool = False) -> dict[str
             ),
             "actions": ACTION_URLS,
             "fetchedAt": now_iso(),
+            "watchlistStatus": watchlist_status(),
         }
         if not token_is_current(token):
             return market_snapshot(period)
@@ -4276,7 +4600,7 @@ def cmd_rows(period: str | None = None, tab: str = "") -> None:
             return
         assets = [dict(a) for a in (snap.get("assets") or []) if isinstance(a, dict)]
         if tab == "watchlist":
-            targets = [a for a in assets if a.get("watchlist")]
+            targets = [a for a in assets if a.get("watchlist") and asset_matches_market_tab(a, "all")]
             targets.sort(key=lambda row: (num(row.get("watchlistOrder"), 1e9), str(row.get("id") or "")))
         elif tab in MARKET_CATEGORIES:
             targets = [a for a in assets if asset_matches_market_tab(a, tab)]
@@ -4287,9 +4611,9 @@ def cmd_rows(period: str | None = None, tab: str = "") -> None:
         missing = [
             row
             for row in targets
-            if int(num(row.get("rowSparkVersion"))) != ROW_SPARK_VERSION
+            if not row.get("watchlistUnavailable") and (int(num(row.get("rowSparkVersion"))) != ROW_SPARK_VERSION
             or str(row.get("rowSparkPeriod") or "") != chosen
-            or len(row.get("rowSpark") or []) < 2
+            or len(row.get("rowSpark") or []) < 2)
         ]
         fill_period_row_sparks(missing[:ROW_SPARK_BATCH], chosen)
         snap["assets"] = assets
@@ -4311,8 +4635,11 @@ def cmd_watchlist_refresh() -> None:
             print(json.dumps(snap))
             return
         assets = [dict(a) for a in (snap.get("assets") or []) if isinstance(a, dict)]
-        entries = fetch_advanced_watchlist(token, force=True)
+        entries = fetch_simple_watchlist(token, force=True)
+        if not token_is_current(token):
+            return
         snap["assets"] = merge_watchlist_entries(assets, entries)
+        snap["watchlistStatus"] = watchlist_status()
         write_snapshot(snap)
     print(json.dumps(snap))
 
@@ -4558,6 +4885,8 @@ def main() -> None:
     search.add_argument("query")
 
     sub.add_parser("watchlist-refresh")
+    watchlist = sub.add_parser("watchlist-action")
+    watchlist.add_argument("action", choices=("state", "add", "remove", "reorder"))
 
     ticker = sub.add_parser("ticker")
     ticker.add_argument("product_id")
@@ -4609,6 +4938,8 @@ def dispatch(args: argparse.Namespace) -> None:
         cmd_search(args.query)
     elif args.cmd == "watchlist-refresh":
         cmd_watchlist_refresh()
+    elif args.cmd == "watchlist-action":
+        cmd_watchlist_action(args.action)
     elif args.cmd == "ticker":
         cmd_ticker(args.product_id, args.symbol, args.stdin)
     elif args.cmd == "chart":

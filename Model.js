@@ -75,7 +75,13 @@ function marketCategory(row) {
   return "crypto"
 }
 
+function isVisibleAsset(row) {
+  // Manual exclusion until account-specific product eligibility is available.
+  return !!row && marketCategory(row) !== "preipo"
+}
+
 function matchesMarketTab(row, tab) {
+  if (!isVisibleAsset(row)) return false
   row = row || {}
   tab = String(tab || "all").toLowerCase()
   if (tab === "all") return String(row.kind || "").toLowerCase() !== "fiat"
@@ -217,6 +223,20 @@ function shouldShowUpdating(state) {
     || (state.chartRunning && (state.detailPeriodChange || !state.hasChart || state.detailMissing))
 }
 
+function watchlistIsWatched(state, row) {
+  return typeof state.watched === "boolean" ? state.watched : !!(row && row.watchlist)
+}
+
+function optimisticWatchlistState(state, action) {
+  return Object.assign({}, state, {watched: action === "add"})
+}
+
+function reconcileWatchlistState(previous, result) {
+  if (!result.ok) return previous
+  // A failed read-after-write must not undo an acknowledged mutation.
+  return result.ready ? result : Object.assign({}, result, {watched: previous.watched})
+}
+
 function assetKey(row) {
   return row ? String(row.kind || "crypto") + ":" + String(row.productId || row.id || "").toUpperCase() : ""
 }
@@ -227,6 +247,78 @@ function selectionIndex(rows, key, previousIndex) {
     if (assetKey(rows[i]) === key) return i
   }
   return Math.min(previousIndex, rows.length - 1)
+}
+
+function pointerMoved(previousX, previousY, x, y) {
+  return previousX >= 0 && previousY >= 0 && isFinite(x) && isFinite(y)
+    && (Math.abs(x - previousX) > 4 || Math.abs(y - previousY) > 4)
+}
+
+function cursorScrollY(currentY, viewHeight, contentHeight, rowTop, rowHeight) {
+  var next = currentY
+  if (rowTop < currentY) next = rowTop
+  else if (rowTop + rowHeight > currentY + viewHeight)
+    next = rowTop + rowHeight - viewHeight
+  return Math.max(0, Math.min(Math.max(0, contentHeight - viewHeight), next))
+}
+
+function watchlistItemKey(item) {
+  if (!item || typeof item !== "object") return ""
+  var fields = Object.keys(item)
+  if (fields.length !== 1 || typeof item[fields[0]] !== "string" || !item[fields[0]]) return ""
+  return fields[0] + ":" + item[fields[0]]
+}
+
+function watchlistMoveRequest(rows, index, delta) {
+  if (delta !== -1 && delta !== 1) return null
+  if (index < 0 || index >= rows.length || index + delta < 0 || index + delta >= rows.length) return null
+  var item = rows[index].watchlistItem
+  var anchor = rows[index + delta].watchlistItem
+  if (!watchlistItemKey(item) || !watchlistItemKey(anchor) || watchlistItemKey(item) === watchlistItemKey(anchor)) return null
+  var body = {item: item}
+  body[delta < 0 ? "beforeItem" : "afterItem"] = anchor
+  return body
+}
+
+function reorderedWatchlist(items, request) {
+  var result = (items || []).slice()
+  if (!request) return null
+  var itemKey = watchlistItemKey(request.item)
+  var anchorKey = watchlistItemKey(request.beforeItem || request.afterItem)
+  var from = -1, anchor = -1
+  for (var i = 0; i < result.length; i++) {
+    if (watchlistItemKey(result[i]) === itemKey) from = i
+    if (watchlistItemKey(result[i]) === anchorKey) anchor = i
+  }
+  if (from < 0 || anchor < 0 || from === anchor) return null
+  var moved = result.splice(from, 1)[0]
+  if (from < anchor) anchor--
+  result.splice(anchor + (request.afterItem ? 1 : 0), 0, moved)
+  return result
+}
+
+function watchlistRowOrder(row, items) {
+  if (items) {
+    var key = watchlistItemKey(row.watchlistItem)
+    for (var i = 0; i < items.length; i++)
+      if (key && watchlistItemKey(items[i]) === key) return i
+  }
+  var order = Number(row.watchlistOrder)
+  return isFinite(order) ? order : 1e9
+}
+
+function withWatchlistOrder(snapshot, items) {
+  var next = Object.assign({}, snapshot)
+  next.watchlistStatus = Object.assign({}, snapshot.watchlistStatus, {items: items})
+  next.assets = (snapshot.assets || []).map(function(row) {
+    return row.watchlist ? Object.assign({}, row, {watchlistOrder: watchlistRowOrder(row, items)}) : row
+  })
+  return next
+}
+
+function snapshotNeedsRefresh(snapshot, now) {
+  var stamp = Date.parse((snapshot || {}).fetchedAt || "")
+  return !isFinite(stamp) || now - stamp >= 120000
 }
 
 function freshnessText(snapshot, now) {
@@ -242,9 +334,20 @@ function freshnessText(snapshot, now) {
 if (typeof module !== "undefined") {
   module.exports = {
     shouldShowUpdating: shouldShowUpdating,
+    watchlistIsWatched: watchlistIsWatched,
+    optimisticWatchlistState: optimisticWatchlistState,
+    reconcileWatchlistState: reconcileWatchlistState,
     assetKey: assetKey,
     selectionIndex: selectionIndex,
+    pointerMoved: pointerMoved,
+    cursorScrollY: cursorScrollY,
     freshnessText: freshnessText,
+    snapshotNeedsRefresh: snapshotNeedsRefresh,
+    watchlistItemKey: watchlistItemKey,
+    watchlistMoveRequest: watchlistMoveRequest,
+    reorderedWatchlist: reorderedWatchlist,
+    watchlistRowOrder: watchlistRowOrder,
+    withWatchlistOrder: withWatchlistOrder,
     formatUsd: formatUsd,
     formatCompactNumber: formatCompactNumber,
     formatCompactUsd: formatCompactUsd,
@@ -252,6 +355,7 @@ if (typeof module !== "undefined") {
     formatSignedUsd: formatSignedUsd,
     pnlColor: pnlColor,
     marketCategory: marketCategory,
+    isVisibleAsset: isVisibleAsset,
     matchesMarketTab: matchesMarketTab,
     shouldDefaultToWatchlist: shouldDefaultToWatchlist,
     marketVolume: marketVolume,

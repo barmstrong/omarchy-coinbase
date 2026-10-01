@@ -7,18 +7,24 @@ portfolio balance and period change.
 The panel includes:
 
 - Portfolio and Coinbase watchlist views plus 24-hour-volume-ranked all, spot
-  crypto, stock, commodity, index, and pre-IPO markets
+  crypto, stock, commodity, and index markets
 - Synchronized 1H, 1D, 1W, 1M, 1Y, and all-time charts and sparklines
 - Asset detail pages, search, market statistics, and links to Coinbase.com
 - Full keyboard navigation: arrows move through rows and tabs, Enter opens an
   asset, Escape goes back or closes, `/` focuses search, and `P` pins the
   current asset while signed out
 - Three bar display modes; right-click cycles full, balance-only, and icon-only
-- A read-only Coinbase watchlist refresh while the panel is open
+- Simple Retail watchlist refresh, with Add/Remove controls on asset detail pages
+- Watchlist ordering with row ↑/↓ controls or Alt+Up/Down on the selected row;
+  moves appear immediately and roll back on failure
 - Cache-first rendering that keeps the last complete view visible while market
   and portfolio data update in the background, including when offline
 - Instant repeat asset details from an owner-only local cache; stale charts and
   statistics render immediately while public market data refreshes in the background
+
+Pre-IPO perpetuals are currently excluded from the interface, including search
+and cached watchlist rows. This is a manual filter, not automatic account/region
+eligibility detection, and does not remove anything from your Coinbase watchlist.
 
 This project is not affiliated with or endorsed by Coinbase. Coinbase and its
 logo are trademarks of their respective owner.
@@ -77,13 +83,23 @@ The default authorization scopes in this source tree are:
 
 - `wallet:user:read`
 - `wallet:accounts:read`
+- `wallet:watchlist:read`
+- `wallet:watchlist:update`
 - `offline_access` (for refresh tokens)
 
-The helper also accepts the optional `wallet:watchlist:read` and
-`wallet:watchlist:update` scopes from a broker configured to request them.
-These permissions do not enable watchlist mutations in this plugin; the
-experimental Simple Retail endpoint is not used. A hosted broker's requested
-scopes may differ from the defaults above; inspect the Coinbase consent screen.
+Watchlist read and update permissions are independent. Older grants remain
+usable for portfolio viewing; sign out and back in to enable watchlist access.
+The detail-page toggle requires read access to show current membership and
+update access to edit it. A hosted broker's requested scopes may differ from
+the source defaults; inspect the Coinbase consent screen.
+
+Reordering uses the same update scope via the documented
+[Simple Retail reorder endpoint](https://docs.cdp.coinbase.com/coinbase-app/track-apis/watchlist#reorder-an-item).
+Each move uses stored canonical identifiers and one neighboring visible item
+as its anchor. Hidden items are not deleted or sent as a replacement list;
+other items retain their relative order. Controls are unavailable in search,
+other tabs, or while a move is pending. The plugin rereads after a move and
+never automatically retries an uncertain write.
 
 The plugin has no code path that places trades or moves funds. Buy, sell,
 deposit, withdrawal, send, and receive controls only open an HTTPS page on
@@ -113,8 +129,8 @@ storage. The Worker source is included for review and can be self-hosted.
 Cloudflare rate limits protect every OAuth endpoint: anonymous entry points are
 limited per source IP, while polling and token operations also have per-session
 or per-credential limits. The Worker fails closed if a required binding is
-absent. The helper refuses token responses containing scopes outside the three
-defaults and two optional watchlist scopes above. The broker validates against
+absent. The helper refuses token responses containing scopes outside the five
+scopes above. The broker validates against
 its configured requested scopes. Trading and transfer scopes are not accepted.
 
 The plugin contacts these services:
@@ -136,7 +152,7 @@ replace the older, broader OAuth grant with the scopes above.
 
 Self-hosting requires a Coinbase OAuth application and a Cloudflare account.
 Create an OAuth app in the [CDP portal](https://portal.cdp.coinbase.com/oauth),
-allow the three scopes listed above, then run:
+request the five scopes listed above, then run:
 
 ```bash
 npx --yes wrangler@4.129.0 login
@@ -183,10 +199,33 @@ bin/coinbase logout
 ```
 
 The **Watchlist** tab refreshes when the panel opens, then every 60 seconds while
-it remains open. Until Coinbase exposes a dedicated OAuth watchlist endpoint,
-the plugin uses the Advanced Trade product `watched` flag. That response does
-not include the user's custom watchlist order, so the panel preserves the order
-returned by the product API.
+it remains open. It reads the Simple Retail `/v2/watchlist/items` API, requires
+`wallet:watchlist:read`, and preserves the order returned by that API. Advanced
+Trade `watched` flags are no longer used. Failed requests retain only a prior
+Simple Retail cache; they never fall back to the Advanced Trade watchlist.
+Crypto UUIDs and equity CBRNs are resolved using Coinbase asset metadata.
+XRP and Zcash's canonical Base token references are mapped using the verified
+network/address identities on [Coinbase's XRP page](https://www.coinbase.com/price/xrp)
+and [Zcash page](https://www.coinbase.com/price/zcash).
+The original token reference is retained for removal.
+Stock metadata follows all catalog pages and preserves alternate USD/USDC
+product IDs. Unknown equity IDs get an exact public product lookup, cached
+locally; stock identities are never guessed from prices or watchlist order.
+Unresolved item types (including predictions and some stock CBRNs) are skipped
+in the widget and remain untouched in Coinbase.
+
+On an asset detail page, click **Watchlist** to the left of Buy/Sell. An outlined
+star means not added; a filled star means added. Clicking toggles membership,
+and repeated clicks are ignored while a request is pending. The button does
+not dim, change labels, or show tooltips during updates. The star toggles
+immediately and reverts if the write fails. User actions wait for a busy
+snapshot writer instead of being discarded by background refreshes.
+Adds POST one typed identifier to `/v2/watchlist/items`; removals POST the
+stored identifier to `/v2/watchlist/items/remove`. Both return `{}`; a separate
+GET refreshes the list. Network failures never trigger automatic write retries.
+Crypto additions resolve a unique asset UUID. Stock additions use native IDs
+from Coinbase's equity catalog. Unsupported products are hidden until their
+owning metadata source is supported.
 
 The open panel refreshes silently every 30 seconds when cached data is present.
 “Updating…” appears only while a chart-period change or missing content is loading.

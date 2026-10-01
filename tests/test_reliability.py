@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_helper():
@@ -328,6 +329,12 @@ class ReliabilityTests(unittest.TestCase):
         self.assertFalse(helper.asset_matches_market_tab(perp, "crypto"))
         self.assertTrue(helper.asset_matches_market_tab(perp, "all"))
 
+    def test_preipo_rows_are_excluded_from_all_tabs(self):
+        helper = load_helper()
+        row = {"kind": "derivative", "marketCategory": "preipo"}
+        for tab in ("all", "preipo", "stock", "crypto"):
+            self.assertFalse(helper.asset_matches_market_tab(row, tab))
+
     def test_market_catalog_dedupes_by_coinbase_product_id(self):
         helper = load_helper()
         portfolio_row = {
@@ -386,7 +393,14 @@ class ReliabilityTests(unittest.TestCase):
         def fake_fetch(product_type, extra):
             calls.append((product_type, extra))
             if extra.get("contract_expiry_type") == "PERPETUAL":
-                return [shared]
+                return [shared, {
+                    "product_id": "OPENAI-PERP-INTX",
+                    "price": "500",
+                    "approximate_quote_24h_volume": "999999",
+                    "future_product_details": {
+                        "perpetual_details": {"underlying_type": "PREIPO"}
+                    },
+                }]
             return [fcm, shared]
 
         helper.fetch_typed_products = fake_fetch
@@ -401,6 +415,7 @@ class ReliabilityTests(unittest.TestCase):
         )
         self.assertEqual([row["productId"] for row in rows], ["AIP-19DEC30-CDE", "COIN50-PERP-INTX"])
         self.assertTrue(all(row["marketCategory"] == "index" for row in rows))
+        self.assertEqual(helper.derivative_majors(limit=1)[0]["productId"], "AIP-19DEC30-CDE")
 
     def test_public_product_catalog_follows_pagination(self):
         helper = load_helper()
@@ -586,6 +601,56 @@ class ReliabilityTests(unittest.TestCase):
 
             self.assertEqual(json.loads(output.getvalue())["assets"][0]["id"], "BTC")
 
+    def test_stale_retry_honors_cooldown_then_recovers(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            configure_state(helper, Path(directory))
+            cached = helper.empty_snapshot(
+                period="day", fetchedAt="2026-01-01T00:00:00Z",
+                assets=[helper.market_row("BTC", "Bitcoin", "crypto", "BTC-USD", price=100)],
+            )
+            helper.write_snapshot(cached)
+            attempts = []
+
+            def build(period):
+                attempts.append(period)
+                if len(attempts) == 1:
+                    return helper.failed_snapshot(cached, "temporary DNS failure")
+                recovered = dict(cached, fetchedAt=helper.now_iso(), error="")
+                helper.write_snapshot(recovered)
+                return recovered
+
+            helper.build_snapshot = build
+            started = time.time()
+            with contextlib.redirect_stdout(io.StringIO()), patch.object(helper.time, "time", return_value=started) as clock:
+                helper.cmd_snapshot("day", max_age=20)
+                for seconds in (5, 10, 15, 20, 25):
+                    clock.return_value = started + seconds
+                    helper.cmd_snapshot("day", max_age=20)
+                self.assertEqual(len(attempts), 1, "faster UI checks must not flood the network")
+                clock.return_value = started + 31
+                helper.cmd_snapshot("day", max_age=20)
+            self.assertEqual(len(attempts), 2)
+            stored = helper.read_json(helper.SNAPSHOT_FILE, {})
+            self.assertEqual(stored["error"], "")
+            self.assertNotEqual(stored["fetchedAt"], cached["fetchedAt"])
+            self.assertNotIn("retryAfter", stored)
+
+    def test_explicit_stale_open_can_bypass_failure_cooldown(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            configure_state(helper, Path(directory))
+            cached = helper.empty_snapshot(
+                period="day", fetchedAt="2026-01-01T00:00:00Z",
+                assets=[helper.market_row("BTC", "Bitcoin", "crypto", "BTC-USD", price=100)],
+            )
+            helper.failed_snapshot(cached, "offline")
+            attempts = []
+            helper.build_snapshot = lambda period: attempts.append(period) or cached
+            with contextlib.redirect_stdout(io.StringIO()):
+                helper.cmd_snapshot("day", max_age=0)
+            self.assertEqual(attempts, ["day"])
+
     def test_ticker_publishes_cached_selection_without_network_delay(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:
@@ -724,6 +789,7 @@ class ReliabilityTests(unittest.TestCase):
                 helper.market_row("BTC", "Bitcoin", "crypto", "BTC-USD", price=99),
                 helper.market_row("ETH", "Ethereum", "crypto", "ETH-USD", price=10),
                 helper.market_row("AAPL", "Apple", "stock", "AAPL-USD", price=200),
+                helper.market_row("OPENAI", "OpenAI PERP", "derivative", "OPENAI-PERP-INTX", price=500, marketCategory="preipo"),
             ]
         )
 

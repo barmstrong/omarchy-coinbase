@@ -43,6 +43,20 @@ Item {
   property bool hoverSelectEnabled: false
   property bool tabSynced: false
   property var detailAsset: null
+  property var detailWatchlistState: ({})
+  property string watchlistMessage: ""
+  property var watchlistPayload: null
+  property string watchlistAction: "state"
+  property string watchlistActionKey: ""
+  property bool watchlistResponseReceived: false
+  property var watchlistBeforeAction: null
+  property var watchlistOrderOverride: null
+  property string watchlistReorderMessage: ""
+  readonly property bool watchlistReorderView: opened && signedIn && !showingDetail && !searching && marketTab === "watchlist"
+  readonly property bool canReorderWatchlist: watchlistReorderView && watchlistStatus.ready === true
+    && watchlistStatus.canUpdate === true && !watchlistStatus.error
+    && !watchlistActionProc.running && !watchlistProc.running && !watchlistRefreshPending
+    && watchlistOrderOverride === null
   property var detailChart: ({})
   property var detailCache: ({})
   property bool detailLoading: false
@@ -56,6 +70,7 @@ Item {
 
   readonly property bool signedIn: snapshot.authenticated === true
   readonly property bool authLoading: root.signedIn && snapshot.loading === true
+  readonly property var watchlistStatus: snapshot.watchlistStatus || ({})
   readonly property bool needsSetup: snapshot.needsSetup === true
   readonly property color foreground: Color.popups.text
   readonly property color muted: Color.muted
@@ -76,16 +91,14 @@ Item {
         { value: "crypto", label: "Crypto" },
         { value: "stock", label: "Stocks" },
         { value: "commodity", label: "Commodities" },
-        { value: "index", label: "Indices" },
-        { value: "preipo", label: "Pre-IPO" }
+        { value: "index", label: "Indices" }
       ]
     : [
         { value: "all", label: "All" },
         { value: "crypto", label: "Crypto" },
         { value: "stock", label: "Stocks" },
         { value: "commodity", label: "Commodities" },
-        { value: "index", label: "Indices" },
-        { value: "preipo", label: "Pre-IPO" }
+        { value: "index", label: "Indices" }
       ]
   readonly property bool showingDetail: detailAsset !== null
   readonly property bool detailIsCrypto: root.showingDetail && Model.marketCategory(root.detailAsset || {}) === "crypto"
@@ -191,18 +204,22 @@ Item {
 
   function receiveSnapshot(raw) {
     var serialized = String(raw || "")
-    if (serialized !== "" && serialized === root.lastSnapshotRaw) {
+    if (serialized !== "" && serialized === root.lastSnapshotRaw && root.watchlistOrderOverride === null) {
       root.acceptSnapshotReload = false
       return true
     }
     var next = Model.parseSnapshot(serialized, null)
     if (!next) return false
-    if (root.opened && root.chartHover && root.snapshotReady && !root.acceptSnapshotReload) {
+    var recovering = Model.snapshotNeedsRefresh(root.snapshot, Date.now())
+    if (root.opened && root.chartHover && root.snapshotReady && !root.acceptSnapshotReload && !recovering) {
       root.pendingSnapshotRaw = serialized
       return true
     }
     root.acceptSnapshotReload = false
     root.pendingSnapshotRaw = ""
+    // Don't keep a stale snapshot (or its hovered price) on screen after
+    // recovery just because the pointer was left over the chart.
+    if (recovering) root.chartHover = false
     return root.applySnapshot(serialized, next)
   }
 
@@ -215,11 +232,18 @@ Item {
     var selectedKey = Model.assetKey(root.visibleAssets[root.listCursor])
     var previousCursor = root.listCursor
     snapshot = next
+    if (root.watchlistOrderOverride !== null && !watchlistActionProc.running
+        && next.watchlistStatus && next.watchlistStatus.ready && !next.watchlistStatus.error) {
+      root.watchlistOrderOverride = null
+      root.watchlistReorderMessage = ""
+    }
     root.statusNow = Date.now()
     root.listCursor = Model.selectionIndex(root.visibleAssets, selectedKey, previousCursor)
     root.hoverSelectEnabled = false
     root.snapshotReady = true
     root.capturePortfolio(snapshot)
+    if (root.showingDetail && root.signedIn && !watchlistActionProc.running)
+      Qt.callLater(root.prepareWatchlistAction)
     if (root.signedIn && !wasSigned) {
       if (Model.shouldDefaultToWatchlist(root.opened, root.marketTabUserSelected))
         root.marketTab = "watchlist"
@@ -238,6 +262,8 @@ Item {
   }
 
   function resetSignedOutView() {
+    root.watchlistOrderOverride = null
+    root.watchlistReorderMessage = ""
     root.marketTab = "all"
     root.marketTabUserSelected = false
     root.tabSynced = true
@@ -341,17 +367,21 @@ Item {
   property real pointerY: -1
 
   function notePointerMove(handler) {
-    var pos = handler && handler.point ? handler.point.position : null
-    if (!pos) {
+    if (handler && handler.hovered && handler.point)
+      root.notePointerPosition(handler.point.scenePosition)
+  }
+
+  function notePointerPosition(pos) {
+    if (!pos) return
+    // Row-local coordinates change when the list scrolls beneath a stationary
+    // pointer. Only movement in the window may take selection from the keys.
+    var moved = Model.pointerMoved(root.pointerX, root.pointerY, pos.x, pos.y)
+    if (moved)
       root.hoverSelectEnabled = true
-      return
+    if (root.pointerX < 0 || moved) {
+      root.pointerX = pos.x
+      root.pointerY = pos.y
     }
-    var x = pos.x
-    var y = pos.y
-    if (root.pointerX >= 0 && (Math.abs(x - root.pointerX) > 4 || Math.abs(y - root.pointerY) > 4))
-      root.hoverSelectEnabled = true
-    root.pointerX = x
-    root.pointerY = y
   }
 
   function resetHoverSelect() {
@@ -434,14 +464,16 @@ Item {
     var searching = q.length > 0
     for (var i = 0; i < rows.length; i++) {
       var a = rows[i]
+      if (!Model.isVisibleAsset(a)) continue
       var aid = String(a.id || "")
       var aname = String(a.name || "")
       if (!aid.replace(/^\s+|\s+$/g, "") && !aname.replace(/^\s+|\s+$/g, "")) continue
       var junk = aid.indexOf("v1:equity") === 0 || (aid.length >= 16 && /^[01]+$/.test(aid))
       if (junk && (aname === aid || aname === "Stock")) continue
+      if (a.watchlistUnavailable) continue
       if (!searching) {
         if (tab === "watchlist") {
-          if (!a.watchlist) continue
+          if (root.watchlistStatus.source !== "simple" || !a.watchlist) continue
         } else if (!Model.matchesMarketTab(a, tab)) continue
       }
       if (q && root.assetSearchScore(a, q) <= 0) continue
@@ -452,6 +484,7 @@ Item {
       var extra = root.searchResults || []
       for (var j = 0; j < extra.length; j++) {
         var hit = extra[j]
+        if (!Model.isVisibleAsset(hit)) continue
         var hid = String(hit.kind || "crypto") + ":" + String(hit.id || "").toUpperCase()
         if (seen[hid]) continue
         if (root.assetSearchScore(hit, q) <= 0) continue
@@ -469,8 +502,8 @@ Item {
       })
     } else if (tab === "watchlist") {
       out.sort(function(a, b) {
-        var ao = Number(a.watchlistOrder)
-        var bo = Number(b.watchlistOrder)
+        var ao = Model.watchlistRowOrder(a, root.watchlistOrderOverride)
+        var bo = Model.watchlistRowOrder(b, root.watchlistOrderOverride)
         if (!isFinite(ao)) ao = 1e9
         if (!isFinite(bo)) bo = 1e9
         if (ao !== bo) return ao - bo
@@ -497,7 +530,9 @@ Item {
     if (flick) flick.contentY = 0
     snapshotFile.reload()
     syncTabToPin()
-    refresh()
+    // An explicit open of a stale view gets one immediate attempt, even if
+    // the last failure's background cooldown has not elapsed yet.
+    refresh(Model.snapshotNeedsRefresh(root.snapshot, Date.now()))
     Qt.callLater(function() {
       if (root.opened && keyCatcher) keyCatcher.forceActiveFocus()
     })
@@ -511,6 +546,7 @@ Item {
   }
 
   function moveListCursor(delta) {
+    root.hoverSelectEnabled = false
     if (visibleAssets.length === 0) {
       listCursor = -1
       return
@@ -524,6 +560,7 @@ Item {
   }
 
   function moveListEdge(toEnd) {
+    root.hoverSelectEnabled = false
     if (visibleAssets.length === 0) {
       listCursor = -1
       return
@@ -539,13 +576,9 @@ Item {
       var repeater = root.searching ? searchAssetRepeater : marketAssetRepeater
       var item = repeater.itemAt(root.listCursor)
       if (!view || !item) return
+      view.cancelFlick()
       var mapped = item.mapToItem(view.contentItem, 0, 0)
-      var top = mapped.y
-      var bottom = top + item.height
-      if (top < view.contentY)
-        view.contentY = Math.max(0, top)
-      else if (bottom > view.contentY + view.height)
-        view.contentY = Math.min(Math.max(0, view.contentHeight - view.height), bottom - view.height)
+      view.contentY = Model.cursorScrollY(view.contentY, view.height, view.contentHeight, mapped.y, item.height)
     })
   }
 
@@ -645,14 +678,17 @@ Item {
   }
 
   function openDetail(row) {
-    if (!row) return
+    if (!Model.isVisibleAsset(row)) return
     root.detailAsset = row
+    root.detailWatchlistState = ({})
+    root.watchlistMessage = ""
     searchDebounce.stop()
     if (searchProc.running) searchProc.running = false
     root.searchQuery = ""
     root.searchResults = []
     if (searchField) searchField.text = ""
     root.loadDetailChart(row)
+    root.prepareWatchlistAction()
     Qt.callLater(function() {
       if (root.showingDetail && keyCatcher) keyCatcher.forceActiveFocus()
     })
@@ -676,6 +712,8 @@ Item {
     root.chartSeq += 1
     if (chartProc.running) chartProc.running = false
     root.detailAsset = null
+    root.detailWatchlistState = ({})
+    root.watchlistMessage = ""
     root.detailChart = ({})
     root.detailLoading = false
     root.chartHover = false
@@ -734,6 +772,74 @@ Item {
     watchlistProc.running = true
   }
 
+  function prepareWatchlistAction() {
+    if (!root.signedIn || !root.showingDetail || watchlistActionProc.running) return
+    root.startWatchlistAction("state", root.detailAsset)
+  }
+
+  function moveWatchlistItem(index, delta) {
+    if (!root.canReorderWatchlist) return
+    var body = Model.watchlistMoveRequest(root.visibleAssets, index, delta)
+    var reordered = Model.reorderedWatchlist(root.watchlistStatus.items, body)
+    if (!body || !reordered) return
+    var selected = Model.assetKey(root.visibleAssets[index])
+    root.watchlistAction = "reorder"
+    root.watchlistPayload = body
+    root.watchlistResponseReceived = false
+    root.watchlistReorderMessage = ""
+    root.hoverSelectEnabled = false
+    root.watchlistOrderOverride = reordered
+    root.listCursor = Model.selectionIndex(root.visibleAssets, selected, index)
+    root.ensureCursorVisible()
+    watchlistActionProc.command = [root.pluginFile("bin/coinbase"), "watchlist-action", "reorder"]
+    watchlistActionProc.running = true
+  }
+
+  function finishWatchlistReorder(result) {
+    if (!root.signedIn) return
+    var selected = Model.assetKey(root.visibleAssets[root.listCursor])
+    if (result.ok && Array.isArray(result.items)) {
+      root.snapshot = Model.withWatchlistOrder(root.snapshot, result.items)
+      root.watchlistOrderOverride = null
+    } else if (!result.ok) {
+      // Roll back only the temporary order, not newer prices or membership.
+      root.watchlistOrderOverride = null
+    }
+    root.watchlistReorderMessage = result.message || (result.ok ? "" : "Could not confirm the new order. Refreshing before another attempt.")
+    if (root.watchlistReorderView) {
+      root.listCursor = Model.selectionIndex(root.visibleAssets, selected, root.listCursor)
+      root.ensureCursorVisible()
+    }
+  }
+
+  function startWatchlistAction(action, payload) {
+    if (watchlistActionProc.running || !root.signedIn || !root.showingDetail) return
+    root.watchlistAction = action
+    root.watchlistActionKey = Model.assetKey(root.detailAsset)
+    root.watchlistPayload = payload
+    root.watchlistResponseReceived = false
+    if (action !== "state") {
+      root.watchlistBeforeAction = root.detailWatchlistState
+      root.detailWatchlistState = Model.optimisticWatchlistState(root.detailWatchlistState, action)
+      root.watchlistMessage = ""
+    }
+    watchlistActionProc.command = [root.pluginFile("bin/coinbase"), "watchlist-action", action]
+    watchlistActionProc.running = true
+  }
+
+  function toggleWatchlist() {
+    // Ignore repeated clicks without disabling/repainting the button while a
+    // request is running. The star changes immediately and rolls back on error.
+    if (watchlistActionProc.running) return
+    if (!root.detailWatchlistState.ready) {
+      root.refreshWatchlist()
+      root.prepareWatchlistAction()
+      return
+    }
+    if (!root.detailWatchlistState.canUpdate) return
+    root.startWatchlistAction(root.detailWatchlistState.watched ? "remove" : "add", {item: root.detailWatchlistState.item})
+  }
+
   function setPeriod(next) {
     if (!next || next === period) return
     if (snapshotProc.running) snapshotProc.running = false
@@ -784,6 +890,7 @@ Item {
     signedOut.authenticated = false
     signedOut.error = ""
     signedOut.user = ({})
+    signedOut.watchlistStatus = ({})
     var publicRows = root.publicCachedRows(root.assets)
     var lead = root.leadPublicAsset(publicRows)
     signedOut.assets = publicRows
@@ -964,6 +1071,58 @@ Item {
   }
 
   RefreshProcess {
+    id: watchlistActionProc
+    stdinEnabled: true
+    onStarted: {
+      write(JSON.stringify(root.watchlistPayload || {}) + "\n")
+      root.watchlistPayload = null
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var result
+        try { result = JSON.parse(String(text || "")) } catch (e) { return }
+        root.watchlistResponseReceived = true
+        if (root.watchlistAction === "reorder") {
+          root.finishWatchlistReorder(result)
+          return
+        }
+        if (root.watchlistAction !== "state") snapshotFile.reload()
+        if (!root.showingDetail || root.watchlistActionKey !== Model.assetKey(root.detailAsset)) return
+        if (root.watchlistAction === "state") {
+          root.detailWatchlistState = Model.reconcileWatchlistState(root.detailWatchlistState, result)
+          if (!result.ok || result.message) root.watchlistMessage = result.message || "Watchlist state unavailable."
+          else if (!result.canUpdate) root.watchlistMessage = "Sign out and back in to grant watchlist editing access."
+        } else {
+          if (!result.ok && root.watchlistBeforeAction)
+            root.detailWatchlistState = root.watchlistBeforeAction
+          root.watchlistMessage = result.message || (result.ok ? "" : "Could not confirm the watchlist update.")
+        }
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      if (root.watchlistAction === "reorder") {
+        if (!root.watchlistResponseReceived)
+          root.finishWatchlistReorder({ok: false, message: "Request not confirmed. Refreshing the watchlist; the move will not be retried automatically."})
+        snapshotFile.reload()
+        root.refreshWatchlist()
+        return
+      }
+      if (!root.watchlistResponseReceived && root.showingDetail && root.watchlistActionKey === Model.assetKey(root.detailAsset)) {
+        if (root.watchlistAction !== "state" && root.watchlistBeforeAction)
+          root.detailWatchlistState = root.watchlistBeforeAction
+        root.watchlistMessage = "Request not confirmed. Refresh your watchlist before trying again."
+      }
+      root.watchlistBeforeAction = null
+      if (root.watchlistAction !== "state") {
+        root.refreshWatchlist()
+        Qt.callLater(root.prepareWatchlistAction)
+      }
+    }
+  }
+
+  RefreshProcess {
     id: chartProc
     onExited: {
       if (root.chartProcSeq === root.chartSeq) root.detailLoading = false
@@ -1045,7 +1204,9 @@ Item {
   }
 
   Timer {
-    interval: 30000
+    // Retry promptly after wake/network recovery. The helper still enforces
+    // its failure cooldown, and refresh() won't overlap a running request.
+    interval: Model.snapshotNeedsRefresh(root.snapshot, root.statusNow) ? 5000 : 30000
     running: root.opened
     repeat: true
     onTriggered: {
@@ -1138,7 +1299,7 @@ Item {
     Column {
       id: assetCol
       z: 1
-      width: parent.width - Style.space(8)
+      width: parent.width - Style.space(8) - (reorderControls.visible ? reorderControls.width + Style.space(8) : 0)
       anchors.verticalCenter: parent.verticalCenter
       anchors.left: parent.left
       anchors.leftMargin: Style.space(4)
@@ -1153,8 +1314,11 @@ Item {
           width: parent.width - rowSparkline.width - rowPrice.width - assetRowContent.spacing * 2
           spacing: Style.space(1)
           Row {
+            id: assetNameRow
+            width: parent.width
             spacing: Style.space(6)
             Text {
+              width: parent.width - (assetPin.visible ? assetPin.width + assetNameRow.spacing : 0)
               text: String(modelData.name || modelData.id)
               color: root.foreground
               font.family: root.fontFamily
@@ -1163,6 +1327,7 @@ Item {
               elide: Text.ElideRight
             }
             Text {
+              id: assetPin
               visible: !root.signedIn && root.isBarAsset(modelData)
               text: "󰐃"
               color: Color.accent
@@ -1208,7 +1373,7 @@ Item {
           Text {
             width: parent.width
             horizontalAlignment: Text.AlignRight
-            text: isFinite(root.rowPeriodPercent(modelData)) ? Model.formatPercent(root.rowPeriodPercent(modelData)) : "—"
+            text: !modelData.watchlistUnavailable && isFinite(root.rowPeriodPercent(modelData)) ? Model.formatPercent(root.rowPeriodPercent(modelData)) : "—"
             color: root.rowPeriodColor(modelData)
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -1228,11 +1393,52 @@ Item {
       onEntered: {
         if (root.hoverSelectEnabled) root.listCursor = index
       }
-      onPositionChanged: {
-        root.hoverSelectEnabled = true
-        root.listCursor = index
+      onPositionChanged: function(mouse) {
+        root.notePointerPosition(rowMouse.mapToItem(null, mouse.x, mouse.y))
+        if (root.hoverSelectEnabled) root.listCursor = index
       }
       onClicked: root.chooseAsset(modelData)
+    }
+
+    Row {
+      id: reorderControls
+      visible: root.watchlistReorderView
+      z: 3
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+      Repeater {
+        model: [-1, 1]
+        Rectangle {
+          id: moveControl
+          required property int modelData
+          readonly property bool canMove: root.canReorderWatchlist
+            && Model.watchlistMoveRequest(root.visibleAssets, assetRow.index, modelData) !== null
+          width: Style.space(28)
+          height: Style.space(36)
+          radius: Style.cornerRadius
+          color: moveMouse.containsMouse && canMove ? Util.alpha(root.foreground, 0.1) : "transparent"
+          Text {
+            anchors.centerIn: parent
+            text: moveControl.modelData < 0 ? "↑" : "↓"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            color: moveControl.canMove ? root.foreground : root.muted
+            opacity: moveControl.canMove ? 1 : 0.4
+          }
+          MouseArea {
+            id: moveMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: moveControl.canMove ? Qt.PointingHandCursor : Qt.ArrowCursor
+            // Consume even unavailable edge/pending clicks; don't open details.
+            onClicked: if (moveControl.canMove) root.moveWatchlistItem(assetRow.index, moveControl.modelData)
+          }
+          Accessible.role: Accessible.Button
+          Accessible.name: "Move " + String(assetRow.modelData.name || assetRow.modelData.id) + (modelData < 0 ? " up" : " down")
+          Accessible.onPressAction: if (canMove) root.moveWatchlistItem(assetRow.index, modelData)
+        }
+      }
     }
   }
 
@@ -1307,6 +1513,18 @@ Item {
         sequence: "P"
         context: Qt.WindowShortcut
         onActivated: root.pinToBar(root.detailAsset)
+      }
+      Shortcut {
+        enabled: root.canReorderWatchlist && !searchField.activeFocus
+        sequence: "Alt+Up"
+        context: Qt.WindowShortcut
+        onActivated: root.moveWatchlistItem(root.listCursor, -1)
+      }
+      Shortcut {
+        enabled: root.canReorderWatchlist && !searchField.activeFocus
+        sequence: "Alt+Down"
+        context: Qt.WindowShortcut
+        onActivated: root.moveWatchlistItem(root.listCursor, 1)
       }
       Shortcut {
         enabled: root.opened && !root.showingDetail && !searchField.activeFocus && !clientIdField.activeFocus && !clientSecretField.activeFocus
@@ -1452,12 +1670,6 @@ Item {
                 font.pixelSize: Style.font.title
                 font.bold: true
                 anchors.verticalCenter: parent.verticalCenter
-                MouseArea {
-                  anchors.fill: parent
-                  anchors.margins: -Style.space(8)
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.closeDetail()
-                }
               }
 
               Text {
@@ -1474,6 +1686,24 @@ Item {
                 verticalAlignment: Text.AlignVCenter
                 anchors.verticalCenter: parent.verticalCenter
               }
+            }
+
+            MouseArea {
+              id: detailBackArea
+              visible: root.showingDetail
+              anchors.left: parent.left
+              anchors.right: detailActions.left
+              anchors.rightMargin: Style.space(10)
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              cursorShape: Qt.PointingHandCursor
+              activeFocusOnTab: true
+              Accessible.role: Accessible.Button
+              Accessible.name: "Back to asset list"
+              onClicked: root.closeDetail()
+              Keys.onReturnPressed: root.closeDetail()
+              Keys.onEnterPressed: root.closeDetail()
+              Keys.onSpacePressed: root.closeDetail()
             }
 
             Row {
@@ -1494,6 +1724,23 @@ Item {
                 horizontalPadding: Style.space(8)
                 verticalPadding: Style.space(3)
                 onClicked: root.pinToBar(root.detailAsset)
+              }
+              Button {
+                id: watchlistButton
+                visible: root.signedIn
+                text: "Watchlist"
+                iconText: Model.watchlistIsWatched(root.detailWatchlistState, root.detailAsset) ? "★" : "☆"
+                enabled: !root.detailWatchlistState.ready || root.detailWatchlistState.canUpdate
+                bordered: true
+                focusable: true
+                Accessible.name: Model.watchlistIsWatched(root.detailWatchlistState, root.detailAsset) ? "Remove from watchlist" : "Add to watchlist"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                iconSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                onClicked: root.toggleWatchlist()
               }
               Button {
                 text: "Buy"
@@ -1620,6 +1867,16 @@ Item {
             spacing: Style.space(6)
 
                 Text {
+                  width: parent.width
+                  visible: root.showingDetail && root.watchlistMessage !== ""
+                  text: root.watchlistMessage
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                Text {
                   visible: !root.showingDetail && !root.signedIn
                   width: parent.width
                   text: root.selectedAssetLabel
@@ -1685,6 +1942,16 @@ Item {
                   width: parent.width
                   visible: !root.showingDetail && text !== ""
                   text: Model.freshnessText(root.snapshot, root.statusNow)
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                Text {
+                  width: parent.width
+                  visible: !root.showingDetail && root.marketTab === "watchlist" && text !== ""
+                  text: root.watchlistReorderMessage || root.watchlistStatus.error || ""
                   color: root.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -2024,7 +2291,11 @@ Item {
 
                   Text {
                     visible: root.snapshotReady && !root.authLoading && root.visibleAssets.length === 0
-                    text: root.marketTab === "watchlist" ? "Nothing on your Coinbase watchlist." : "Nothing in this tab yet."
+                    text: root.marketTab === "watchlist"
+                      ? (root.watchlistStatus.error ? "Watchlist unavailable."
+                        : (!root.watchlistStatus.ready ? "Loading your Simple Retail watchlist…"
+                          : (Number(root.watchlistStatus.unsupported || 0) > 0 ? "No supported watchlist items." : "Nothing on your Coinbase watchlist.")))
+                      : "Nothing in this tab yet."
                     color: root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
