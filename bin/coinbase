@@ -1446,11 +1446,51 @@ def open_browser(url: str) -> None:
         or parsed.password
     ):
         raise RuntimeError("refusing to open a non-Coinbase or malformed URL")
-    # Let the desktop honor the complete browser entry and reuse its session.
-    # Forcing a raw executable with --new-window bypasses desktop/profile flags.
-    opener = ["gio", "open"] if shutil.which("gio") else ["xdg-open"]
+    # Omarchy's launcher also focuses the browser across workspaces. A plain
+    # gio open can succeed while leaving the approval tab out of sight.
+    if shutil.which("omarchy-launch-browser"):
+        opener = ["omarchy-launch-browser"]
+    else:
+        opener = ["gio", "open"] if shutil.which("gio") else ["xdg-open"]
     subprocess.run([*opener, url], check=True, timeout=15,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def open_login_browser(url: str) -> None:
+    url = all_accounts_authorize_url(url)
+    write_json(STATE_DIR / "login-pending.json", {"url": url, "expiresAt": time.time() + 180})
+    open_browser(url)
+
+
+def reopen_login_browser() -> None:
+    pending = read_json(STATE_DIR / "login-pending.json", {})
+    if read_json(LOGIN_STATUS_FILE, {}).get("status") != "waiting":
+        return
+    if num(pending.get("expiresAt")) <= time.time():
+        return
+    # Only an explicit new click reopens the existing flow. Never create a
+    # second state/PKCE exchange while the original process is polling.
+    try:
+        open_browser(all_accounts_authorize_url(str(pending.get("url") or "")))
+        if read_json(LOGIN_STATUS_FILE, {}).get("status") == "waiting":
+            write_login_status("waiting")
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        if read_json(LOGIN_STATUS_FILE, {}).get("status") == "waiting":
+            write_login_status("waiting", "Could not open the browser. Try Open browser again.")
+
+
+def cmd_login_status() -> None:
+    with (STATE_DIR / "login.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            active = False
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except BlockingIOError:
+            active = True
+        data = read_json(LOGIN_STATUS_FILE, {})
+        if not active and data.get("status", "") in {"", "opening", "waiting", "exchanging", "snapshot"}:
+            data = {"status": "error", "message": "Sign-in ended. Please try again.", "at": now_iso()}
+        print(json.dumps({**data, "active": active}))
 
 
 def _finish_login(payload: dict[str, Any]) -> None:
@@ -1490,7 +1530,7 @@ def login_via_broker() -> None:
     if not authorize or not session_id:
         write_login_status("error", "broker did not return an authorize URL")
         die("broker did not return an authorize URL")
-    open_browser(all_accounts_authorize_url(str(authorize)))
+    open_login_browser(str(authorize))
     write_login_status("waiting")
     print("STATUS waiting", flush=True)
     deadline = time.time() + 180
@@ -1525,18 +1565,27 @@ def login_via_broker() -> None:
 def cmd_login() -> None:
     ensure_state()
     with (STATE_DIR / "login.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            # Another process already owns the browser/callback/polling flow.
-            # Do not queue a second authorization when the first finishes.
+        # The status reader briefly probes this lock. Give that probe time to
+        # finish, without queueing behind a real authorization attempt.
+        for attempt in range(5):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(0.02)
+        else:
+            reopen_login_browser()
             print("STATUS waiting", flush=True)
             return
         try:
+            (STATE_DIR / "login-pending.json").unlink(missing_ok=True)
             _perform_login()
-        except (OSError, subprocess.SubprocessError, RuntimeError):
-            write_login_status("error", "Could not complete sign-in. Please try again.")
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, SystemExit):
+            if read_json(LOGIN_STATUS_FILE, {}).get("status") != "error":
+                write_login_status("error", "Could not complete sign-in. Please try again.")
             raise
+        finally:
+            (STATE_DIR / "login-pending.json").unlink(missing_ok=True)
 
 
 def _perform_login() -> None:
@@ -1620,11 +1669,11 @@ def _perform_login() -> None:
 
     server.timeout = 1
     print("STATUS opening", flush=True)
-    open_browser(all_accounts_authorize_url(url))
-    write_login_status("waiting")
-    print("STATUS waiting", flush=True)
-    deadline = time.time() + 180
     try:
+        open_login_browser(url)
+        write_login_status("waiting")
+        print("STATUS waiting", flush=True)
+        deadline = time.time() + 180
         while time.time() < deadline and not result:
             server.handle_request()
     finally:
@@ -4828,6 +4877,7 @@ def main() -> None:
     opener.add_argument("url")
 
     sub.add_parser("oauth-check")
+    sub.add_parser("login-status")
 
     args = parser.parse_args()
     global _BACKGROUND_JOB
@@ -4849,6 +4899,8 @@ def dispatch(args: argparse.Namespace) -> None:
         cmd_setup(args.client_id, args.client_secret, args.stdin)
     elif args.cmd == "login":
         cmd_login()
+    elif args.cmd == "login-status":
+        cmd_login_status()
     elif args.cmd == "logout":
         cmd_logout()
     elif args.cmd == "snapshot":

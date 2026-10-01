@@ -297,3 +297,8 @@ assert.equal(Model.parseSnapshot("{}", null), null)
 assert.equal(Model.parseSnapshot(JSON.stringify({ authenticated: false, assets: [] }), null), null)
 
 console.log("snapshot model tests passed")
+
+// Reopening the panel recovers an active login, but ignores stale status files.
+assert.equal(Model.shouldHandleLoginStatus("waiting", false, false, true), true)
+assert.equal(Model.shouldHandleLoginStatus("waiting", false, false, false), false)
+assert.equal(Model.shouldHandleLoginStatus("waiting", false, true, true), false)

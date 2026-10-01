@@ -182,8 +182,10 @@ function parseSearch(raw) {
   }
 }
 
-function shouldHandleLoginStatus(status, signingIn, signedIn) {
+function shouldHandleLoginStatus(status, signingIn, signedIn, active) {
   var current = String(status || "")
+  if (active === true && signedIn !== true && ["opening", "waiting", "exchanging", "snapshot"].indexOf(current) !== -1)
+    return true
   if (["opening", "waiting", "exchanging", "snapshot", "done", "error"].indexOf(current) !== -1)
     return signingIn === true
   if (current === "logged-out") return signedIn === true || signingIn === true

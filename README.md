@@ -67,8 +67,13 @@ The authorization request includes Coinbase's documented
 to request all portfolios/wallets. Coinbase controls the consent screen and
 the final access choice; if it still shows **Specific portfolios**, select
 **All portfolios and wallets** there. The widget requests the same limited
-scopes listed below. Sign-in uses the desktop's normal browser opener and
-permits only one authorization attempt at a time.
+scopes listed below. Sign-in uses Omarchy's browser launcher to bring the
+approval page into view, with the desktop opener as a fallback outside Omarchy.
+The panel shows sign-in progress and errors. While approval is pending,
+**Open browser** reopens the same authorization request; it does not create a
+second sign-in session. Closing and reopening the panel recovers that status.
+The pending authorization URL is kept locally with mode `0600` until the
+attempt finishes, and cannot be reopened after its three-minute timeout.
 
 ## CLI and agent integration
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "coinbase",
   "name": "Coinbase",
-  "version": "1.0.31",
+  "version": "1.0.32",
   "author": "Brian Armstrong",
   "license": "MIT",
   "description": "Coinbase portfolio overview for the Omarchy bar: balances and Simple Retail watchlist editing via OAuth.",

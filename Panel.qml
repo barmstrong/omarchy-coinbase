@@ -33,6 +33,9 @@ Item {
   property double statusNow: Date.now()
   property bool signingIn: false
   property string loginStatus: ""
+  property string loginPhase: ""
+  property double loginRequestedAt: 0
+  property bool dismissAfterLoginLaunch: false
   property string searchQuery: ""
   property var searchResults: []
   property string clientIdDraft: ""
@@ -738,6 +741,7 @@ Item {
 
   function close() {
     opened = false
+    root.dismissAfterLoginLaunch = false
     root.periodChangeRequested = false
     root.detailPeriodChangeRequested = false
     watchlistRefreshPending = false
@@ -914,11 +918,13 @@ Item {
   }
 
   function signIn() {
-    if (root.signingIn) return
+    if (root.signingIn && root.loginPhase !== "waiting") return
     signingIn = true
-    loginStatus = ""
+    loginPhase = "opening"
+    loginRequestedAt = Date.now()
+    dismissAfterLoginLaunch = true
+    loginStatus = "Opening Coinbase…"
     Quickshell.execDetached([pluginFile("bin/coinbase"), "login"])
-    root.dismiss()
   }
 
   function saveAndSignIn() {
@@ -984,47 +990,63 @@ Item {
     onLoaded: root.receiveSnapshot(text())
   }
 
-  FileView {
-    id: loginStatusFile
-    path: Quickshell.env("HOME") + "/.local/state/omarchy/coinbase/login-status.json"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      var data = {}
-      try { data = JSON.parse(text() || "{}") } catch (e) { data = {} }
-      var status = String(data.status || "")
-      if (!Model.shouldHandleLoginStatus(status, root.signingIn, root.signedIn)) return
-      if (status === "opening") {
-        root.signingIn = true
-        root.loginStatus = "Opening Coinbase…"
-      } else if (status === "waiting") {
-        root.signingIn = true
-        root.loginStatus = "Waiting for Coinbase in your browser…"
+  function applyLoginStatus(data) {
+    // Give the detached helper time to acquire its lock and publish status.
+    if (!data.active && Date.now() - root.loginRequestedAt < 1500) return
+    var status = String(data.status || "")
+    if (!Model.shouldHandleLoginStatus(status, root.signingIn, root.signedIn, data.active)) return
+    root.loginPhase = status
+    if (status === "opening") {
+      root.signingIn = true
+      root.loginStatus = "Opening Coinbase…"
+    } else if (status === "waiting") {
+      root.signingIn = true
+      root.loginStatus = String(data.message || "Approve access in Coinbase. If offered a portfolio choice, select All portfolios and wallets.")
+      if (root.dismissAfterLoginLaunch && !data.message) {
+        root.dismissAfterLoginLaunch = false
         root.dismiss()
-      } else if (status === "exchanging") {
-        root.signingIn = true
-        root.loginStatus = "Finishing sign-in…"
-      } else if (status === "snapshot") {
-        root.signingIn = true
-        root.loginStatus = "Loading portfolio…"
-        snapshotFile.reload()
-      } else if (status === "done") {
-        root.signingIn = false
-        root.loginStatus = ""
-        root.acceptSnapshotReload = true
-        snapshotFile.reload()
-      } else if (status === "error") {
-        root.signingIn = false
-        root.loginStatus = String(data.message || "Sign-in did not finish.")
-      } else if (status === "logged-out") {
-        root.signingIn = false
-        root.loginStatus = ""
-        root.resetSignedOutView()
-        root.acceptSnapshotReload = true
-        snapshotFile.reload()
+      }
+    } else if (status === "exchanging") {
+      root.signingIn = true
+      root.loginStatus = "Finishing sign-in…"
+    } else if (status === "snapshot") {
+      root.signingIn = true
+      root.loginStatus = "Loading portfolio…"
+      snapshotFile.reload()
+    } else if (status === "done") {
+      root.signingIn = false
+      root.loginStatus = ""
+      root.acceptSnapshotReload = true
+      snapshotFile.reload()
+    } else if (status === "error") {
+      root.signingIn = false
+      root.loginStatus = String(data.message || "Sign-in did not finish.")
+    } else if (status === "logged-out") {
+      root.signingIn = false
+      root.loginStatus = ""
+      root.resetSignedOutView()
+      root.acceptSnapshotReload = true
+      snapshotFile.reload()
+    }
+  }
+
+  Process {
+    id: loginStateProc
+    command: [root.pluginFile("bin/coinbase"), "login-status"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try { root.applyLoginStatus(JSON.parse(text || "{}")) } catch (e) {}
       }
     }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  Timer {
+    interval: 1000
+    running: root.opened && (!root.signedIn || root.signingIn)
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: { if (!loginStateProc.running) loginStateProc.running = true }
   }
 
   FileView {
@@ -1091,7 +1113,10 @@ Item {
       root.clientSecretDraft = ""
     }
     onExited: function(code) {
-      if (code === 0) root.signIn()
+      if (code === 0) {
+        root.signingIn = false
+        root.signIn()
+      }
       else {
         root.signingIn = false
         root.loginStatus = "Could not save OAuth app."
@@ -1881,9 +1906,9 @@ Item {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               compact: true
-              label: root.signingIn ? "Signing in…" : "Sign in"
+              label: root.loginPhase === "waiting" && root.signingIn ? "Open browser" : (root.signingIn ? "Signing in…" : "Sign in")
               primary: true
-              enabled: !root.signingIn
+              enabled: !root.signingIn || root.loginPhase === "waiting"
               onClicked: root.signIn()
             }
           }
@@ -1936,7 +1961,7 @@ Item {
           }
 
           Text {
-            visible: !root.signedIn && !root.signingIn && root.loginStatus !== ""
+            visible: !root.signedIn && root.loginStatus !== ""
             width: parent.width
             horizontalAlignment: Text.AlignRight
             wrapMode: Text.WordWrap
