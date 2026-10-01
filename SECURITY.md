@@ -22,22 +22,7 @@ OAuth scopes. Disclosing credentials outside the explicitly configured OAuth
 flow, or disclosing one user's OAuth result to another user, is a security
 vulnerability.
 
-First enable offers optional CLI setup; the Yes default requires an explicit
-confirmation. Agent integration remains inactive until the user confirms the
-agent checklist, which initially has all listed agents checked and allows
-deselection or cancellation. No package downloads or new skill directories/links
-occur before consent. Only the saved exact directories are reconciled; shared
-discovery locations and future profiles are not added automatically. Legacy
-plugin-owned links from the previous automatic setup are removed on migration
-without treating their existence as consent. Foreign skills are preserved.
-
-The selected CLI installation uses the official `@coinbase/coinbase-cli` with
-an exact version and npm lockfile integrity hashes, with package lifecycle
-scripts disabled. Existing user commands are preserved. Setup may install
-Node 22 through mise when needed. It does not configure authentication or
-grant trading permissions. The official CLI has
-broader account capabilities when separately authenticated; the skill requires
-user authorization for account mutations and never reuses widget OAuth tokens.
+The plugin does not install additional packages or register agent skills.
 
 Local OAuth tokens, portfolio snapshots, account-derived watchlist data, and
 cache files must remain owner-only (`0600`) inside the owner-only (`0700`)

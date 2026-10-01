@@ -39,26 +39,19 @@ logo are trademarks of their respective owner.
 ## Install
 
 Requires Omarchy with `omarchy-shell`, Python 3, and network access. The widget
-has no third-party Python dependencies. On first enable, a setup prompt offers
-the optional official Coinbase CLI and lets you choose which agents receive its skill.
-Installation runs as your user and needs no elevated privileges.
+has no third-party Python dependencies. Installation runs as your user and
+needs no elevated privileges. It installs only the plugin, with no additional
+package downloads, setup prompts, or agent skill registration.
 
 The [marketplace submission](https://github.com/omacom/omarchy-plugin-marketplace/issues/7520)
-is awaiting maintainer approval. On October 1, the reviewer
-[withdrew the earlier broker and read-only requirements](https://github.com/omacom/omarchy-plugin-marketplace/issues/7520#issuecomment-5924487958).
-Version 1.0.29 addresses the subsequent
-[agent opt-in request](https://github.com/omacom/omarchy-plugin-marketplace/issues/7520#issuecomment-5931520767)
-with explicit CLI confirmation and per-agent selection; the new commit needs review.
-Automated checks alone do not approve a listing. Install the public repository directly:
+is awaiting maintainer approval. Install the public repository directly:
 
 ```bash
 omarchy plugin add https://github.com/barmstrong/omarchy-coinbase.git --enable
 ```
 
 The command clones the current public repository, validates it locally, and
-then installs and enables the widget. Omarchy has no plugin install hook, so
-the optional setup prompt opens in a terminal on first enable. Installing
-without `--enable` defers that prompt until the plugin is enabled.
+then installs and enables the widget.
 
 Click the bar widget, then **Sign in with Coinbase**. The repository includes a
 hosted OAuth broker URL, so installers do not need a Coinbase client secret.
@@ -75,108 +68,14 @@ second sign-in session. Closing and reopening the panel recovers that status.
 The pending authorization URL is kept locally with mode `0600` until the
 attempt finishes, and cannot be reopened after its three-minute timeout.
 
-## CLI and agent integration
-
-First enable opens a one-time setup prompt:
-
-1. **Install Coinbase CLI?** defaults to **Yes**, but requires confirmation.
-   Choose **No** to use only the widget. No downloads happen before confirmation.
-2. Confirm which agents receive the Coinbase skill. **All listed agents start
-   checked**; deselect any you do not want and press Enter to confirm. Clear
-   all selections to install only the CLI. No links are created until confirmation.
-
-Closing or canceling setup grants no new permissions. The prompt does not
-repeatedly reopen; rerun `setup-agents configure` when ready. Existing CLI
-installations do not imply consent to register agent instructions. Upgrading
-from pre-1.0.29 removes legacy plugin-owned skill links and offers the same
-choice, while preserving the existing CLI until a choice is made. A prior
-explicit opt-out remains respected.
-
-After confirmation, setup installs the official `@coinbase/coinbase-cli` version 0.0.10 from npm using
-the committed lockfile and integrity hashes, with lifecycle scripts disabled.
-The runtime lives in `~/.local/share/omarchy/coinbase-cli/`; its launcher is
-`~/.local/bin/coinbase`, already on PATH in Omarchy. The widget continues using
-its own private `bin/coinbase` helper.
-
-The official CLI needs Node.js 22+ and npm. Setup uses a compatible installed
-runtime or installs Node 22 through Omarchy's `mise`, without changing the
-user's global Node selection. Runtime downloads use mise's configured backend;
-CLI packages use npm's configured registry/cache. Linux credential storage
-uses `secret-tool` (Arch's `libsecret` package). Credentials are not configured,
-copied, or read by setup; the CLI's authentication is separate from the widget's
-OAuth login. See the [official CLI guide](https://docs.cdp.coinbase.com/coinbase-cli/skill.md).
-
-A single bundled `skills/coinbase-cli` directory is linked only into the
-selected user skill directories. Choices include Claude, Codex, Cursor, Gemini,
-Copilot, Pi, OpenClaw, OpenCode, Crush, Grok, and Hermes, with existing Hermes
-profiles offered individually. No link is created in the shared `~/.agents/skills`
-directory. Directory mappings follow the
-[Skills project's agent registry](https://github.com/vercel-labs/skills/blob/main/src/agents.ts)
-and Omarchy's existing skill locations. Supported configuration-root environment
-variables are honored when choosing agents. The exact selected directories are
-saved; a later environment change cannot silently redirect registration.
-You may explicitly select an agent before installing it. Future agents and
-profiles are never added automatically; rerun configuration to select them.
-
-While the plugin is enabled, setup reconciles the saved choices every five
-minutes, repairing missing links for selected agents after reinstallation.
-No selection means no CLI download or new agent directories/links. It performs
-no npm download once the pinned runtime is ready.
-Existing commands and same-name user skills are preserved. A conflicting
-`coinbase` command blocks setup and is reported in status, rather than replaced.
-Open a new agent session (or reload skills) after installation.
-
-```bash
-coinbase --version
-coinbase --help
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents status
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents configure
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents ensure
-```
-
-For explicit noninteractive setup, `enable` installs only the CLI by default.
-Add each intended agent by name (e.g. `--agent codex --agent claude`).
-`ensure` only repairs an existing selection; it cannot opt in.
-
-```bash
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents enable
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents enable --agent codex --agent claude
-```
-
-Choices are stored in `~/.local/state/omarchy/coinbase-agents/selection.json`.
-Rerunning configuration replaces the selection and removes deselected managed
-links. Choosing **No** also removes any plugin-managed CLI installation.
-
-Failures are recorded in `~/.local/state/omarchy/coinbase-agents/status.json`
-and retried at the next five-minute interval. To opt out, remove the managed
-CLI runtime, launcher and skill links, and prevent automatic reinstallation:
-
-```bash
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents remove
-# Choose what to opt back into:
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents configure
-```
-
 ## Remove
 
 Use **Log out** in the panel first. This asks Coinbase to revoke the active
 access token and then removes the local token file. Remove the plugin with:
 
 ```bash
-python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents uninstall
+omarchy plugin remove coinbase
 ```
-
-This invokes Omarchy's normal removal confirmation, then removes the managed
-CLI runtime, launcher and agent skill links. Add `--yes` for noninteractive
-removal. Canceling confirmation leaves the CLI and links intact. Independently
-installed commands, user skills, the shared Node.js runtime and CLI credentials
-are preserved. A later plugin reinstall offers the setup prompt again.
-
-Plain `omarchy plugin remove coinbase` does **not** clean up the CLI or skill
-links: Omarchy does not currently invoke uninstall hooks. Use the combined
-command above, or run `setup-agents remove` before native plugin removal.
-The separate `remove` action persists an explicit opt-out across reinstalls;
-run `setup-agents configure` to change it.
 
 Omarchy may retain non-secret preferences and market-data caches under
 `~/.local/state/omarchy/coinbase/` after removal. To erase those files too:
@@ -306,8 +205,6 @@ node broker/test.mjs
 node tests/model.test.js
 python3 -m unittest discover -s tests -v
 bash tests/refresh/run.sh # Requires a running desktop session
-python3 tests/agents/run.py # Isolated headless service smoke test
-python3 tests/agents/prompt.py # Real terminal prompts; package installation stubbed
 bin/coinbase status
 bin/coinbase snapshot --period day
 bin/coinbase chart BTC-USD --period week --symbol BTC --kind crypto
