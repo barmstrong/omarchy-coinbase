@@ -923,14 +923,14 @@ Item {
     loginPhase = "opening"
     loginRequestedAt = Date.now()
     dismissAfterLoginLaunch = true
-    loginStatus = "Opening Coinbase…"
+    loginStatus = ""
     Quickshell.execDetached([pluginFile("bin/coinbase"), "login"])
   }
 
   function saveAndSignIn() {
     if (setupProc.running || !clientIdDraft || !clientSecretDraft) return
     signingIn = true
-    loginStatus = "Saving OAuth app…"
+    loginStatus = ""
     setupProc.command = [pluginFile("bin/coinbase"), "setup", "--stdin"]
     setupProc.running = true
   }
@@ -998,7 +998,7 @@ Item {
     root.loginPhase = status
     if (status === "opening") {
       root.signingIn = true
-      root.loginStatus = "Opening Coinbase…"
+      root.loginStatus = ""
     } else if (status === "waiting") {
       root.signingIn = true
       root.loginStatus = String(data.message || "")
@@ -1008,10 +1008,10 @@ Item {
       }
     } else if (status === "exchanging") {
       root.signingIn = true
-      root.loginStatus = "Finishing sign-in…"
+      root.loginStatus = ""
     } else if (status === "snapshot") {
       root.signingIn = true
-      root.loginStatus = "Loading portfolio…"
+      root.loginStatus = ""
       snapshotFile.reload()
     } else if (status === "done") {
       root.signingIn = false
@@ -1953,7 +1953,7 @@ Item {
             AuthButton {
               width: parent.width
               height: Style.space(40)
-              label: root.signingIn ? (root.loginStatus || "Signing in…") : "Save and sign in"
+              label: "Save and sign in"
               primary: true
               enabled: !root.signingIn && root.clientIdDraft !== "" && root.clientSecretDraft !== ""
               onClicked: root.saveAndSignIn()
