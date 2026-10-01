@@ -49,5 +49,9 @@ python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents ensure
 python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents status
 ```
 
+`ensure` only repairs the user's saved selection. To change CLI or agent
+registration, the user can run `setup-agents configure` in the plugin's `bin`
+directory. Do not opt additional agents in merely to repair this agent's skill.
+
 Skills become discoverable on the agent's next skill reload or new session.
 A locally installed CLI is not automatically available to remote sandboxes.

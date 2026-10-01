@@ -4,10 +4,14 @@ import Quickshell.Io
 Item {
   id: root
   visible: false
+  readonly property string setupPath: decodeURIComponent(Qt.resolvedUrl("bin/setup-agents").toString().replace(/^file:\/\//, ""))
+  Component.onCompleted: {
+    setup.command = ["python3", root.setupPath, "onboard"]
+    setup.running = true
+  }
 
   Process {
     id: setup
-    command: ["python3", decodeURIComponent(Qt.resolvedUrl("bin/setup-agents").toString().replace(/^file:\/\//, "")), "ensure"]
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
@@ -16,13 +20,16 @@ Item {
     }
   }
 
-  // Runs on enable and shell startup. Reconcile missing agent/profile links
-  // without repeated downloads once the pinned runtime is installed.
+  // Background work only reconciles the user's explicitly saved selection.
   Timer {
     interval: 300000
     running: true
     repeat: true
-    triggeredOnStart: true
-    onTriggered: if (!setup.running) setup.running = true
+    onTriggered: {
+      if (!setup.running) {
+        setup.command = ["python3", root.setupPath, "ensure"]
+        setup.running = true
+      }
+    }
   }
 }

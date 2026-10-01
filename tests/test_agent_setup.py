@@ -32,6 +32,7 @@ class AgentSetupTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.calls = []
+        self.h.save_selection(self.state, True, [self.home / '.claude/skills', self.home / '.codex/skills'])
 
     def fake_run(self, args, **kwargs):
         self.calls.append(args)
@@ -54,7 +55,7 @@ class AgentSetupTests(unittest.TestCase):
         wrapper = self.home / '.local/bin/coinbase'
         self.assertTrue(os.access(wrapper, os.X_OK))
         self.assertIn('/test/node', wrapper.read_text())
-        self.assertTrue((self.home / '.agents/skills/coinbase-cli').is_symlink())
+        self.assertTrue((self.home / '.codex/skills/coinbase-cli').is_symlink())
         first_calls = len(self.calls)
         self.install()
         self.assertEqual(len(self.calls), first_calls, 'healthy repeat setup has no network work')
@@ -64,7 +65,7 @@ class AgentSetupTests(unittest.TestCase):
         profile.mkdir(parents=True)
         self.install()
         self.assertTrue(link.is_symlink())
-        self.assertTrue((profile / 'skills/coinbase-cli').is_symlink())
+        self.assertFalse((profile / 'skills/coinbase-cli').is_symlink(), 'new profiles need explicit selection')
         install_command = next(c for c in self.calls if 'ci' in c)
         self.assertIn('--ignore-scripts', install_command)
 
@@ -85,7 +86,7 @@ class AgentSetupTests(unittest.TestCase):
         self.assertTrue(any('preserved existing' in s for s in result['skills']))
         self.h.remove(self.home, self.state, self.data)
         self.assertEqual((custom / 'SKILL.md').read_text(), 'user instructions')
-        self.assertFalse(os.path.lexists(self.home / '.agents/skills/coinbase-cli'))
+        self.assertFalse(os.path.lexists(self.home / '.codex/skills/coinbase-cli'))
         self.assertFalse((self.home / '.local/bin/coinbase').exists())
         calls = len(self.calls)
         self.assertEqual(self.install(), {'disabled': True})
@@ -136,7 +137,7 @@ class AgentSetupTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'left intact'):
                 self.h.uninstall(self.home, self.state, self.data)
         self.assertTrue((self.home / '.local/bin/coinbase').exists())
-        self.assertTrue((self.home / '.agents/skills/coinbase-cli').is_symlink())
+        self.assertTrue((self.home / '.codex/skills/coinbase-cli').is_symlink())
         self.assertTrue(next(self.data.glob('runtime-*')).exists())
         self.assertFalse((self.state / 'disabled').exists())
 
@@ -152,7 +153,7 @@ class AgentSetupTests(unittest.TestCase):
             result = self.h.uninstall(self.home, self.state, self.data, assume_yes=True)
         self.assertTrue(result['uninstalled'])
         self.assertFalse((self.home / '.local/bin/coinbase').exists())
-        self.assertFalse(os.path.lexists(self.home / '.agents/skills/coinbase-cli'))
+        self.assertFalse(os.path.lexists(self.home / '.codex/skills/coinbase-cli'))
         self.assertEqual(list(self.data.glob('runtime-*')), [])
         self.assertFalse((self.state / 'disabled').exists())
 
@@ -171,6 +172,105 @@ class AgentSetupTests(unittest.TestCase):
         self.assertFalse((self.home / '.local/bin/coinbase').exists())
         self.install()
         self.assertTrue((self.home / '.local/bin/coinbase').exists())
+
+    def test_fresh_install_has_no_implicit_consent_or_agent_directories(self):
+        (self.state / 'selection.json').unlink()
+        self.assertEqual(self.install(), {'needsConfiguration': True})
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.data.exists())
+        for directory in self.h.skill_directories(self.home):
+            self.assertFalse(directory.exists())
+
+    def test_cli_only_consent_never_registers_agent_skills(self):
+        self.h.save_selection(self.state, True, [])
+        result = self.install()
+        self.assertEqual(result['skills'], [])
+        self.assertTrue((self.home / '.local/bin/coinbase').exists())
+        for directory in self.h.skill_directories(self.home):
+            self.assertFalse(directory.exists())
+
+    def test_legacy_links_are_removed_without_inferring_consent(self):
+        self.install()
+        shared = self.home / '.agents/skills'
+        self.h.link_skill(shared, self.h.SKILL)
+        (self.state / 'selection.json').unlink()
+        self.assertEqual(self.install(), {'needsConfiguration': True})
+        for directory in self.h.skill_directories(self.home):
+            self.assertFalse(os.path.lexists(directory / 'coinbase-cli'))
+        self.assertTrue((self.home / '.local/bin/coinbase').exists(), 'migration does not delete the existing CLI')
+
+    def test_only_explicit_selection_is_repaired_after_environment_changes(self):
+        self.install()
+        (self.home / '.codex/skills/coinbase-cli').unlink()
+        with patch.dict(os.environ, {'CODEX_HOME': str(self.home / 'another-codex')}):
+            self.install()
+        self.assertTrue((self.home / '.codex/skills/coinbase-cli').is_symlink())
+        self.assertFalse((self.home / 'another-codex').exists())
+        self.assertFalse((self.home / '.agents').exists())
+
+    def test_reselection_removes_deselected_links(self):
+        self.install()
+        with patch.object(self.h, 'ensure_cli', return_value={'version': 'test'}):
+            result = self.h.choose_integration(self.home, self.state, self.data, ['codex'])
+        self.assertEqual(len(result['skills']), 1)
+        self.assertFalse(os.path.lexists(self.home / '.claude/skills/coinbase-cli'))
+        self.assertTrue((self.home / '.codex/skills/coinbase-cli').is_symlink())
+        self.assertEqual(self.h.selection(self.state)['directories'], [str(self.home / '.codex/skills')])
+
+    def test_onboarding_opens_once_and_does_not_install(self):
+        (self.state / 'selection.json').unlink()
+        with patch.object(self.h.subprocess, 'Popen') as launch:
+            for _ in range(2):
+                self.assertEqual(self.h.onboard(self.home, self.state, self.data), {'needsConfiguration': True})
+            launch.assert_called_once()
+            self.assertTrue(launch.call_args.kwargs['close_fds'])
+            self.assertIn('configure', launch.call_args.args[0][1])
+        self.assertFalse(self.data.exists())
+        self.assertIsNone(self.h.selection(self.state))
+
+    def test_wizard_defaults_cli_yes_but_selects_only_checked_agents(self):
+        (self.state / 'selection.json').unlink()
+        picked = 'codex (' + str(self.home / '.codex/skills') + ')\n'
+        responses = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, picked)]
+        with patch.object(self.h.sys.stdin, 'isatty', return_value=True), \
+             patch.object(self.h.sys.stdout, 'isatty', return_value=True), \
+             patch.object(self.h.subprocess, 'run', side_effect=responses) as prompt, \
+             patch.object(self.h, 'ensure_cli', return_value={'version': 'test'}), \
+             patch('builtins.print'):
+            self.h.configure(self.home, self.state, self.data)
+        self.assertIn('--default=true', prompt.call_args_list[0].args[0])
+        self.assertIn('--selected=', prompt.call_args_list[1].args[0])
+        for call in prompt.call_args_list:
+            self.assertIn('--timeout=0s', call.args[0])
+        self.assertEqual(self.h.selection(self.state)['directories'], [str(self.home / '.codex/skills')])
+        self.assertFalse((self.home / '.claude').exists())
+
+    def test_decline_or_cancel_never_installs(self):
+        for exit_code in (1, 130):
+            with self.subTest(exit_code=exit_code):
+                (self.state / 'selection.json').unlink(missing_ok=True)
+                (self.state / 'disabled').unlink(missing_ok=True)
+                with patch.object(self.h.sys.stdin, 'isatty', return_value=True), \
+                     patch.object(self.h.sys.stdout, 'isatty', return_value=True), \
+                     patch.object(self.h.subprocess, 'run', return_value=subprocess.CompletedProcess([], exit_code)), \
+                     patch.object(self.h, 'ensure_cli') as install, patch('builtins.print'):
+                    self.h.configure(self.home, self.state, self.data)
+                install.assert_not_called()
+                if exit_code == 1:
+                    self.assertFalse(self.h.selection(self.state)['cli'])
+                    self.assertEqual(self.install(), {'disabled': True})
+                else:
+                    self.assertIsNone(self.h.selection(self.state))
+
+    def test_cancel_agent_picker_does_not_save_cli_consent(self):
+        (self.state / 'selection.json').unlink()
+        with patch.object(self.h.sys.stdin, 'isatty', return_value=True), \
+             patch.object(self.h.sys.stdout, 'isatty', return_value=True), \
+             patch.object(self.h.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 130)]), \
+             patch.object(self.h, 'ensure_cli') as install, patch('builtins.print'):
+            self.assertEqual(self.h.configure(self.home, self.state, self.data), {'canceled': True})
+        install.assert_not_called()
+        self.assertIsNone(self.h.selection(self.state))
 
 
 if __name__ == '__main__':

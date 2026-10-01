@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='coinbase service test ') as directory:
     (stage / 'bin').mkdir()
     (stage / 'bin/setup-agents').write_text('''from pathlib import Path
 import sys
-assert sys.argv[1:] == ["ensure"]
+assert sys.argv[1:] == ["onboard"]
 (Path(__file__).resolve().parents[1] / "invoked").write_text("ok")
 ''')
     (stage / 'shell.qml').write_text('''import QtQuick
@@ -32,4 +32,4 @@ ShellRoot {
                             env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (stage / 'invoked').read_text() == 'ok', result.stdout + result.stderr
-    print('PASS: service automatically runs setup; paths containing spaces work')
+    print('PASS: service offers onboarding; paths containing spaces work')

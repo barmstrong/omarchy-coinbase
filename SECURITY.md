@@ -22,12 +22,19 @@ OAuth scopes. Disclosing credentials outside the explicitly configured OAuth
 flow, or disclosing one user's OAuth result to another user, is a security
 vulnerability.
 
-Enabling the plugin separately installs the official `@coinbase/coinbase-cli`
-using an exact version and npm lockfile integrity hashes, with package lifecycle
-scripts disabled. Its local launcher and shared skill are reconciled without
-overwriting existing user commands or skills. Setup may install Node 22 through
-mise when needed. This installation is disclosed in the README and does not
-configure authentication or grant trading permissions. The official CLI has
+First enable offers optional CLI setup; the Yes default requires an explicit
+confirmation. Agent integration is disabled by default and requires selection
+of each intended agent. No package downloads or new skill directories/links
+occur before consent. Only the saved exact directories are reconciled; shared
+discovery locations and future profiles are not added automatically. Legacy
+plugin-owned links from the previous automatic setup are removed on migration
+without treating their existence as consent. Foreign skills are preserved.
+
+The selected CLI installation uses the official `@coinbase/coinbase-cli` with
+an exact version and npm lockfile integrity hashes, with package lifecycle
+scripts disabled. Existing user commands are preserved. Setup may install
+Node 22 through mise when needed. It does not configure authentication or
+grant trading permissions. The official CLI has
 broader account capabilities when separately authenticated; the skill requires
 user authorization for account mutations and never reuses widget OAuth tokens.
 

@@ -17,22 +17,114 @@ MARKER = '# Managed by omarchy-coinbase setup-agents'
 RUNTIME_MARKER = '.omarchy-coinbase-runtime'
 
 
+def agent_targets(home):
+    """Offer explicit per-agent locations, never an implicit shared/future target."""
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config')
+    targets = {name: home / path for name, path in [
+        ('cursor', '.cursor/skills'), ('gemini', '.gemini/skills'),
+        ('copilot', '.copilot/skills'), ('pi', '.pi/agent/skills'),
+        ('openclaw', '.openclaw/skills')]}
+    targets.update(opencode=config / 'opencode/skills', crush=config / 'crush/skills')
+    for name, variable in [('claude', 'CLAUDE_CONFIG_DIR'), ('codex', 'CODEX_HOME'),
+                           ('hermes', 'HERMES_HOME'), ('grok', 'GROK_HOME')]:
+        base = Path(os.environ.get(variable) or home / ('.' + name))
+        targets[name] = base / 'skills'
+        if name == 'hermes':
+            for profile in sorted((base / 'profiles').glob('*')):
+                if profile.is_dir():
+                    targets['hermes/' + profile.name] = profile / 'skills'
+    return targets
+
+
+def selection(state):
+    try:
+        value = json.loads((state / 'selection.json').read_text())
+        if (value.get('version') == 1 and type(value.get('cli')) is bool
+                and isinstance(value.get('directories'), list)
+                and all(isinstance(p, str) and Path(p).is_absolute() for p in value['directories'])):
+            return value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def save_selection(state, cli, directories):
+    temporary = state / 'selection.tmp'
+    temporary.write_text(json.dumps({'version': 1, 'cli': cli,
+                                    'directories': [str(p) for p in directories]}) + '\n')
+    temporary.chmod(0o600)
+    temporary.replace(state / 'selection.json')
+
+
+def prune_links(home, keep=(), previous=()):
+    keep = {Path(p) for p in keep}
+    for directory in set(skill_directories(home)) | {Path(p) for p in previous}:
+        destination = directory / 'coinbase-cli'
+        if directory not in keep and destination.is_symlink() and destination.readlink() == SKILL:
+            destination.unlink()
+
+
+def choose_integration(home, state, data, agents):
+    targets = agent_targets(home)
+    unknown = set(agents) - targets.keys()
+    if unknown:
+        raise RuntimeError('Unknown agent selection: ' + ', '.join(sorted(unknown)))
+    directories = list(dict.fromkeys(targets[name] for name in agents))
+    previous = selection(state) or {}
+    prune_links(home, directories, previous.get('directories', []))
+    save_selection(state, True, directories)
+    (state / 'disabled').unlink(missing_ok=True)
+    return setup(home, state, data)
+
+
+def configure(home, state, data):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError('Run configure in a terminal, or use enable --agent NAME for explicit noninteractive setup.')
+    print('Optional Coinbase CLI and agent setup', flush=True)
+    print('Install the official CLI on PATH (Node.js may be installed if needed).\n'
+          'Authentication is separate; the widget works without it.\n'
+          'No keeps only the widget and removes any plugin-managed CLI/skills.\n', flush=True)
+    # Explicit timeouts prevent inherited gum settings from treating elapsed
+    # time as consent. No agent starts selected, including on reconfiguration.
+    answer = subprocess.run(['gum', 'confirm', 'Install Coinbase CLI?', '--default=true', '--timeout=0s'], check=False)
+    if answer.returncode == 1:
+        return remove(home, state, data)
+    if answer.returncode != 0:
+        return {'canceled': True}
+    targets = agent_targets(home)
+    print('\nChoose agents to receive the Coinbase skill using the keys shown below; Enter confirms.\n'
+          'Leave all unchecked for CLI only. Future agents/profiles require another selection.\n', flush=True)
+    labels = {name + ' (' + str(path) + ')': name for name, path in sorted(targets.items())}
+    picked = subprocess.run(['gum', 'choose', '--no-limit', '--selected=', '--timeout=0s',
+                             '--header=Share the Coinbase skill with:', *labels],
+                            check=False, text=True, stdout=subprocess.PIPE)
+    if picked.returncode != 0:
+        return {'canceled': True}
+    names = [labels[line] for line in picked.stdout.splitlines() if line in labels]
+    return choose_integration(home, state, data, names)
+
+
+def onboard(home, state, data):
+    result = setup(home, state, data)
+    if not result.get('needsConfiguration') or (state / 'prompted').exists():
+        return result
+    command = shlex.join(['python3', str(ROOT / 'bin/setup-agents'), 'configure'])
+    # The new terminal must not inherit the setup lock. Only open it once;
+    # cancellation/closing is never consent and does not cause repeated popups.
+    subprocess.Popen(['omarchy-launch-floating-terminal-with-presentation', command],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
+    (state / 'prompted').touch()
+    return result
+
+
 def run(args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, timeout=180, **kwargs).stdout.strip()
 
 
 def skill_directories(home):
-    config = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config')
-    paths = [home / '.agents/skills', home / '.cursor/skills', home / '.gemini/skills',
-             home / '.copilot/skills', home / '.pi/agent/skills', home / '.openclaw/skills',
-             config / 'opencode/skills', config / 'crush/skills']
-    for variable, fallback in [('CLAUDE_CONFIG_DIR', '.claude'), ('CODEX_HOME', '.codex'),
-                               ('HERMES_HOME', '.hermes'), ('GROK_HOME', '.grok')]:
-        base = Path(os.environ.get(variable) or home / fallback)
-        paths.append(base / 'skills')
-        if variable == 'HERMES_HOME':
-            paths.extend(p / 'skills' for p in (base / 'profiles').glob('*') if p.is_dir())
-    return list(dict.fromkeys(paths))
+    """Legacy locations for cleanup only; registration uses saved selections."""
+    return list(dict.fromkeys([home / '.agents/skills', *agent_targets(home).values()]))
 
 
 def link_skill(directory, source):
@@ -114,11 +206,22 @@ def ensure_cli(home, data):
 
 
 def setup(home, state, data):
+    chosen = selection(state)
     if (state / 'disabled').exists():
+        prune_links(home, previous=(chosen or {}).get('directories', []))
         return {'disabled': True}
+    if chosen is None:
+        # Versions before 1.0.29 registered instructions without a recorded
+        # selection. Remove only those owned links; never infer consent.
+        prune_links(home)
+        return {'needsConfiguration': True}
+    if not chosen['cli']:
+        prune_links(home, previous=chosen['directories'])
+        return {'disabled': True}
+    prune_links(home, chosen['directories'])
     result = ensure_cli(home, data)
     links = []
-    for directory in skill_directories(home):
+    for directory in map(Path, chosen['directories']):
         try:
             links.append(link_skill(directory, SKILL))
         except OSError as exc:
@@ -131,10 +234,9 @@ def setup(home, state, data):
 def remove(home, state, data):
     # Persist opt-out so a still-running plugin won't immediately reinstall.
     (state / 'disabled').touch()
-    for directory in skill_directories(home):
-        destination = directory / 'coinbase-cli'
-        if destination.is_symlink() and destination.readlink() == SKILL:
-            destination.unlink()
+    previous = selection(state) or {}
+    prune_links(home, previous=previous.get('directories', []))
+    save_selection(state, False, [])
     wrapper = home / '.local/bin/coinbase'
     if owned_wrapper(wrapper):
         wrapper.unlink()
@@ -159,8 +261,10 @@ def uninstall(home, state, data, assume_yes=False):
     if os.path.lexists(target):
         raise RuntimeError('Plugin removal did not complete; CLI and skill links were left intact.')
     cleaned = remove(home, state, data)
-    # A later plugin reinstall should get the normal automatic CLI setup.
+    # A later plugin reinstall should offer setup again.
     (state / 'disabled').unlink(missing_ok=True)
+    (state / 'selection.json').unlink(missing_ok=True)
+    (state / 'prompted').unlink(missing_ok=True)
     cleaned.pop('disabled')
     cleaned['uninstalled'] = True
     if result.returncode:
@@ -170,29 +274,39 @@ def uninstall(home, state, data, assume_yes=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['ensure', 'enable', 'remove', 'uninstall', 'status'])
+    parser.add_argument('action', choices=['ensure', 'onboard', 'configure', 'enable', 'remove', 'uninstall', 'status'])
+    parser.add_argument('--agent', action='append', default=[], help='Agent to opt into (repeatable; enable only). Omit for CLI only.')
     parser.add_argument('--yes', action='store_true', help='Skip Omarchy confirmation for uninstall')
     args = parser.parse_args()
     if args.yes and args.action != 'uninstall':
         parser.error('--yes is only supported with uninstall')
+    if args.agent and args.action != 'enable':
+        parser.error('--agent is only supported with enable')
     home = Path.home()
     state = Path(os.environ.get('XDG_STATE_HOME') or home / '.local/state') / 'omarchy/coinbase-agents'
     data = Path(os.environ.get('XDG_DATA_HOME') or home / '.local/share') / 'omarchy/coinbase-cli'
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     status = state / 'status.json'
     if args.action == 'status':
-        print(status.read_text() if status.exists() else '{"installed": false}')
+        print(json.dumps({'selection': selection(state),
+                          'lastRun': json.loads(status.read_text()) if status.exists() else {}}))
         return
     with (state / 'setup.lock').open('w') as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The launched wizard may start before its onboarding parent has
+            # released this lock. Let interactive configuration wait for it.
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if args.action == 'configure' else fcntl.LOCK_NB))
         except BlockingIOError:
             print('{"busy": true}')
             return
         try:
             if args.action == 'enable':
-                (state / 'disabled').unlink(missing_ok=True)
-            if args.action == 'uninstall':
+                result = choose_integration(home, state, data, args.agent)
+            elif args.action == 'configure':
+                result = configure(home, state, data)
+            elif args.action == 'onboard':
+                result = onboard(home, state, data)
+            elif args.action == 'uninstall':
                 result = uninstall(home, state, data, args.yes)
             elif args.action == 'remove':
                 result = remove(home, state, data)
