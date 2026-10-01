@@ -222,6 +222,58 @@ class ReliabilityTests(unittest.TestCase):
 
         self.assertIn("MU", [row["id"] for row in rows])
 
+    def test_stock_aliases_prefer_catalog_identity_in_either_order(self):
+        helper = load_helper()
+        for fallback_first in (True, False):
+            with self.subTest(fallback_first=fallback_first):
+                fallback = helper.coinbase_stock_row("COIN", "Coinbase")
+                fallback.update(price=187.52, rowSpark=[186, 187.52], rowSparkPeriod="day",
+                                rowSparkVersion=helper.ROW_SPARK_VERSION)
+                catalog = helper.coinbase_stock_row("COIN", "Coinbase Global", "official-equity-id")
+                rows = [fallback, catalog] if fallback_first else [catalog, fallback]
+                merged = helper.dedupe_stock_assets(rows)
+                self.assertEqual(len(merged), 1)
+                self.assertEqual(merged[0]["productId"], "official-equity-id")
+                self.assertEqual(merged[0]["name"], "Coinbase Global")
+                self.assertEqual(merged[0]["price"], 187.52)
+                self.assertEqual(merged[0]["rowSpark"], [186, 187.52])
+
+    def test_stock_deduplication_keeps_other_instruments_and_share_classes(self):
+        helper = load_helper()
+        rows = [
+            helper.coinbase_stock_row("COIN", "Coinbase", "official-equity-id"),
+            helper.market_row("COIN", "Coinbase PERP", "derivative", "COIN-PERP", marketCategory="stock"),
+            helper.market_row("COIN", "Coin token", "crypto", "COIN-USD"),
+            helper.market_row("CBETH", "Coinbase Wrapped Staked ETH", "crypto", "CBETH-USD"),
+            helper.coinbase_stock_row("GOOG", "Alphabet", "goog-id"),
+            helper.coinbase_stock_row("GOOGL", "Alphabet", "googl-id"),
+        ]
+        self.assertEqual(helper.dedupe_stock_assets(rows), rows)
+
+    def test_public_refresh_repairs_cached_stock_aliases(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            configure_state(helper, Path(directory))
+            fallback = helper.coinbase_stock_row("COIN", "Coinbase")
+            fallback["price"] = 187.52
+            catalog = helper.coinbase_stock_row("COIN", "Coinbase Global", "official-equity-id")
+            catalog["price"] = 187.52
+            previous = helper.empty_snapshot(assets=[fallback, catalog], catalogAt=int(time.time()))
+            helper.write_json(helper.MARKET_SNAPSHOT_FILE, previous)
+            helper.ensure_bar_asset = lambda assets: assets
+            helper.enrich_yahoo_assets = lambda assets: None
+            helper.lead_asset = lambda assets: assets[0]
+            helper.apply_period_pnl = lambda *args, **kwargs: ([186, 187.52], 1.52, 0.82)
+            helper.snapshot_bar = lambda *args, **kwargs: {}
+
+            result = helper.market_snapshot("day")
+
+            self.assertEqual(len(result["assets"]), 1)
+            self.assertEqual(result["assets"][0]["productId"], "official-equity-id")
+            for path in (helper.SNAPSHOT_FILE, helper.MARKET_SNAPSHOT_FILE):
+                stored = json.loads(path.read_text())
+                self.assertEqual(stored["assets"], result["assets"])
+
     def test_new_detail_cache_version_discards_legacy_chart_entries(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

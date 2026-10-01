@@ -3633,6 +3633,13 @@ def dedupe_stock_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen[ticker] = asset
             out.append(asset)
             continue
+        # Early public catalogs use a synthetic ticker-USD ID until Coinbase's
+        # equity index is available. Prefer the real product identity regardless
+        # of cache order, while retaining the existing quote and chart data.
+        previous_id = str(prev.get("productId") or "")
+        product_id = str(asset.get("productId") or "")
+        if previous_id in {"", f"{ticker}-USD"} and product_id not in {"", f"{ticker}-USD"}:
+            apply_stock_identity(prev, ticker, str(asset.get("name") or ticker), product_id)
         if asset.get("held"):
             prev["held"] = True
             prev["quantity"] = asset.get("quantity") or prev.get("quantity")
@@ -4033,6 +4040,9 @@ def write_market_snapshot(
 ) -> dict[str, Any]:
     if not assets:
         raise RuntimeError("market data is unavailable")
+    # Catalog backfills and existing disk snapshots can contain both fallback
+    # and canonical entries for a stock. Normalize every public refresh too.
+    assets = dedupe_stock_assets(assets)
     enrich_yahoo_assets(assets)
     activate_cached_row_sparks(assets, period)
     lead = lead_asset(assets) or {}
