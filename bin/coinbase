@@ -1476,7 +1476,7 @@ def reopen_login_browser() -> None:
             write_login_status("waiting")
     except (OSError, subprocess.SubprocessError, RuntimeError):
         if read_json(LOGIN_STATUS_FILE, {}).get("status") == "waiting":
-            write_login_status("waiting", "Could not open the browser. Try Open browser again.")
+            write_login_status("waiting", "Could not open the browser. Click Sign in to try again.")
 
 
 def cmd_login_status() -> None:

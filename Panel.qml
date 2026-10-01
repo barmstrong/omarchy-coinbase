@@ -1906,7 +1906,7 @@ Item {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               compact: true
-              label: root.loginPhase === "waiting" && root.signingIn ? "Open browser" : (root.signingIn ? "Signing in…" : "Sign in")
+              label: "Sign in"
               primary: true
               enabled: !root.signingIn || root.loginPhase === "waiting"
               onClicked: root.signIn()

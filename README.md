@@ -70,7 +70,7 @@ the final access choice; if it still shows **Specific portfolios**, select
 scopes listed below. Sign-in uses Omarchy's browser launcher to bring the
 approval page into view, with the desktop opener as a fallback outside Omarchy.
 The panel shows sign-in progress and errors. While approval is pending,
-**Open browser** reopens the same authorization request; it does not create a
+clicking **Sign in** again reopens the same authorization request; it does not create a
 second sign-in session. Closing and reopening the panel recovers that status.
 The pending authorization URL is kept locally with mode `0600` until the
 attempt finishes, and cannot be reopened after its three-minute timeout.

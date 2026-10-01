@@ -127,7 +127,7 @@ class LoginFlowTests(unittest.TestCase):
             self.h.reopen_login_browser()
         status = self.h.read_json(self.h.LOGIN_STATUS_FILE, {})
         self.assertEqual(status['status'], 'waiting')
-        self.assertIn('Open browser', status['message'])
+        self.assertIn('Click Sign in', status['message'])
 
     def test_finished_or_failed_flow_removes_pending_url(self):
         for error in [None, SystemExit(1), RuntimeError('test')]:
