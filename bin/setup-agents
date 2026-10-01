@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Install the pinned official CLI and reconcile plugin-owned skill links."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+SKILL = ROOT / 'skills/coinbase-cli'
+MARKER = '# Managed by omarchy-coinbase setup-agents'
+RUNTIME_MARKER = '.omarchy-coinbase-runtime'
+
+
+def run(args, **kwargs):
+    return subprocess.run(args, check=True, text=True, capture_output=True, timeout=180, **kwargs).stdout.strip()
+
+
+def skill_directories(home):
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config')
+    paths = [home / '.agents/skills', home / '.cursor/skills', home / '.gemini/skills',
+             home / '.copilot/skills', home / '.pi/agent/skills', home / '.openclaw/skills',
+             config / 'opencode/skills', config / 'crush/skills']
+    for variable, fallback in [('CLAUDE_CONFIG_DIR', '.claude'), ('CODEX_HOME', '.codex'),
+                               ('HERMES_HOME', '.hermes'), ('GROK_HOME', '.grok')]:
+        base = Path(os.environ.get(variable) or home / fallback)
+        paths.append(base / 'skills')
+        if variable == 'HERMES_HOME':
+            paths.extend(p / 'skills' for p in (base / 'profiles').glob('*') if p.is_dir())
+    return list(dict.fromkeys(paths))
+
+
+def link_skill(directory, source):
+    destination = directory / 'coinbase-cli'
+    if destination.is_symlink() and destination.readlink() == source:
+        return 'ready'
+    if os.path.lexists(destination):
+        return 'preserved existing ' + str(destination)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(source, target_is_directory=True)
+    return 'linked ' + str(destination)
+
+
+def owned_wrapper(path):
+    return path.is_file() and not path.is_symlink() and MARKER in path.read_text(errors='replace').splitlines()[:3]
+
+
+def node_runtime():
+    node = shutil.which('node')
+    if node:
+        try:
+            if int(run([node, '--version']).lstrip('v').split('.')[0]) >= 22:
+                npm = shutil.which('npm')
+                if npm:
+                    return Path(node).resolve(), npm
+        except (ValueError, subprocess.SubprocessError):
+            pass
+    mise = shutil.which('mise')
+    if not mise:
+        raise RuntimeError('Node.js 22+ and npm are required. Install them, then rerun setup-agents ensure.')
+    # Install a runtime without changing the user's globally selected Node.
+    run([mise, 'install', 'node@22'])
+    runtime = Path(run([mise, 'where', 'node@22'])) / 'bin'
+    return runtime / 'node', str(runtime / 'npm')
+
+
+def ensure_cli(home, data):
+    wrapper = home / '.local/bin/coinbase'
+    existing = shutil.which('coinbase')
+    if os.path.lexists(wrapper) and not owned_wrapper(wrapper):
+        raise RuntimeError('Preserved existing command at ' + str(wrapper) + '; resolve the name conflict before setup.')
+    if existing and Path(existing) != wrapper:
+        raise RuntimeError('Preserved existing coinbase on PATH at ' + existing + '; resolve the name conflict before setup.')
+    node, npm = node_runtime()
+    lock = (ROOT / 'cli/package-lock.json').read_bytes()
+    release = data / ('runtime-' + hashlib.sha256(lock).hexdigest()[:16])
+    if data.is_symlink() or release.is_symlink():
+        raise RuntimeError('Refusing a symlink at the managed CLI runtime path.')
+    entry = release / 'node_modules/@coinbase/coinbase-cli/dist/index.js'
+    package = entry.parent.parent / 'package.json'
+    version = json.loads((ROOT / 'cli/package.json').read_text())['dependencies']['@coinbase/coinbase-cli']
+    try:
+        metadata = json.loads(package.read_text())
+    except (OSError, ValueError):
+        metadata = {}
+    if not (entry.is_file() and (release / '.ready').is_file()
+            and metadata.get('name') == '@coinbase/coinbase-cli' and metadata.get('version') == version):
+        release.mkdir(parents=True, exist_ok=True)
+        (release / RUNTIME_MARKER).write_text(MARKER + '\n')
+        for name in ['package.json', 'package-lock.json']:
+            shutil.copyfile(ROOT / 'cli' / name, release / name)
+        env = dict(os.environ, PATH=str(node.parent) + os.pathsep + os.environ.get('PATH', ''))
+        run([npm, 'ci', '--prefix', str(release), '--ignore-scripts', '--no-audit', '--no-fund'], env=env)
+        run([str(node), str(entry), '--version'])
+        (release / '.ready').touch()
+    if not (release / RUNTIME_MARKER).exists():
+        (release / RUNTIME_MARKER).write_text(MARKER + '\n')
+    content = '#!/bin/sh\n' + MARKER + '\nexec ' + shlex.quote(str(node)) + ' ' + shlex.quote(str(entry)) + ' "$@"\n'
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    if not owned_wrapper(wrapper) or wrapper.read_text() != content:
+        temporary = wrapper.with_name('.coinbase-setup-' + str(os.getpid()))
+        try:
+            temporary.write_text(content)
+            temporary.chmod(0o755)
+            temporary.replace(wrapper)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {'version': version, 'command': str(wrapper)}
+
+
+def setup(home, state, data):
+    if (state / 'disabled').exists():
+        return {'disabled': True}
+    result = ensure_cli(home, data)
+    links = []
+    for directory in skill_directories(home):
+        try:
+            links.append(link_skill(directory, SKILL))
+        except OSError as exc:
+            links.append('could not register ' + str(directory) + ': ' + str(exc))
+    result['skills'] = links
+    result['pathReady'] = str(home / '.local/bin') in os.environ.get('PATH', '').split(os.pathsep)
+    return result
+
+
+def remove(home, state, data):
+    # Persist opt-out so a still-running plugin won't immediately reinstall.
+    (state / 'disabled').touch()
+    for directory in skill_directories(home):
+        destination = directory / 'coinbase-cli'
+        if destination.is_symlink() and destination.readlink() == SKILL:
+            destination.unlink()
+    wrapper = home / '.local/bin/coinbase'
+    if owned_wrapper(wrapper):
+        wrapper.unlink()
+    if not data.is_symlink():
+        for release in data.glob('runtime-*'):
+            marker = release / RUNTIME_MARKER
+            if not release.is_symlink() and marker.is_file() and marker.read_text() == MARKER + '\n':
+                shutil.rmtree(release)
+    return {'disabled': True, 'message': 'Removed managed CLI runtime, command and skill links; credentials and independent installations preserved.'}
+
+
+def uninstall(home, state, data, assume_yes=False):
+    target = home / '.config/omarchy/plugins/coinbase'
+    if not target.exists() or target.resolve() != ROOT:
+        raise RuntimeError('Run uninstall using ~/.config/omarchy/plugins/coinbase/bin/setup-agents.')
+    command = ['omarchy', 'plugin', 'remove', 'coinbase']
+    if assume_yes:
+        command.append('--yes')
+    # Keep the terminal attached for Omarchy's confirmation. Python has already
+    # loaded this script, so cleanup can finish after its directory is removed.
+    result = subprocess.run(command, check=False)
+    if os.path.lexists(target):
+        raise RuntimeError('Plugin removal did not complete; CLI and skill links were left intact.')
+    cleaned = remove(home, state, data)
+    # A later plugin reinstall should get the normal automatic CLI setup.
+    (state / 'disabled').unlink(missing_ok=True)
+    cleaned.pop('disabled')
+    cleaned['uninstalled'] = True
+    if result.returncode:
+        cleaned['warning'] = 'Plugin files were removed, but Omarchy reported an error; check the shell plugin list.'
+    return cleaned
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['ensure', 'enable', 'remove', 'uninstall', 'status'])
+    parser.add_argument('--yes', action='store_true', help='Skip Omarchy confirmation for uninstall')
+    args = parser.parse_args()
+    if args.yes and args.action != 'uninstall':
+        parser.error('--yes is only supported with uninstall')
+    home = Path.home()
+    state = Path(os.environ.get('XDG_STATE_HOME') or home / '.local/state') / 'omarchy/coinbase-agents'
+    data = Path(os.environ.get('XDG_DATA_HOME') or home / '.local/share') / 'omarchy/coinbase-cli'
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    status = state / 'status.json'
+    if args.action == 'status':
+        print(status.read_text() if status.exists() else '{"installed": false}')
+        return
+    with (state / 'setup.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('{"busy": true}')
+            return
+        try:
+            if args.action == 'enable':
+                (state / 'disabled').unlink(missing_ok=True)
+            if args.action == 'uninstall':
+                result = uninstall(home, state, data, args.yes)
+            elif args.action == 'remove':
+                result = remove(home, state, data)
+            else:
+                result = setup(home, state, data)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            # Package-manager stderr may contain local configuration; don't echo it.
+            result = {'error': str(exc)}
+        raw = json.dumps(result, indent=2) + '\n'
+        temporary = status.with_suffix('.tmp')
+        temporary.write_text(raw)
+        temporary.replace(status)
+        print(raw, end='')
+        if 'error' in result:
+            sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

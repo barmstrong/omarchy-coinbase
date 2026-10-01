@@ -2,17 +2,19 @@
   "schemaVersion": 1,
   "id": "coinbase",
   "name": "Coinbase",
-  "version": "1.0.26",
+  "version": "1.0.27",
   "author": "Brian Armstrong",
   "license": "MIT",
   "description": "Coinbase portfolio overview for the Omarchy bar: balances and Simple Retail watchlist editing via OAuth.",
   "kinds": [
     "bar-widget",
-    "panel"
+    "panel",
+    "service"
   ],
   "entryPoints": {
     "barWidget": "BarWidget.qml",
-    "panel": "Panel.qml"
+    "panel": "Panel.qml",
+    "service": "AgentSetup.qml"
   },
   "barWidget": {
     "displayName": "Coinbase",

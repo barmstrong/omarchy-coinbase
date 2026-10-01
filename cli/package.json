@@ -1,0 +1,8 @@
+{
+  "name": "omarchy-coinbase-cli-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@coinbase/coinbase-cli": "0.0.10"
+  }
+}

@@ -15,7 +15,7 @@ The panel includes:
   current asset while signed out
 - Three bar display modes; right-click cycles full, balance-only, and icon-only
 - Simple Retail watchlist refresh, with Add/Remove controls on asset detail pages
-- Watchlist ordering with row ↑/↓ controls or Alt+Up/Down on the selected row;
+- Watchlist ordering with six-dot drag handles or Alt+Up/Down on the selected row;
   moves appear immediately and roll back on failure
 - Cache-first rendering that keeps the last complete view visible while market
   and portfolio data update in the background, including when offline
@@ -38,25 +38,76 @@ logo are trademarks of their respective owner.
 
 ## Install
 
-Requires Omarchy with `omarchy-shell`, Python 3, and network access. It has no
-third-party Python or JavaScript runtime dependencies and needs no elevated
-privileges.
+Requires Omarchy with `omarchy-shell`, Python 3, and network access. The widget
+has no third-party Python dependencies. Enabling the plugin also installs the
+official Coinbase CLI and registers its agent skill as described below.
+Installation runs as your user and needs no elevated privileges.
 
-The Coinbase submission has passed the marketplace's automated compatibility
-and security-baseline checks and is awaiting maintainer listing approval. Once
-it is published on [Omarchy Plugin Marketplace](https://omarchyplugins.com/),
-its install button will copy this same command:
+The [marketplace submission](https://github.com/omacom/omarchy-plugin-marketplace/issues/7520)
+is awaiting maintainer approval. On October 1, the reviewer
+[withdrew the earlier broker and read-only requirements](https://github.com/omacom/omarchy-plugin-marketplace/issues/7520#issuecomment-5924487958).
+Automated checks alone do not approve a listing. Install the public repository directly:
 
 ```bash
 omarchy plugin add https://github.com/barmstrong/omarchy-coinbase.git --enable
 ```
 
 The command clones the current public repository, validates it locally, and
-then installs and enables the widget. Until the listing is approved, run it
-directly in a terminal.
+then installs and enables the widget. Installing without `--enable` defers CLI
+setup until the plugin is enabled.
 
 Click the bar widget, then **Sign in with Coinbase**. The repository includes a
 hosted OAuth broker URL, so installers do not need a Coinbase client secret.
+
+## CLI and agent integration
+
+On enable and shell startup, `AgentSetup.qml` runs `bin/setup-agents ensure`.
+It installs the official `@coinbase/coinbase-cli` version 0.0.10 from npm using
+the committed lockfile and integrity hashes, with lifecycle scripts disabled.
+The runtime lives in `~/.local/share/omarchy/coinbase-cli/`; its launcher is
+`~/.local/bin/coinbase`, already on PATH in Omarchy. The widget continues using
+its own private `bin/coinbase` helper.
+
+The official CLI needs Node.js 22+ and npm. Setup uses a compatible installed
+runtime or installs Node 22 through Omarchy's `mise`, without changing the
+user's global Node selection. Runtime downloads use mise's configured backend;
+CLI packages use npm's configured registry/cache. Linux credential storage
+uses `secret-tool` (Arch's `libsecret` package). Credentials are not configured,
+copied, or read by setup; the CLI's authentication is separate from the widget's
+OAuth login. See the [official CLI guide](https://docs.cdp.coinbase.com/coinbase-cli/skill.md).
+
+A single bundled `skills/coinbase-cli` directory is linked into the shared
+`~/.agents/skills` location and the supported user skill directories for Claude,
+Codex, Cursor, Gemini, Copilot, Pi, OpenClaw, OpenCode, Crush, Grok, and Hermes
+(including existing Hermes profiles). Directory mappings follow the
+[Skills project's agent registry](https://github.com/vercel-labs/skills/blob/main/src/agents.ts)
+and Omarchy's existing skill locations. Supported configuration-root environment
+variables are honored. Known directories are prepared even before an agent is
+installed. Agents with other discovery conventions are not automatically covered.
+
+While the plugin is enabled, setup reconciles every five minutes, repairing
+missing managed links after agent reinstallation and discovering new Hermes
+profiles. It performs no npm download once the pinned runtime is ready.
+Existing commands and same-name user skills are preserved. A conflicting
+`coinbase` command blocks setup and is reported in status, rather than replaced.
+Open a new agent session (or reload skills) after installation.
+
+```bash
+coinbase --version
+coinbase --help
+python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents status
+python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents ensure
+```
+
+Failures are recorded in `~/.local/state/omarchy/coinbase-agents/status.json`
+and retried at the next five-minute interval. To opt out, remove the managed
+CLI runtime, launcher and skill links, and prevent automatic reinstallation:
+
+```bash
+python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents remove
+# Explicitly opt back in:
+python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents enable
+```
 
 ## Remove
 
@@ -64,8 +115,20 @@ Use **Log out** in the panel first. This asks Coinbase to revoke the active
 access token and then removes the local token file. Remove the plugin with:
 
 ```bash
-omarchy plugin remove coinbase
+python3 ~/.config/omarchy/plugins/coinbase/bin/setup-agents uninstall
 ```
+
+This invokes Omarchy's normal removal confirmation, then removes the managed
+CLI runtime, launcher and agent skill links. Add `--yes` for noninteractive
+removal. Canceling confirmation leaves the CLI and links intact. Independently
+installed commands, user skills, the shared Node.js runtime and CLI credentials
+are preserved. A later plugin reinstall enables CLI setup again.
+
+Plain `omarchy plugin remove coinbase` does **not** clean up the CLI or skill
+links: Omarchy does not currently invoke uninstall hooks. Use the combined
+command above, or run `setup-agents remove` before native plugin removal.
+The separate `remove` action persists an explicit opt-out across reinstalls;
+run `setup-agents enable` to reverse it.
 
 Omarchy may retain non-secret preferences and market-data caches under
 `~/.local/state/omarchy/coinbase/` after removal. To erase those files too:
@@ -93,6 +156,11 @@ The detail-page toggle requires read access to show current membership and
 update access to edit it. A hosted broker's requested scopes may differ from
 the source defaults; inspect the Coinbase consent screen.
 
+Drag the six-dot handle on a watchlist row to move it. The cursor changes to a
+grab hand, a marker shows the drop position, and dragging near the list edges
+scrolls the list. Release to save, or press Escape to cancel. Alt+Up and Alt+Down
+also move the selected row.
+
 Reordering uses the same update scope via the documented
 [Simple Retail reorder endpoint](https://docs.cdp.coinbase.com/coinbase-app/track-apis/watchlist#reorder-an-item).
 Each move uses stored canonical identifiers and one neighboring visible item
@@ -101,7 +169,7 @@ other items retain their relative order. Controls are unavailable in search,
 other tabs, or while a move is pending. The plugin rereads after a move and
 never automatically retries an uncertain write.
 
-The plugin has no code path that places trades or moves funds. Buy, sell,
+The widget has no code path that places trades or moves funds. Buy, sell,
 deposit, withdrawal, send, and receive controls only open an HTTPS page on
 Coinbase.com in your browser. Browser launches are restricted to Coinbase HTTPS
 hosts.
@@ -190,6 +258,7 @@ node broker/test.mjs
 node tests/model.test.js
 python3 -m unittest discover -s tests -v
 bash tests/refresh/run.sh # Requires a running desktop session
+python3 tests/agents/run.py # Isolated headless service smoke test
 bin/coinbase status
 bin/coinbase snapshot --period day
 bin/coinbase chart BTC-USD --period week --symbol BTC --kind crypto
@@ -227,7 +296,10 @@ Crypto additions resolve a unique asset UUID. Stock additions use native IDs
 from Coinbase's equity catalog. Unsupported products are hidden until their
 owning metadata source is supported.
 
-The open panel refreshes silently every 30 seconds when cached data is present.
+Opening the panel immediately requests a fresh snapshot. While open, it polls
+every 15 seconds, reusing a snapshot only if it is at most 10 seconds old.
+The bar continues polling at its configured interval (60 seconds by default).
+Refreshes already in progress are shared; requests do not queue or overlap.
 “Updating…” appears only while a chart-period change or missing content is loading.
 Network work can continue quietly for up to two
 minutes before the helper is terminated. Background jobs skip an already-busy
