@@ -771,6 +771,52 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(stored["bar"]["price"], 300)
             self.assertIn("COIN", [row["id"] for row in stored["assets"]])
 
+    def test_stock_pin_with_opaque_product_id_survives_preference_reload(self):
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            configure_state(helper, state)
+            cached = helper.empty_snapshot(
+                period="day",
+                assets=[helper.market_row("BTC", "Bitcoin", "crypto", "BTC-USD", price=100)],
+            )
+            helper.write_snapshot(cached)
+            product_id = "29313d688c3e47c2e644b28bdfdacf81ce61b2f9c16e657dac1497d341c2464f"
+            pref = helper.save_bar_preference(product_id, "COIN")
+            incoming = helper.sanitize_ticker_asset(
+                {
+                    "id": "COIN",
+                    "name": "Coinbase",
+                    "productId": product_id,
+                    "kind": "stock",
+                    "price": 300,
+                    "rowSpark": [290, 300],
+                    "rowSparkPeriod": "day",
+                },
+                pref,
+            )
+
+            self.assertTrue(helper.publish_cached_ticker(pref, incoming))
+            stored = json.loads(helper.SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            self.assertEqual(stored["bar"]["symbol"], "COIN")
+            self.assertEqual(stored["bar"]["price"], 300)
+            self.assertIn("COIN", [row["id"] for row in stored["assets"]])
+
+            self.assertEqual(helper.bar_preference(), pref)
+            self.assertEqual(stored["bar"]["productId"], product_id)
+            self.assertEqual(helper.lead_asset(stored["assets"])["id"], "COIN")
+            self.assertEqual(helper.read_json(helper.MARKET_SNAPSHOT_FILE, {})["bar"]["symbol"], "COIN")
+
+    def test_bar_preference_still_repairs_opaque_display_symbols(self):
+        helper = load_helper()
+        opaque_id = "a" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            configure_state(helper, Path(directory))
+            for symbol in ("", opaque_id):
+                with self.subTest(symbol=symbol):
+                    helper.update_prefs(barProduct=opaque_id, barSymbol=symbol)
+                    self.assertEqual(helper.bar_preference(), {"symbol": "BTC", "product": "BTC-USD"})
+
     def test_loading_portfolio_stops_spinning_on_auth_failure(self):
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

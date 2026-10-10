@@ -622,10 +622,13 @@ def bar_preference() -> dict[str, str]:
     prefs = load_prefs()
     product = str(prefs.get("barProduct") or "").strip()
     symbol = str(prefs.get("barSymbol") or "").strip().upper()
-    if _is_hex_id(product) or _is_hex_id(symbol):
+    # Equity products use opaque hex IDs; keep them when paired with a ticker.
+    # Only repair legacy preferences that would display an opaque ID as the symbol.
+    if _is_hex_id(symbol) or (_is_hex_id(product) and not symbol):
         update_prefs(barProduct="BTC-USD", barSymbol="BTC")
         return {"symbol": "BTC", "product": "BTC-USD"}
-    product = product.upper()
+    if not _is_hex_id(product):
+        product = product.upper()
     if not product and not symbol:
         return {"symbol": "BTC", "product": "BTC-USD"}
     if not product and symbol:
