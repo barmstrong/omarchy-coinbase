@@ -245,6 +245,10 @@ owning metadata source is supported.
 Opening the panel immediately requests a fresh snapshot. While open, it polls
 every 15 seconds, reusing a snapshot only if it is at most 10 seconds old.
 The bar continues polling at its configured interval (60 seconds by default).
+Both views check failed or stale data every five seconds, including while the
+panel is closed. A gap in wall-clock ticks detects resume and requests a fresh
+snapshot without the failure cooldown. Helpers whose two-minute deadline passed
+while asleep are terminated within a second of the event loop resuming.
 Refreshes already in progress are shared; requests do not queue or overlap.
 “Updating…” appears only while a chart-period change or missing content is loading.
 Network work can continue quietly for up to two

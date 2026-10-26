@@ -146,6 +146,11 @@ BarWidget {
     onExited: snapshotFile.reload()
   }
 
+  RecoveryTimer {
+    snapshot: root.snapshot
+    onRefreshRequested: function(force) { root.refresh(force) }
+  }
+
   Timer {
     interval: root.refreshSeconds * 1000
     running: true

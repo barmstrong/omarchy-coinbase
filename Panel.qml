@@ -1283,6 +1283,12 @@ Item {
     onTriggered: root.statusNow = Date.now()
   }
 
+  RecoveryTimer {
+    running: root.opened
+    snapshot: root.snapshot
+    onRefreshRequested: function(force) { root.refresh(force) }
+  }
+
   Timer {
     // Keep an open dashboard current; the bar retains its slower cadence.
     // Failed refreshes still honor the helper's cooldown, without overlaps.
